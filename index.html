@@ -363,7 +363,8 @@ select option{background:var(--surface2);color:var(--text)}
       </select></div>
       <div><label>观察指标</label><select id="sSweepMetric">
         <option value="hit_rate">HBM命中率(%)</option><option value="p99_latency">P99延迟(ms)</option>
-        <option value="ttft">平均TTFT(ms)</option><option value="tpot">平均TPOT(ms/tok)</option>
+        <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
+        <option value="tpot">平均TPOT(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
       </select></div>
       <div><label>对比档位(逗号分隔,可空)</label><input id="sSweepCompare" value="" placeholder="如 1,2,5,10,20,40,80"></div>
@@ -3043,7 +3044,7 @@ function runSensitivity() {
   else if (param === 'ssd_bw') { values = [1,2,5,10,20,40,80]; labels = values.map(v=>v+'GB/s'); }
   else { values = [10,20,30,40,50,60,70,80,90]; labels = values.map(v=>v+'%'); }
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', p99_latency:'P99延迟(ms)', ttft:'平均TTFT(ms)', tpot:'平均TPOT(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
+  let metricLabel = {hit_rate:'HBM命中率(%)', p99_latency:'P99延迟(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
   let paramLabel = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'SSD带宽'}[param];
 
   // 双参数模式：对比档位（仅 prefix_hit × ssd_bw 双向支持；其余参数忽略对比）
@@ -3120,7 +3121,8 @@ function runSensitivity() {
         if (compareParam === 'ssd_bw') overrides.ssdBW = cv;               // 对比档位: 带宽
         let r = runSimulation(s, overrides);
         let val = metric === 'hit_rate' ? r.hitRate : metric === 'p99_latency' ? r.p99
-          : metric === 'ttft' ? r.avgTtft : metric === 'tpot' ? r.avgTpot
+          : metric === 'ttft' ? r.avgTtft : metric === 'ttft_p50' ? r.p50Ttft
+          : metric === 'ttft_p99' ? r.p99Ttft : metric === 'tpot' ? r.avgTpot
           : metric === 'throughput' ? r.throughput : r.memUtilPeak;
         if (compareParam) results[ci][idx] = val; else results[idx] = val;
       } catch(e) {
