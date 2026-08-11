@@ -3112,7 +3112,7 @@ function runSensitivity() {
       '<br>基准策略: <code>'+baseStrategy.name+'</code> · 在「对比档位」填多个值可画曲线族（前缀命中率 × SSD带宽 双向支持）'+
       (cached ? ' · <span style="color:var(--accent)">⚡ 缓存命中，未重跑仿真（切换纵轴即时）</span>' : '');
     if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
-    chartEl.innerHTML = '';
+    // 注意: 不要清空 chartEl.innerHTML——echarts.init 已接管元素并渲染 canvas, 清空会销毁图表
   }
 
   if (cached) { paint(cached); return; } // 缓存命中：零仿真，按当前指标直接重绘（快速切换纵轴）
