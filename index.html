@@ -3031,8 +3031,15 @@ function drawStrategyComparisonGantt() {
 }
 
 // ======================== SENSITIVITY ANALYSIS ========================
-// 支持单参数扫描(对比档位留空)与双参数对比(对比档位填多个值 → 曲线族)
-// 双参数组合: 前缀命中率 × SSD带宽（经 overrides 注入，与引擎同口径）
+// 扫描结果缓存（2026-08-11）：key = (全局参数+策略DSL+扫描参数+档位+种子) → 轻量全指标记录数组。
+// 命中缓存时直接重绘（切换纵轴指标零仿真重跑）；未命中才跑 runSimulation 并缓存全部指标，
+// 同一扫描换 metric 观察不再重复仿真。FIFO 上限 20 条。
+let sensCache = {};
+function extractSensMetrics(r) {
+  return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
+    throughput: r.throughput, hit_rate: r.hitRate, mem_util: r.memUtilPeak, p99_latency: r.p99 };
+}
+
 function runSensitivity() {
   let btn = document.querySelector('#sensitivityPanel .btn');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 分析中...'; }
@@ -3060,55 +3067,76 @@ function runSensitivity() {
   }
   let cmpLabel = compareParam === 'ssd_bw' ? (v => v + 'GB/s') : (v => v + '%');
 
-  // results: 单参数 → 一维数组; 双参数 → compareVals.length × values.length 二维
-  let results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
+  // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数/档位 + 种子），不含 metric——
+  // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑
+  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, compareVals, gi('pSeed')]);
+  let cached = sensCache[cacheKey];
+
   let chartEl = $('chartSensitivity');
+  let formulaEl = $('formulaSensitivity');
+  function metricOf(rec) { return rec && rec[metric] != null ? rec[metric] : 0; }
+
+  // 统一绘图：results 元素 = 全指标记录(rec) 或 null；按当前 metric 提取
+  function paint(results) {
+    let ch = initChart('chartSensitivity');
+    let series = [];
+    if (compareParam) {
+      let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
+      compareVals.forEach((cv, k) => {
+        series.push({ name: cmpLabel(cv), type: 'line', smooth: true,
+          data: results[k].map(rec => +metricOf(rec).toFixed(1)),
+          lineStyle: { color: palette[k % palette.length], width: 2 },
+          itemStyle: { color: palette[k % palette.length] } });
+      });
+    } else {
+      series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(rec => +metricOf(rec).toFixed(1)),
+        lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
+        itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
+    }
+    let opt = {
+      tooltip: { trigger: 'axis' },
+      legend: compareParam ? { top: 0, textStyle: { color: '#9ca0b0' } } : undefined,
+      grid: { left: 70, right: 20, top: compareParam ? 32 : 20, bottom: 40 },
+      xAxis: { type: 'category', data: labels, name: paramLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
+      yAxis: { type: 'value', name: metricLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
+      series: series
+    };
+    ch.setOption(opt);
+    formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+
+      (compareParam
+        ? '双参数对比：固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>（X 轴），'+
+          '每条曲线 = 一个 <code>'+(compareParam === 'ssd_bw' ? 'SSD带宽' : '前缀命中率')+'</code> 档位：<code>'+compareVals.join(', ')+'</code><br>'+
+          '用于分析「L3 命中率 × L3 带宽」对延迟/吞吐的耦合影响——低带宽下命中率收益被放大（L3 拉取/预取排队占链路），'+
+          '高带宽下命中率收益收敛（带宽不再瓶颈）；曲线收敛点 ≈ 该场景 L3 带宽需求（l3BWp99）'
+        : '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>')+
+      '<br>基准策略: <code>'+baseStrategy.name+'</code> · 在「对比档位」填多个值可画曲线族（前缀命中率 × SSD带宽 双向支持）'+
+      (cached ? ' · <span style="color:var(--accent)">⚡ 缓存命中，未重跑仿真（切换纵轴即时）</span>' : '');
+    if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
+    chartEl.innerHTML = '';
+  }
+
+  if (cached) { paint(cached); return; } // 缓存命中：零仿真，按当前指标直接重绘（快速切换纵轴）
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 分析中...'; }
+
+  // results: 单参数 → 一维数组; 双参数 → compareVals.length × values.length 二维（元素=全指标记录）
+  let results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
   let totalRuns = compareParam ? compareVals.length * values.length : values.length;
   chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... 0/'+totalRuns+'</div>';
-  let formulaEl = $('formulaSensitivity');
   formulaEl.innerHTML = '';
 
   let ci = 0, idx = 0; // ci=对比档位索引, idx=扫描档位索引
   function runNext() {
     if (compareParam ? ci >= compareVals.length : idx >= values.length) {
-      let ch = initChart('chartSensitivity');
-      let series = [];
-      if (compareParam) {
-        let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
-        compareVals.forEach((cv, k) => {
-          series.push({ name: cmpLabel(cv), type: 'line', smooth: true,
-            data: results[k].map(v => +v.toFixed(1)),
-            lineStyle: { color: palette[k % palette.length], width: 2 },
-            itemStyle: { color: palette[k % palette.length] } });
-        });
-      } else {
-        series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(v => +v.toFixed(1)),
-          lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
-          itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
-      }
-      let opt = {
-        tooltip: { trigger: 'axis' },
-        legend: compareParam ? { top: 0, textStyle: { color: '#9ca0b0' } } : undefined,
-        grid: { left: 70, right: 20, top: compareParam ? 32 : 20, bottom: 40 },
-        xAxis: { type: 'category', data: labels, name: paramLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
-        yAxis: { type: 'value', name: metricLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
-        series: series
-      };
-      ch.setOption(opt);
-      formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+
-        (compareParam
-          ? '双参数对比：固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>（X 轴），'+
-            '每条曲线 = 一个 <code>'+(compareParam === 'ssd_bw' ? 'SSD带宽' : '前缀命中率')+'</code> 档位：<code>'+compareVals.join(', ')+'</code><br>'+
-            '用于分析「L3 命中率 × L3 带宽」对延迟/吞吐的耦合影响——低带宽下命中率收益被放大（L3 拉取/预取排队占链路），'+
-            '高带宽下命中率收益收敛（带宽不再瓶颈）；曲线收敛点 ≈ 该场景 L3 带宽需求（l3BWp99）'
-          : '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>')+
-        '<br>基准策略: <code>'+baseStrategy.name+'</code> · 在「对比档位」填多个值可画曲线族（前缀命中率 × SSD带宽 双向支持）';
-      if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
+      sensCache[cacheKey] = results; // 全指标记录入缓存（后续切纵轴/重跑直接复用）
+      let keys = Object.keys(sensCache);
+      if (keys.length >= 20) delete sensCache[keys[0]]; // FIFO 淘汰最旧
+      paint(results);
       return;
     }
     let v = values[idx];
     let cv = compareParam ? compareVals[ci] : null;
     setTimeout(() => {
+      let rec = null;
       try {
         let s = JSON.parse(JSON.stringify(baseStrategy));
         let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
@@ -3120,15 +3148,9 @@ function runSensitivity() {
         if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
         if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100; // 对比档位: 命中率
         if (compareParam === 'ssd_bw') overrides.ssdBW = cv;               // 对比档位: 带宽
-        let r = runSimulation(s, overrides);
-        let val = metric === 'hit_rate' ? r.hitRate : metric === 'p99_latency' ? r.p99
-          : metric === 'ttft' ? r.avgTtft : metric === 'ttft_p50' ? r.p50Ttft
-          : metric === 'ttft_p99' ? r.p99Ttft : metric === 'tpot' ? r.avgTpot
-          : metric === 'throughput' ? r.throughput : r.memUtilPeak;
-        if (compareParam) results[ci][idx] = val; else results[idx] = val;
-      } catch(e) {
-        if (compareParam) results[ci][idx] = 0; else results[idx] = 0;
-      }
+        rec = extractSensMetrics(runSimulation(s, overrides));
+      } catch(e) { rec = null; }
+      if (compareParam) results[ci][idx] = rec; else results[idx] = rec;
       chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... '+(compareParam ? ci*values.length+idx+1 : idx+1)+'/'+totalRuns+'</div>';
       idx++;
       if (idx >= values.length && compareParam) { idx = 0; ci++; }
