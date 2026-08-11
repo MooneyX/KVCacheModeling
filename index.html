@@ -354,20 +354,26 @@ select option{background:var(--surface2);color:var(--text)}
   <!-- Sensitivity Analysis -->
   <div class="card" id="sensitivityPanel" style="display:none">
     <h2><span>参数敏感性</span> 分析</h2>
-    <p class="subtitle">单/双参数扫描：固定其他参数与随机种子（共同随机数法），观察关键指标变化；「对比档位」填多个值时画曲线族（如扫描前缀命中率时对比不同 SSD 带宽）</p>
+    <p class="subtitle">三参数敏感性：横轴「扫描参数」+ 颜色「对比参数」分档（自动生成档位，可编辑）+ 纵轴「观察指标」；固定其他参数与随机种子（共同随机数法）。留空对比参数则单参数扫描</p>
     <div class="form-row" style="margin-bottom:8px">
-      <div><label>扫描参数</label><select id="sSweepParam">
+      <div><label>① 扫描参数(横轴)</label><select id="sSweepParam">
         <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
         <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
         <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">SSD带宽</option>
       </select></div>
-      <div><label>观察指标</label><select id="sSweepMetric">
+      <div><label>② 对比参数(颜色, 可空)</label><select id="sSweepCompareParam">
+        <option value="">无(单参数)</option>
+        <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
+        <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
+        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">SSD带宽</option>
+      </select></div>
+      <div><label>③ 观察指标(纵轴)</label><select id="sSweepMetric">
         <option value="hit_rate">HBM命中率(%)</option><option value="p99_latency">P99延迟(ms)</option>
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
         <option value="tpot">平均TPOT(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
       </select></div>
-      <div><label>对比档位(逗号分隔,可空)</label><input id="sSweepCompare" value="" placeholder="如 1,2,5,10,20,40,80"></div>
+      <div><label>对比档位(逗号分隔)</label><input id="sSweepCompare" value="" placeholder="自动生成, 可编辑" style="width:130px"></div>
       <div><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
     <div id="chartSensitivity" class="chart-container"></div>
@@ -3031,14 +3037,49 @@ function drawStrategyComparisonGantt() {
 }
 
 // ======================== SENSITIVITY ANALYSIS ========================
-// 扫描结果缓存（2026-08-11）：key = (全局参数+策略DSL+扫描参数+档位+种子) → 轻量全指标记录数组。
-// 命中缓存时直接重绘（切换纵轴指标零仿真重跑）；未命中才跑 runSimulation 并缓存全部指标，
-// 同一扫描换 metric 观察不再重复仿真。FIFO 上限 20 条。
+// 三参数敏感性：横轴「扫描参数」× 颜色「对比参数」分档 × 纵轴「观察指标」，任意参数组合。
+// 对比参数档位默认自动生成（可选「无」回退单参数扫描），档位文本可编辑。
+// 扫描结果缓存（2026-08-11）：key = (全局参数+策略DSL+扫描参数+对比参数+档位+种子) → 轻量全指标记录数组。
+// 命中缓存时直接重绘（切换纵轴指标零仿真重跑）；未命中才跑 runSimulation 并缓存全部指标。
+// FIFO 上限 20 条。
 let sensCache = {};
 function extractSensMetrics(r) {
   return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
     throughput: r.throughput, hit_rate: r.hitRate, mem_util: r.memUtilPeak, p99_latency: r.p99 };
 }
+
+// 各参数默认档位（选择对比参数时自动填充；可手动编辑）
+const SENS_LEVELS = {
+  hbm_threshold: [10,30,50,70,90],
+  evict_threshold: [10,30,50,70,90],
+  prefetch_threshold: [10,30,50,70,90],
+  max_batch_size: [4,8,16,32,64],
+  prefix_hit: [0,25,50,75,100],
+  ssd_bw: [1,2,5,10,20,40,80]
+};
+const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'SSD带宽'};
+function sensParamUnit(param, v) {
+  if (param === 'ssd_bw') return v + 'GB/s';
+  if (param === 'max_batch_size') return 'B=' + v;
+  return v + '%';
+}
+
+// 对比参数选择时自动填充默认档位
+function autofillCompareLevels() {
+  let el = $('sSweepCompareParam'); if (!el) return;
+  let cmp = el.value, lv = SENS_LEVELS[cmp];
+  let inp = $('sSweepCompare');
+  if (inp) inp.value = lv ? lv.join(',') : '';
+}
+// 扫描/对比参数互斥提示（运行时自动忽略相同项，UI 上也即时标注）
+function guardCompareParam() {
+  let sp = $('sSweepParam').value, cp = $('sSweepCompareParam').value;
+  if (cp && cp === sp) { $('sSweepCompareParam').value = ''; autofillCompareLevels(); }
+}
+document.addEventListener('change', function(e) {
+  if (e.target && e.target.id === 'sSweepCompareParam') { autofillCompareLevels(); guardCompareParam(); }
+  if (e.target && e.target.id === 'sSweepParam') guardCompareParam();
+});
 
 function runSensitivity() {
   let btn = document.querySelector('#sensitivityPanel .btn');
@@ -3053,23 +3094,24 @@ function runSensitivity() {
   else { values = [10,20,30,40,50,60,70,80,90]; labels = values.map(v=>v+'%'); }
 
   let metricLabel = {hit_rate:'HBM命中率(%)', p99_latency:'P99延迟(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
-  let paramLabel = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'SSD带宽'}[param];
+  let paramLabel = SENS_PARAM_LABEL[param];
 
-  // 双参数模式：对比档位（仅 prefix_hit × ssd_bw 双向支持；其余参数忽略对比）
-  let compareParam = null, compareVals = [];
-  let cmpRaw = ($('sSweepCompare') ? $('sSweepCompare').value : '').trim();
-  if (cmpRaw) {
-    let cv = cmpRaw.split(/[,，\s]+/).map(s => parseFloat(s)).filter(v => isFinite(v));
-    if (cv.length > 0) {
-      compareParam = (param === 'prefix_hit') ? 'ssd_bw' : (param === 'ssd_bw') ? 'prefix_hit' : null;
-      compareVals = cv;
+  // 对比参数（第三维=颜色）：显式下拉选择，档位从输入框读取（自动填充默认，可编辑）
+  let compareParam = ($('sSweepCompareParam') ? $('sSweepCompareParam').value : '') || null;
+  let compareVals = [];
+  if (compareParam) {
+    if (compareParam === param) compareParam = null; // 与扫描参数相同 → 回退单参数
+    else {
+      let cmpRaw = ($('sSweepCompare') ? $('sSweepCompare').value : '').trim();
+      let cv = cmpRaw.split(/[,，\s]+/).map(s => parseFloat(s)).filter(v => isFinite(v));
+      compareVals = cv.length ? cv : SENS_LEVELS[compareParam] || [];
     }
   }
-  let cmpLabel = compareParam === 'ssd_bw' ? (v => v + 'GB/s') : (v => v + '%');
+  let cmpLabel = compareParam ? (v => sensParamUnit(compareParam, v)) : null;
 
-  // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数/档位 + 种子），不含 metric——
+  // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数 + 对比参数/档位 + 种子），不含 metric——
   // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑
-  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, compareVals, gi('pSeed')]);
+  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, compareParam, compareVals, gi('pSeed')]);
   let cached = sensCache[cacheKey];
 
   let chartEl = $('chartSensitivity');
@@ -3104,12 +3146,11 @@ function runSensitivity() {
     ch.setOption(opt);
     formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+
       (compareParam
-        ? '双参数对比：固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>（X 轴），'+
-          '每条曲线 = 一个 <code>'+(compareParam === 'ssd_bw' ? 'SSD带宽' : '前缀命中率')+'</code> 档位：<code>'+compareVals.join(', ')+'</code><br>'+
-          '用于分析「L3 命中率 × L3 带宽」对延迟/吞吐的耦合影响——低带宽下命中率收益被放大（L3 拉取/预取排队占链路），'+
-          '高带宽下命中率收益收敛（带宽不再瓶颈）；曲线收敛点 ≈ 该场景 L3 带宽需求（l3BWp99）'
+        ? '三参数敏感性：固定其他策略参数与随机种子（共同随机数法），横轴扫描 <code>'+paramLabel+'</code>，'+
+          '每条曲线 = 一个 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> 档位（颜色）：<code>'+compareVals.join(', ')+'</code>，纵轴 <code>'+metricLabel+'</code><br>'+
+          '三维联动可观察「两个参数 × 指标」的耦合（如命中率 × 带宽 → TTFT）：低带宽下命中率收益被放大，高带宽收敛；曲线收敛点 ≈ 该场景带宽需求（l3BWp99）'
         : '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>')+
-      '<br>基准策略: <code>'+baseStrategy.name+'</code> · 在「对比档位」填多个值可画曲线族（前缀命中率 × SSD带宽 双向支持）'+
+      '<br>基准策略: <code>'+baseStrategy.name+'</code> · 对比参数选择后自动填充档位（可编辑）· 同一扫描切换纵轴即时（缓存）'+
       (cached ? ' · <span style="color:var(--accent)">⚡ 缓存命中，未重跑仿真（切换纵轴即时）</span>' : '');
     if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
     // 注意: 不要清空 chartEl.innerHTML——echarts.init 已接管元素并渲染 canvas, 清空会销毁图表
@@ -3146,8 +3187,13 @@ function runSensitivity() {
         if (param === 'max_batch_size') s.batching.max_batch_size = v;
         if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
         if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
-        if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100; // 对比档位: 命中率
-        if (compareParam === 'ssd_bw') overrides.ssdBW = cv;               // 对比档位: 带宽
+        // 对比参数（颜色维度）注入：与扫描参数同样的映射
+        if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
+        if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
+        if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
+        if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
+        if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
+        if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
         rec = extractSensMetrics(runSimulation(s, overrides));
       } catch(e) { rec = null; }
       if (compareParam) results[ci][idx] = rec; else results[idx] = rec;
