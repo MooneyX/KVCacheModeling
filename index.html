@@ -2881,6 +2881,7 @@ function drawStrategyMetrics() {
     rows.push('<div style="grid-column:1/-1;font-size:.78rem;color:var(--accent);margin-bottom:2px;border-bottom:1px solid var(--border);padding-bottom:4px;margin-top:8px">📌 '+sr.name+'</div>');
     let items = [
       ['HBM命中率', sr.hitRate.toFixed(1)+'%', 'green'],
+      ['TTFT(均值)', sr.avgTtft.toFixed(0)+' ms', 'accent'],
       ['TTFT(P50)', sr.p50Ttft.toFixed(0)+' ms', 'accent'],
       ['TTFT(P99)', sr.p99Ttft.toFixed(0)+' ms', 'orange'],
       ['TPOT(均值)', sr.avgTpot.toFixed(1)+' ms/tok', 'accent'],
