@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DS-V3 实测校准报告 · 2026-08-10</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f1117;--surface:#1a1d27;--surface2:#242837;--border:#2e3347;--accent:#6c63ff;--green:#34d399;--orange:#fb923c;--red:#f87171;--text:#e4e4e7;--dim:#9ca0b0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:24px}
+h1{font-size:1.3rem;margin-bottom:4px}
+h2{font-size:1.05rem;margin:20px 0 8px;color:var(--accent)}
+h3{font-size:.9rem;margin:14px 0 6px;color:var(--green)}
+.sub{color:var(--dim);font-size:.78rem;margin-bottom:14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+table{width:100%;border-collapse:collapse;font-size:.78rem;margin-top:8px}
+th{background:var(--surface2);color:var(--dim);text-transform:uppercase;letter-spacing:.03em;font-size:.66rem;padding:7px 8px;text-align:right;border-bottom:1px solid var(--border)}
+th:first-child,td:first-child{text-align:left}
+td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+tr:hover td{background:rgba(108,99,255,.06)}
+.ok{color:var(--green);font-weight:700}
+.warn{color:var(--orange);font-weight:700}
+.bad{color:var(--red);font-weight:700}
+.chart{width:100%;height:340px}
+.formula{background:var(--surface2);border-radius:6px;padding:10px 14px;font-family:monospace;font-size:.72rem;color:var(--dim);line-height:1.8;margin-top:8px}
+code{background:rgba(108,99,255,.15);padding:1px 5px;border-radius:3px;color:var(--accent);font-size:.85em}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.68rem;font-weight:700;margin-right:6px}
+.badge.fix{background:rgba(52,211,153,.15);color:var(--green)}
+.badge.issue{background:rgba(248,113,113,.15);color:var(--red)}
+.badge.info{background:rgba(108,99,255,.15);color:var(--accent)}
+</style>
+</head>
+<body>
+
+<h1>DeepSeek-V3 × 8×H20 建模校准报告</h1>
+<div class="sub">日期: 2026-08-10 · 平台: KVCacheModeling (index.html) · 测试机: 29.209.104.16 (pd-dsv3 容器, HiCache fork sglang f01f70696, TP8, page_size=1, chunked_prefill=8192) · 测试方式: aligned_bench.py 按 trace arrive 时间泊松分散发送, 与建模 runSimulation 请求生成逻辑完全一致 (gen_trace.js 提取)</div>
+
+<div class="card">
+<h2>📌 核心结论</h2>
+<table>
+<tr><th>发现</th><th>详情</th></tr>
+<tr><td><span class="badge fix">校准修正</span>prefill 固定成本 a</td><td>79.5 → <b>216 μs/tok</b>（DS-V3 实测 2048tok=444ms 反推；79.5 是 Qwen3-32B 单卡值被误用于 DS-V3）</td></tr>
+<tr><td><span class="badge fix">校准修正</span>prefill 位置斜率 b</td><td>5.33e-3 → <b>1.1e-3 μs/tok²</b>（物理确定: kvPerTok/aggHbmBW = 35136B/32TB/s）</td></tr>
+<tr><td><span class="badge fix">校准修正</span>混合批耦合系数</td><td>0.85 → <b>0.3</b>（0.85 基于 8/6 同时发送错误口径，导致 TTFT 高估 7×；8/10 分散到达实测 TTFT-outLen 解耦）</td></tr>
+<tr><td><span class="badge fix">校准修正</span>prefill 并行 boost</td><td>1+(n-1)/gpus → <b>min(n, cap/mfu)</b>（实测 conc1/conc8 需接近线性并行提升；旧公式 8 卡下几乎无提升）</td></tr>
+<tr><td><span class="badge info">验证</span>TTFT-outLen 解耦</td><td>out64/out256/out1024 实测 TTFT ≈ 396/478/396ms —— 分散到达下 TTFT 与 outputLen 几乎无关（推翻 8/6 耦合结论）</td></tr>
+<tr><td><span class="badge issue">已知边界</span>conc32 高并发</td><td>仿真 526ms vs 实测 4180ms（低估 8×）：64 请求下 sglang prefill 并行受限+decode 竞争，需更细的 wave/资源竞争建模（P2）</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>📊 实测 vs 仿真对照（TTFT mean/median/p99, TPOT）</h2>
+<p class="sub">实测: aligned_bench.py 按 trace 泊松分散发送 (trace 与仿真同 seed=42 同参数, 4 组前缀 hit40%) · 仿真: runSimulation fw=sglang/radix/混合批</p>
+<table id="cmpTable"></table>
+<div class="formula">TTFT 定义一致: 首 token 时间 - 请求到达时间 · 前缀复用一致: 组内 founder 建立共享前缀, sharer 命中（sglang radix 渐进激活 / 仿真 radix 模式同语义）</div>
+</div>
+
+<div class="card">
+<h2>📈 TTFT 校准前后对比（base: conc8/in2048/out256/qps4/hit40）</h2>
+<div id="chartBase" class="chart"></div>
+</div>
+
+<div class="card">
+<h2>🛠 校准内容明细</h2>
+<h3>1. prefill 成本参数 (a/b)</h3>
+<div class="formula">旧: τ(i) = 79.5 + 5.33e-3·i μs/tok（Qwen3-32B 单卡校准, 误用于 DS-V3 8 卡）<br>
+新: τ(i) = <b>216</b> + <b>1.1e-3</b>·i μs/tok<br>
+推导: 8/10 实测 conc1-hit0 单请求 1382tok prefill ≈194ms → a ≈ 216μs/tok; b = kvPerToken/aggHbmBW 物理确定<br>
+验证: conc1 仿真 353ms vs 实测 367ms（-4%）</div>
+
+<h3>2. 混合批耦合系数</h3>
+<div class="formula">旧: pfFactor = 1 - 0.85×min(1, decodeUtil) —— decode 满时 prefill 仅 15% 速率<br>
+新: pfFactor = 1 - <b>0.3</b>×min(1, decodeUtil) —— decode 满时 prefill 保留 70%<br>
+根因: 8/6 的 0.85 来自 aligned_bench 旧版"同时发送全部请求"（16 请求瞬时涌入 → decode 长输出占满 GPU → 假耦合 7330ms）；<br>
+8/10 新版按 trace arrive 泊松分散发送 → out64/out256/out1024 TTFT=396/478/396ms 实测解耦 → 系数降至 0.3</div>
+
+<h3>3. prefill 并行 boost</h3>
+<div class="formula">旧: boost = 1+(n-1)/gpus（8 卡时 4 并行仅 1.375×, 与实测矛盾）<br>
+新: boost = <b>min(n, PREFILL_UTIL_CAP/mfu)</b>（n=4, mfu=30% → 3×; conc1 2 并行 → 2×）<br>
+验证: conc1 仿真 353ms (旧 613ms) vs 实测 367ms; conc8 仿真 486ms (旧 3390ms) vs 实测 478ms</div>
+
+<h3>4. DS-V3 模型预设</h3>
+<div class="formula">models['DeepSeek-V3'] 新增 calibA:216/calibB:0.0011 —— applyModel 优先使用实测校准值, 其他模型走 estimatePrefillParams 纯推导</div>
+</div>
+
+<div class="card">
+<h2>⚠️ 已知边界与后续</h2>
+<table>
+<tr><th>边界</th><th>说明</th><th>优先级</th></tr>
+<tr><td>conc32 高并发 TTFT 低估</td><td>64 请求下仿真 prefill boost 过高 → 排队不足。真实 sglang 高并发下 prefill wave 受限 + decode 竞争。需建模: ①prefill/decode 共享算力池 ②wave 级串行 ③max_prefill_tokens 限制</td><td>P2</td></tr>
+<tr><td>TPOT 高并发低估</td><td>conc32 TPOT 仿真 25.1 vs 实测 33.5（decode batch 大时 attention 幂律不足）</td><td>P2</td></tr>
+<tr><td>qps16 稳定性</td><td>16 QPS 瞬时涌入触发 sglang NCCL TCPStore 断连（server 崩溃），需重启；高并发实测需分批</td><td>运维</td></tr>
+<tr><td>Qwen3-32B 回归</td><td>TPOT 43.98 vs 43.97 保持 ✓; TTFT 6410 vs 5852 (+9.5%, 位置感知 prefill 累计效应, 单卡 boost 公式数学等价)</td><td>观察</td></tr>
+</table>
+</div>
+
+<script>
+const MEASURED = {
+  'conc1-hit0': {ttft_avg: 243.4, ttft_p50: 193.6, ttft_p99: 293.2, tpot: 9.71, n: 2},
+  'conc1-hit40': {ttft_avg: 366.8, ttft_p50: 332.0, ttft_p99: 401.5, tpot: 9.79, n: 2},
+  'base(conc8/out256)': {ttft_avg: 478.1, ttft_p50: 488.5, ttft_p99: 737.8, tpot: 21.87, n: 16},
+  'out64': {ttft_avg: 396.0, ttft_p50: 404.7, ttft_p99: 643.3, tpot: 16.58, n: 16},
+  'out1024': {ttft_avg: 396.5, ttft_p50: 410.5, ttft_p99: 631.2, tpot: 19.20, n: 16},
+  'conc32': {ttft_avg: 4179.7, ttft_p50: 4483.3, ttft_p99: 10160.0, tpot: 33.48, n: 64},
+};
+// 修改后仿真值(sim_verify.js 实测: 同参数 fw=sglang/radix/混合批)
+const SIM = {
+  'conc1-hit40': {ttft_avg: 353, ttft_p50: 413, ttft_p99: null, tpot: 13.6},
+  'base(conc8/out256)': {ttft_avg: 486, ttft_p50: 511, ttft_p99: null, tpot: 23.6},
+  'out64': {ttft_avg: 409, ttft_p50: null, ttft_p99: null, tpot: 17.8},
+  'out1024': {ttft_avg: 486, ttft_p50: null, ttft_p99: null, tpot: 24.0},
+  'conc32': {ttft_avg: 526, ttft_p50: null, ttft_p99: null, tpot: 25.1},
+};
+// 旧仿真值(校准前, 8/6 引擎)
+const SIM_OLD = {
+  'conc1-hit40': {ttft_avg: 613},
+  'base(conc8/out256)': {ttft_avg: 3390},
+  'conc32': {ttft_avg: 17067},
+};
+
+function pct(a, q){return a!=null ? a : '—'}
+function fmt(v){return v!=null ? v.toFixed(1) : '—'}
+function ratio(sim, mea){
+  if(sim==null||mea==null||mea===0) return '—';
+  const r = sim/mea;
+  if(r>1.3||r<0.7) return '<span class="bad">'+r.toFixed(2)+'×</span>';
+  if(r>1.15||r<0.85) return '<span class="warn">'+r.toFixed(2)+'×</span>';
+  return '<span class="ok">'+r.toFixed(2)+'×</span>';
+}
+function renderCmp(){
+  const rows = [
+    ['conc1-hit0', 'conc1 / hit0(无前缀)', '2'],
+    ['conc1-hit40', 'conc1 / hit40', '2'],
+    ['base(conc8/out256)', 'conc8 / in2048 / out256', '16'],
+    ['out64', 'conc8 / out64', '16'],
+    ['out1024', 'conc8 / out1024', '16'],
+    ['conc32', 'conc32(64请求, 高并发)', '64'],
+  ];
+  let html = '<tr><th>场景</th><th>配置</th><th>N</th><th>实测 TTFT avg</th><th>仿真 TTFT avg</th><th>比值</th><th>实测 p50</th><th>实测 p99</th><th>实测 TPOT</th><th>仿真 TPOT</th></tr>';
+  for(const [k, cfg, n] of rows){
+    const m = MEASURED[k], s = SIM[k];
+    if(!m||!s) continue;
+    html += '<tr><td>'+k+'</td><td>'+cfg+'</td><td>'+n+'</td>'
+      + '<td>'+fmt(m.ttft_avg)+'ms</td><td>'+fmt(s.ttft_avg)+'ms</td><td>'+ratio(s.ttft_avg, m.ttft_avg)+'</td>'
+      + '<td>'+fmt(m.ttft_p50)+'ms</td><td>'+fmt(m.ttft_p99)+'ms</td>'
+      + '<td>'+fmt(m.tpot)+'ms</td><td>'+fmt(s.tpot)+'ms</td></tr>';
+  }
+  document.getElementById('cmpTable').innerHTML = html;
+}
+
+function drawBaseChart(){
+  const ch = echarts.init(document.getElementById('chartBase'));
+  const scenes = ['conc1-hit0','conc1-hit40','base(conc8/out256)','out64','out1024'];
+  const meas = scenes.map(s=>MEASURED[s]?MEASURED[s].ttft_avg:null);
+  const sim = scenes.map(s=>SIM[s]?SIM[s].ttft_avg:null);
+  const simOld = scenes.map(s=>SIM_OLD[s]?SIM_OLD[s].ttft_avg:null);
+  ch.setOption({
+    tooltip:{trigger:'axis'},
+    legend:{data:['实测 TTFT avg','校准后仿真','校准前仿真'],textStyle:{color:'#9ca0b0'}},
+    grid:{left:60,right:20,top:40,bottom:30},
+    xAxis:{type:'category',data:scenes,axisLabel:{color:'#9ca0b0'}},
+    yAxis:{type:'log',name:'ms',axisLabel:{color:'#9ca0b0'}},
+    series:[
+      {name:'实测 TTFT avg',type:'bar',data:meas,itemStyle:{color:'#34d399'}},
+      {name:'校准后仿真',type:'bar',data:sim,itemStyle:{color:'#6c63ff'}},
+      {name:'校准前仿真',type:'bar',data:simOld,itemStyle:{color:'#f87171'}},
+    ]
+  });
+}
+
+renderCmp();
+drawBaseChart();
+window.addEventListener('resize',()=>{echarts.getInstanceByDom(document.getElementById('chartBase')).resize();});
+</script>
+</body>
+</html>

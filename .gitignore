@@ -1,0 +1,41 @@
+# 部署产物(由 index.html 一键生成, 可随时重建)
+dist/
+
+# 工具内部数据: 个人工作日志不入库(回归脚本 .workbuddy/*.js 保留)
+.workbuddy/memory/
+
+# 临时操作脚本
+free_gpu.sh
+trace.json
+s2.txt
+poll*.sh
+chk*.sh
+push_*.sh
+run_bench*.sh
+mkcasetrace.sh
+free_gpu*.sh
+kill*.sh
+sm1.txt
+
+# 系统/临时文件
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+l3_test_results/
+gpu_proc.sh
+gpu_query.sh
+owner*.sh
+who_owns.sh
+s1.txt
+s2o.txt
+
+# 本地调试临时文件
+_cache_test*.js
+doctor_out*.txt
+d3.txt
+s1.txt
+s2o.txt
+sim_l2l3*.js
+sim_race*.js
