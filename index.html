@@ -282,9 +282,18 @@ select option{background:var(--surface2);color:var(--text)}
       </div>
     </div>
 
+    <div class="form-row" style="margin-bottom:8px;align-items:center">
+      <div><label>L3 预取策略 (sglang HiCache)</label><select id="sPrefetchPolicy" onchange="setPrefetchPolicy(this.value)" style="width:auto">
+        <option value="wait_complete" selected>wait_complete（等 KV 拉齐再算）</option>
+        <option value="best_effort">best_effort（边拉边算, 完成=max(计算,拉取)）</option>
+        <option value="suffix_race">suffix_race（GPU 前向重算 + L3 后向拉取, 相遇即停）</option>
+      </select></div>
+      <span style="font-size:.7rem;color:var(--text-dim)">选择后自动写入 DSL 的 PREFETCH 行（wait_complete→none）</span>
+    </div>
+
     <div style="display:flex;gap:12px;margin-bottom:10px">
       <div style="flex:1">
-        <textarea id="sDsl" spellcheck="false" style="width:100%;height:180px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:var(--text);font-family:'SF Mono','Fira Code',monospace;font-size:.73rem;line-height:1.6;resize:vertical;outline:none"
+        <textarea id="sDsl" spellcheck="false" oninput="syncPrefetchSelect()" style="width:100%;height:180px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:var(--text);font-family:'SF Mono','Fira Code',monospace;font-size:.73rem;line-height:1.6;resize:vertical;outline:none"
           placeholder="ADMIT: always&#10;EVICT: lru from hbm when 85% -> dram&#10;PREFETCH: none&#10;BATCH: continuous max(8)&#10;PLACE: hbm_first"></textarea>
         <div id="sDslError" style="font-size:.65rem;color:var(--accent4);min-height:16px;margin-top:2px"></div>
       </div>
@@ -1601,6 +1610,7 @@ function switchMode(mode) {
     $('strategySubtitle').textContent = 'JavaScript模式：自由编写调度函数。引擎在每个决策点调用你的 admit/evict/prefetch/place';
     if (!$('sDsl').value.trim() || $('sDsl').value.match(/^ADMIT:/m)) {
       $('sDsl').value = strategyPresetsJS['Pure-HBM'];
+      syncPrefetchSelect();
     }
     ref.innerHTML = '<b style="color:var(--accent2)">JS API 参考</b><br>'+
       '<code>admit(req)</code> → tier<br>'+
@@ -1619,6 +1629,7 @@ function switchMode(mode) {
     $('strategySubtitle').textContent = 'DSL模式：规则语言描述。点击"JS"切换为编程模式获得完全自由度';
     if ($('sDsl').value.trim().startsWith('// JavaScript')) {
       $('sDsl').value = strategyPresets['Pure-HBM'];
+      syncPrefetchSelect();
     }
     ref.innerHTML = '<b style="color:var(--accent)">DSL 语法参考</b><br>'+
       '<code>ADMIT: always</code><br>'+
@@ -1742,6 +1753,29 @@ function place() { return hbmUsage() < 0.9 ? 'hbm' : 'dram'; }`,
 };
 
 // ======================== DSL PARSER ========================
+// L3 预取策略开关 → DSL PREFETCH 行（2026-08-12）:
+// wait_complete→none(等拉齐), best_effort→best_effort(边拉边算), suffix_race→race(相遇即停)
+function setPrefetchPolicy(v) {
+  let map = { wait_complete: 'none', best_effort: 'best_effort', suffix_race: 'race' };
+  let dsl = $('sDsl');
+  if (!dsl) return;
+  let lines = dsl.value.split('\n');
+  let newLine = 'PREFETCH: ' + (map[v] || 'none');
+  let idx = lines.findIndex(l => l.trim().startsWith('PREFETCH:'));
+  if (idx >= 0) lines[idx] = newLine;
+  else lines.push(newLine);
+  dsl.value = lines.join('\n');
+  let note = $('prefetchPolicyNote');
+  if (note) note.textContent = '';
+}
+// DSL 被编辑/预设加载后同步下拉（从 PREFETCH 行反查）
+function syncPrefetchSelect() {
+  let dslEl = $('sDsl'), sel = $('sPrefetchPolicy');
+  if (!dslEl || !sel) return;
+  let m = dslEl.value.match(/^PREFETCH:\s*(\w+)/m);
+  let t = m ? m[1] : '';
+  sel.value = t === 'race' ? 'suffix_race' : (t === 'best_effort' ? 'best_effort' : 'wait_complete');
+}
 function parseDSL(text) {
   let s = {
     name: '', dsl: text,
@@ -1818,6 +1852,7 @@ function dslToText(s) {
   if (p.type === 'none') lines.push('PREFETCH: none');
   else if (p.type === 'eager') lines.push('PREFETCH: eager');
   else if (p.type === 'race') lines.push('PREFETCH: race');   // race: GPU前向后重算 + L3后向前拉取, 相遇即停
+  else if (p.type === 'best_effort') lines.push('PREFETCH: best_effort');  // 边拉边算, 完成=max(计算,拉取)
   else lines.push('PREFETCH: '+p.type+' from '+(p.from_tier||'dram')+' when hbm<'+(Math.round((p.prefetch_threshold||0.5)*100))+'%');
   let b = s.batching;
   lines.push('BATCH: '+b.type+' max('+(b.max_batch_size||8)+')');
@@ -1830,7 +1865,7 @@ function dslToText(s) {
 
 function autoNameStrategy(s) {
   let a = s.admission.type, e = s.eviction.type, p = s.prefetch.type;
-  return (a==='always'?'AH':a==='threshold'?'TH':'PR')+'-'+(e==='lru'?'LRU':e==='lfu'?'LFU':e.toUpperCase())+'-'+(p==='none'?'NP':p==='on_demand'?'OD':'EG');
+  return (a==='always'?'AH':a==='threshold'?'TH':'PR')+'-'+(e==='lru'?'LRU':e==='lfu'?'LFU':e.toUpperCase())+'-'+(p==='none'?'NP':p==='on_demand'?'OD':p==='race'?'RC':p==='best_effort'?'BE':'EG');
 }
 
 function getCurrentStrategy() {
@@ -1881,6 +1916,7 @@ function loadStrategy(idx) {
   if (!s) return;
   $('sName').value = s.name;
   $('sDsl').value = s.dsl || dslToText(s);
+  syncPrefetchSelect();
   $('sDslError').textContent = '';
 }
 
@@ -2249,6 +2285,9 @@ function runSimulation(strategy, overrides) {
     // 仅对"有 L3 命中(fetchTime>0)"的请求生效; 无命中请求走普通 prefill。
     req._race = !!(s.prefetch && s.prefetch.type === 'race' && req.fetchTime > 0);
     req._raceTok = 0;   // race: L3 从尾部已拉取 token 数
+    // best_effort(2026-08-12): 边拉边算——计算不等待 fetch, 与拉取并行推进,
+    // 完成 = max(计算完, 拉取完)。仅对命中请求(fetchTime>0)生效。
+    req._be = !!(s.prefetch && s.prefetch.type === 'best_effort' && req.fetchTime > 0);
 
     // 3) 构造新块（PagedAttention 块；过多时合并为超级块保证性能）
     let totalNewTokens = groupPrefixTokens + ownTokens;
@@ -2606,7 +2645,8 @@ function runSimulation(strategy, overrides) {
           sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
           continue;
         }
-        if ((qq.fetchTime || 0) > qq._fetchDone) continue; // 拉取中不占算力
+        // best_effort 计算进行中占算力（与拉取并行）；wait_complete 拉取中不占算力
+        if (!qq._be && (qq.fetchTime || 0) > qq._fetchDone) continue;
         // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
         let pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
@@ -2620,6 +2660,10 @@ function runSimulation(strategy, overrides) {
           q._pfDone += perReqTok;
           q._raceTok += DT * (p.ssdBW * 1e9 * 0.9) / Math.max(kvPerTok, 1);
           if (q._pfDone + q._raceTok >= q.inputLen) q._pfDone = q._pfTotal;  // 相遇 → 完成
+        } else if (q._be) {
+          // best_effort: 计算与拉取并行推进, 完成 = max(计算完, 拉取完)
+          q._pfDone += perReqTok;
+          q._fetchDone = Math.min(q.fetchTime || 0, (q._fetchDone || 0) + DT);
         } else if ((q.fetchTime || 0) > q._fetchDone) { q._fetchDone += DT; continue; }
         else q._pfDone += perReqTok;
         // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
@@ -2635,7 +2679,9 @@ function runSimulation(strategy, overrides) {
           prefixGroupMap[q.groupId].blkIds = q.groupBlkIds.slice(0, availN);
           prefixGroupMap[q.groupId].activated = true;
         }
-        if (q._pfDone >= q._pfTotal) {
+        // best_effort 完成需 计算+拉取 都到齐（decode 需全部 KV）
+        let _done = q._pfDone >= q._pfTotal && (!q._be || q._fetchDone >= (q.fetchTime || 0));
+        if (_done) {
           prefilling.splice(i, 1);
           q.prefillEnd = now;
           // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续
@@ -3359,12 +3405,14 @@ function initStrategyTab() {
       $('sDslError').textContent = '';
       $('sName').value = '';
       $('sName').placeholder = strategyMode === 'js' ? '自动命名: JS-'+name : '自动命名: '+autoNameStrategy(parseDSL(text));
+      syncPrefetchSelect();
     };
     bar.appendChild(btn);
   });
   if (!$('sDsl').value.trim()) {
     $('sDsl').value = strategyMode === 'js' ? strategyPresetsJS['Pure-HBM'] : strategyPresets['Pure-HBM'];
   }
+  syncPrefetchSelect();
 }
 
 // ======================== INIT ========================
