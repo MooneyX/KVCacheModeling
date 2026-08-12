@@ -853,7 +853,7 @@ function updateQuickResults(){
       ? '<code>MLA: L×(kvLora+rope)×dt = '+p.layers+'×('+(p.kvLora+p.ropeDim)+')×'+p.dtypeBytes+' = '+formatBytes(r.kvPerToken)+'</code>'
       : '<code>2×L×kvHeads×headDim×dt = '+formatBytes(r.kvPerToken)+'</code>')+'<br>'+
     '• 单请求KV含碎片: <code>⌈S/blockSize⌉×blockSize×kv/tok = '+r.blocksPerReq+'块×'+formatBytes(r.blockBytes)+' = '+formatBytes(r.perRequestKv)+'</code>（碎片 '+r.fragPct.toFixed(1)+'%）<br>'+
-    '• 前缀抵扣: <code>'+(p.prefixHit*100).toFixed(0)+'% × S<sub>in</sub> × kv/tok = '+formatBytes(r.prefixSavedPerReq)+'/请求</code> → 有效占用 '+formatBytes(r.effPerReqKv)+'（命中率=可复用前缀token占总输入的比例；前缀组结构[12/22/35/48]%决定分布，不影响期望总量）<br>'+
+    '• 前缀抵扣: <code>'+(p.prefixHit*100).toFixed(0)+'% × S<sub>in</sub> × kv/tok = '+formatBytes(r.prefixSavedPerReq)+'/请求</code> → 有效占用 '+formatBytes(r.effPerReqKv)+'（命中率=可复用前缀token占总输入的比例；前缀组结构[12/22/35/48]%决定分布，单请求覆盖量 = 命中率×组比例×S<sub>in</sub>，期望总量 = 命中率×总输入）<br>'+
     '• Prefill(位置感知): <code>τ(i)=a+b·i = '+p.prefillA+'+'+p.prefillB+'·i μs/tok</code> → T<sub>prefill</sub> = a·L + b·L²/2 = '+(r.ttftEst*1000).toFixed(0)+'ms（含 TP通信；a/b 来自实测拟合）<br>'+
     '• Decode(带宽瓶颈): <code>passTime = max[(权重+批次KV)/HBM带宽, 2×激活参数×B/算力] + TP通信 = '+(r.passTime*1000).toFixed(2)+' ms</code> → 每请求 '+r.decodeTpsPerReq.toFixed(0)+' tok/s（KV 读取量随输出增长）<br>'+
     '• TP通信(AllReduce): <code>2×L×(2(TP−1)/TP × B×hidden×2B)/NVLink + 2×L×5μs = '+(r.commOverhead*1000).toFixed(2)+' ms/步</code>（TP='+r.tpSize+'，占 passTime '+(r.commOverhead/r.passTime*100).toFixed(0)+'%）<br>'+
@@ -1868,6 +1868,9 @@ function runSimulation(strategy, overrides) {
   let inFlight = [];
   let stats = { hbmAcc: 0, dramAcc: 0, ssdAcc: 0, latencies: [], ttfts: [], tpots: [], queueWaits: [],
     completed: 0, evictions: 0, activeEvictions: 0, prefetches: 0, drops: 0, transferBytes: 0,
+    // TTFT/延迟分解累计（秒）：TTFT = 到达排队 + prefill排队 + L3拉取fetch + prefill计算；
+    // 延迟 = TTFT + decode槽位等待 + decode执行（L3 读占比的落点）
+    ttftQ: 0, ttftP: 0, ttftF: 0, ttftC: 0, latDw: 0, latDt: 0,
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
     hbmReadBytes: 0, dramReadBytes: 0, ssdReadBytes: 0,       // 每步批次读取量的时间累计（÷仿真时长=平均读带宽）
     dramPeak: 0, ssdPeak: 0, dramUsedSum: 0, ssdUsedSum: 0,   // L2/L3 峰值与时间加权均值占用
@@ -1975,17 +1978,20 @@ function runSimulation(strategy, overrides) {
   let prefixGroupMap = {};
   if (p.prefixHit > 0.001) {
     let totalInput = requests.reduce((s, r) => s + r.inputLen, 0);
-    let targetReused = totalInput * p.prefixHit;
+    let h = Math.min(p.prefixHit, 1);                 // 命中率 h ∈ (0,1]
     let avgInput = Math.max(p.inputLen, 1);
     let groupDefs = [
       { id: 'pfx_A', ratio: 0.12 }, { id: 'pfx_B', ratio: 0.22 },
       { id: 'pfx_C', ratio: 0.35 }, { id: 'pfx_D', ratio: 0.48 },
     ];
     let sumRatioSq = groupDefs.reduce((s, g) => s + g.ratio * g.ratio, 0);
-    let k = sumRatioSq > 0 ? (targetReused / avgInput) / sumRatioSq : 0;
+    // 入组数按满命中(h=1)基准配比(与 h 无关)；单请求覆盖量随 h 缩放:
+    // pTokLen = h×ratio×avgInput → 期望实际覆盖 = Σ nTotal×pTokLen = h×totalInput
+    // (修复 2026-08-11: 旧版 pTokLen 固定、仅 nTotal 随 h 增长, maxAssign 封顶后命中率不敏感)
+    let k = sumRatioSq > 0 ? (totalInput / avgInput) / sumRatioSq : 0;
     let assignments = [], totalAssigned = 0;
     groupDefs.forEach(g => {
-      let pTokLen = Math.round(avgInput * g.ratio);
+      let pTokLen = Math.round(avgInput * g.ratio * h);   // h 缩放单请求覆盖
       if (pTokLen <= 0) return;
       let nTotal = Math.max(1, Math.round(k * g.ratio)) + 1;
       assignments.push({ group: g, prefixTokLen: pTokLen, nTotal: nTotal });
@@ -2321,6 +2327,16 @@ function runSimulation(strategy, overrides) {
     stats.ttfts.push((req.prefillEnd - req.arrive) * 1000);
     stats.tpots.push((now - (req.decodeStart || req.prefillEnd)) / Math.max(1, req.outputLen) * 1000); // ms/token（剔除 decodeWait 排队）
     stats.queueWaits.push(req.admitTime - req.arrive);
+    // TTFT/延迟分解（秒）：qW=到达→准入, pW=准入→prefill开始, fW=L3拉取等待(fetchTime),
+    // cW=实际prefill计算, dW=decode槽位等待, dT=decode执行。校验: qW+pW+fW+cW+dW+dT = 延迟。
+    let _qW = Math.max(0, req.admitTime - req.arrive);
+    let _pW = Math.max(0, (req.prefillStart || 0) - req.admitTime);
+    let _fW = Math.min(req.fetchTime || 0, req._fetchDone || 0);
+    let _cW = Math.max(0, req.prefillEnd - req.prefillStart - _fW);
+    stats.ttftQ += _qW; stats.ttftP += _pW; stats.ttftF += _fW; stats.ttftC += _cW;
+    let _dW = Math.max(0, (req.decodeStart || req.prefillEnd) - req.prefillEnd);
+    let _dT = Math.max(0, req.completeTime - (req.decodeStart || req.prefillEnd));
+    stats.latDw += _dW; stats.latDt += _dT;
     stats.completed++; stats.outTokens += req.outputLen;
     if (timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
       prefillStart: req.prefillStart, prefillEnd: req.prefillEnd, completeTime: now });
@@ -2820,6 +2836,16 @@ function runSimulation(strategy, overrides) {
     l2BWPeak: pctOf(stats.l2Inst, 1), l3BWPeak: pctOf(stats.l3Inst, 1),
     // 容量需求 = 峰值占用（容量低于该值必发生淘汰/丢弃/排队）
     // passTime 分解（名义分量占比）与瓶颈归因（时间主要花在哪层）
+    // TTFT 分解（平均 ms）：queue/prefillQ/fetch/compute 构成 prefill 段时间账；
+    // dWait/dTime 为 decode 段（延迟分解用）。TTFT = queue+prefillQ+fetch+compute
+    ttftBreakdown: stats.completed > 0 ? {
+      queue: stats.ttftQ / stats.completed * 1000,
+      prefillQ: stats.ttftP / stats.completed * 1000,
+      fetch: stats.ttftF / stats.completed * 1000,
+      compute: stats.ttftC / stats.completed * 1000,
+      dWait: stats.latDw / stats.completed * 1000,
+      dTime: stats.latDt / stats.completed * 1000
+    } : null,
     ptBreakdown: stats.ptSamples > 0 ? {
       hbm: stats.ptHbm / (stats.ptHbm + stats.ptL2 + stats.ptL3 + stats.ptCmp + stats.ptComm) * 100,
       l2: stats.ptL2 / (stats.ptHbm + stats.ptL2 + stats.ptL3 + stats.ptCmp + stats.ptComm) * 100,
@@ -2951,19 +2977,34 @@ function drawStrategyTierDemand(){
   let colors = {hbm:'#6c63ff', l2:'#fb923c', l3:'#f87171', cmp:'#34d399', comm:'#9ca0b0'};
   let names = {hbm:'HBM读', l2:'L2读', l3:'L3读', cmp:'算力下限', comm:'TP通信'};
   let keys = ['hbm','l2','l3','cmp','comm'];
-  // 图1: passTime 分解（100% 堆叠，占比最大者=瓶颈）
+  // 图1: TTFT 分解 + passTime 分解（各 100% 堆叠，每策略两条）
+  // TTFT 条 = prefill 段时间账（到达排队/准入排队/L3拉取/计算）；passTime 条 = decode 每 token 前向账
+  // ——区分「TTFT 时间花在哪」vs「延迟(每前向)时间花在哪」，L3 拉取与 L3 读的落点一目了然
+  let ttftNames = ['TTFT·到达排队','TTFT·prefill排队','TTFT·L3拉取','TTFT·prefill计算'];
+  let ttftKeys = ['queue','prefillQ','fetch','compute'];
+  let ttftColors = ['#B5D4F4','#85B7EB','#FAC775','#185FA5'];
+  let ycats = [];
+  simResults.forEach(s => { ycats.push(s.name + ' · TTFT'); ycats.push(s.name + ' · 每token前向'); });
   let ch = initChart('chartStrategyPt');
   ch.setOption({
     tooltip:{trigger:'axis',axisPointer:{type:'shadow'},valueFormatter:v=>v.toFixed(1)+'%'},
-    legend:{data:keys.map(k=>names[k]),top:0,textStyle:{color:'#9ca0b0',fontSize:10}},
-    grid:{left:90,right:30,top:34,bottom:24},
+    legend:{data:[...ttftNames, ...keys.map(k=>names[k])],top:0,textStyle:{color:'#9ca0b0',fontSize:9}},
+    grid:{left:120,right:30,top:46,bottom:24},
     xAxis:{type:'value',name:'占比(%)',max:100,nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
-    yAxis:{type:'category',data:simResults.map(s=>s.name),axisLabel:{color:'#e4e4e7',fontSize:10}},
-    series:keys.map(k=>({
-      name:names[k],type:'bar',stack:'pt',barMaxWidth:30,
-      data:simResults.map(s=>+(s.ptBreakdown ? s.ptBreakdown[k] : 0).toFixed(1)),
-      itemStyle:{color:colors[k]}
-    }))
+    yAxis:{type:'category',data:ycats,axisLabel:{color:'#e4e4e7',fontSize:10}},
+    series:[
+      ...ttftKeys.map((k,i)=>({
+        name:ttftNames[i],type:'bar',stack:'ttft',barMaxWidth:22,
+        data:simResults.map(s=>{ let b=s.ttftBreakdown; if(!b) return 0;
+          let t=b.queue+b.prefillQ+b.fetch+b.compute; return t>0?+(b[k]/t*100).toFixed(1):0; }),
+        itemStyle:{color:ttftColors[i]}
+      })),
+      ...keys.map(k=>({
+        name:names[k],type:'bar',stack:'pt',barMaxWidth:22,
+        data:simResults.map(s=>+(s.ptBreakdown ? s.ptBreakdown[k] : 0).toFixed(1)),
+        itemStyle:{color:colors[k]}
+      }))
+    ]
   });
   // 图2: L2/L3 带宽需求 P99/峰值 vs 配置带宽
   let ch2 = initChart('chartStrategyBwReq');
@@ -3000,7 +3041,9 @@ function drawStrategyTierDemand(){
     '<b>📐 L2/L3 需求推导（实测轨迹 → 所需资源，任意代码策略适用）</b><br>'+
     '• <b>带宽需求</b>: 每步瞬时链路速率 = decode读(<code>ΣKV<sub>T</sub>/passTime</code>) + 本步换入换出字节/DT；取 <code>P99 分位 = 推荐所需带宽</code>（峰值评估最坏突发）——平均口径会低估，预取/淘汰突发才是需求决定因素<br>'+
     '• <b>容量需求</b>: 该策略下 L2/L3 峰值占用（低于它必发生淘汰/丢弃/排队）<br>'+
-    '• <b>passTime 分解</b>: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈<br>'+
+    '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
+    '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
+    '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
@@ -3040,7 +3083,7 @@ function drawStrategyComparisonGantt() {
 // ======================== SENSITIVITY ANALYSIS ========================
 // 三参数敏感性：横轴「扫描参数」× 颜色「对比参数」分档 × 纵轴「观察指标」，任意参数组合。
 // 对比参数档位默认自动生成（可选「无」回退单参数扫描），档位文本可编辑。
-// 扫描结果缓存（2026-08-11）：key = (全局参数+策略DSL+扫描参数+对比参数+档位+种子) → 轻量全指标记录数组。
+// 扫描结果缓存（2026-08-11）：key = (全局参数+策略DSL+扫描参数+扫描档位+对比参数+对比档位+种子) → 轻量全指标记录数组。
 // 命中缓存时直接重绘（切换纵轴指标零仿真重跑）；未命中才跑 runSimulation 并缓存全部指标。
 // FIFO 上限 20 条。
 let sensCache = {};
@@ -3134,9 +3177,10 @@ function runSensitivity() {
   }
   let cmpLabel = compareParam ? (v => sensParamUnit(compareParam, v)) : null;
 
-  // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数 + 对比参数/档位 + 种子），不含 metric——
-  // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑
-  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, compareParam, compareVals, gi('pSeed')]);
+  // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数 + 扫描档位 + 对比参数/档位 + 种子），不含 metric——
+  // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑；含扫描档位 values（修复 2026-08-11:
+  // 旧版漏 values → 改扫描档位重跑命中旧缓存显示旧曲线）
+  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, gi('pSeed')]);
   let cached = sensCache[cacheKey];
 
   let chartEl = $('chartSensitivity');
