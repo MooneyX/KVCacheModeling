@@ -2123,7 +2123,9 @@ function runSimulation(strategy, overrides) {
         let nTok = g.prefixTokLen;
         if (nTok <= 0) return;
         let needBytes = nTok * kvPerTok;
-        if (caps.ssd <= 0 || pools.ssd.used + needBytes * tierRatio.ssd > caps.ssd) return;
+        // C3 修复(2026-08-12): 注入容量口径与正常写入一致(evictThreshold=0.98),
+        // 不再按 100% 填满——避免注入即满触发后续强制淘汰(prewarmed 无淘汰保护时被误伤)
+        if (caps.ssd <= 0 || pools.ssd.used + needBytes * tierRatio.ssd > caps.ssd * evictThreshold('ssd')) return;
         let nBlocksRaw = Math.ceil(nTok / p.blockSize);
         let merge = Math.max(1, Math.ceil(nBlocksRaw / MAX_SIM_BLOCKS));
         let nSimBlocks = Math.ceil(nBlocksRaw / merge);
@@ -2207,10 +2209,11 @@ function runSimulation(strategy, overrides) {
 
   function pickVictim(tier) {
     let pool = pools[tier];
-    let avail = pool.blocks.filter(b => b.available);
+    // C1 修复(2026-08-12): prewarmed 块为 L3 常驻(pinned)前缀, 永不被淘汰——HiCache 常驻语义
+    let avail = pool.blocks.filter(b => b.available && !b.prewarmed);
     if (avail.length === 0) return null;
     if (jsEvict) {
-      try { let v = jsEvict(pool, tier); if (v && pool.blockIndex[v.id] && v.available) return v; } catch(e) {}
+      try { let v = jsEvict(pool, tier); if (v && pool.blockIndex[v.id] && v.available && !v.prewarmed) return v; } catch(e) {}
     }
     let type = (tier === 'dram' && s.eviction.second) ? s.eviction.second.type : s.eviction.type;
     if (type === 'lfu') {
@@ -2405,8 +2408,10 @@ function runSimulation(strategy, overrides) {
     req.prefixBlkIds.concat(req.ownBlkIds).forEach(id => {
       if (moved >= 32) return;
       // SSD swap-in：先拉回 DRAM（FlexGen 式换入，占 ssd>dram 链路）
+      // C2 修复(2026-08-12): 跳过 prewarmed 块——L3 常驻前缀不参与主动预取搬运,
+      // 避免搬走上层后 attach 快照 ssdCoveredTok=0 → fetchTime=0 的 L3 语义失效
       let sblk = pools.ssd.blockIndex[id];
-      if (sblk && sblk.available && pools.dram.used + sizeInTier(sblk, 'dram') <= caps.dram * 0.9) {
+      if (sblk && !sblk.prewarmed && sblk.available && pools.dram.used + sizeInTier(sblk, 'dram') <= caps.dram * 0.9) {
         scheduleTransfer(sblk, 'ssd', 'dram');
         moved++; stats.prefetches++;
         return;
@@ -2739,8 +2744,9 @@ function runSimulation(strategy, overrides) {
         for (let id of q.prefixBlkIds.concat(q.ownBlkIds)) {
           if (moved >= 8) break;
           // SSD → DRAM swap-in（不占 HBM 水位，仅受 DRAM 空间约束）
+          // C2 修复(2026-08-12): 跳过 prewarmed 块, 保持 L3 常驻语义
           let sblk = pools.ssd.blockIndex[id];
-          if (sblk && sblk.available && pools.dram.used + sizeInTier(sblk, 'dram') <= caps.dram * 0.9) {
+          if (sblk && !sblk.prewarmed && sblk.available && pools.dram.used + sizeInTier(sblk, 'dram') <= caps.dram * 0.9) {
             scheduleTransfer(sblk, 'ssd', 'dram'); moved++; stats.prefetches++; dirty = true;
             continue;
           }
