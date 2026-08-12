@@ -1995,7 +1995,7 @@ function runSimulation(strategy, overrides) {
     // (h=99% 实测仅 27.7% 覆盖)。新版水桶分配 ΣnTotal=maxAssign, 无截断。
     let assignments = [];
     if (h > 0.001) {
-      let maxAssign = Math.max(4, Math.floor(N * 0.9));      // 入组名额目标(保底4, 兼容小N)
+      let maxAssign = Math.max(4, N);                   // 全请求入组(请求级命中率100%, 前缀缓存全覆盖); 保底4 兼容小N
       let sumRatio = groupDefs.reduce((s, g) => s + g.ratio, 0);
       let quota = groupDefs.map(g => maxAssign * g.ratio / sumRatio);
       let nTotals = quota.map(Math.floor);
