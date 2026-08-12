@@ -2070,13 +2070,12 @@ function runSimulation(strategy, overrides) {
     ];
     let sumRatioSq = groupDefs.reduce((s, g) => s + g.ratio * g.ratio, 0);
     // 入组数按满命中(h=1)基准配比(与 h 无关)；单请求覆盖量随 h 缩放:
-    // pTokLen = h×ratio×avgInput → 期望实际覆盖 = Σ nTotal×pTokLen = h×totalInput
     // (修复 2026-08-11: 旧版 pTokLen 固定、仅 nTotal 随 h 增长, maxAssign 封顶后命中率不敏感)
-    // 2026-08-12 语义重构: prefixHit = 入组请求的"前缀命中比例"——
-    // 共享前缀长度 = avgInput×h（组内统一, 与组 ratio 无关, 与解析层 prefixSavedPerReq 同口径),
-    // 每个入组请求命中 min(前缀长度, inputLen) 的输入。h=0.99 → 命中请求跳过 ~99% prefill。
     // 修复旧版: nTotal=k×ratio+1 使 ΣnTotal≈3N 膨胀, 被 maxAssign 截断后实际覆盖≈h×0.29
     // (h=99% 实测仅 27.7% 覆盖)。新版水桶分配 ΣnTotal=maxAssign, 无截断。
+    // 2026-08-12 v2 语义: prefixHit = 每个请求的"前缀命中比例"(与长度无关的固定比例)——
+    // 每个入组请求命中 round(inputLen×h) 的输入(短/长请求一致), 与解析层 prefixSavedPerReq 同口径;
+    // 共享前缀长度 = max(成员 inputLen)×h(组内统一), founder 取组内最长请求以保证能建完整前缀。
     let assignments = [];
     if (h > 0.001) {
       let maxAssign = Math.max(4, N);                   // 全请求入组(请求级命中率100%, 前缀缓存全覆盖); 保底4 兼容小N
@@ -2087,7 +2086,7 @@ function runSimulation(strategy, overrides) {
       let order = quota.map((q, i) => [i, q - Math.floor(q)]).sort((a, b) => b[1] - a[1]);
       for (let j = 0; j < rem; j++) nTotals[order[j % order.length][0]]++;
       groupDefs.forEach((g, i) => {
-        if (nTotals[i] >= 2) assignments.push({ group: g, prefixTokLen: Math.round(avgInput * h), nTotal: nTotals[i] });
+        if (nTotals[i] >= 2) assignments.push({ group: g, nTotal: nTotals[i] });
       });
     }
     let pool = requests.slice();
@@ -2097,10 +2096,17 @@ function runSimulation(strategy, overrides) {
       let grp = [];
       for (let i = 0; i < a.nTotal && pi < pool.length; i++, pi++) {
         let req = pool[pi];
-        req.groupId = a.group.id; req.prefixTokLen = Math.min(a.prefixTokLen, req.inputLen); // 命中 ≤ 输入长度(短请求整段在前缀内)
-        req.isFounder = (i === 0); grp.push(req);
+        req.groupId = a.group.id;
+        req.prefixTokLen = Math.max(1, Math.round(req.inputLen * h)); // 每请求固定命中比例(与其自身长度无关)
+        req.isFounder = false; grp.push(req);
       }
-      if (grp.length >= 2) prefixGroupMap[a.group.id] = { prefixTokLen: a.prefixTokLen, blkIds: [], refcount: 0, activated: false };
+      if (grp.length >= 2) {
+        // founder = 组内最长请求: 能 prefill 出完整组前缀(ownTokens = maxInput - P ≥ 0)
+        grp.sort((x, y) => y.inputLen - x.inputLen);
+        grp[0].isFounder = true;
+        let P = Math.max(...grp.map(r0 => r0.prefixTokLen));  // 组前缀 = 最长请求的 h%
+        prefixGroupMap[a.group.id] = { prefixTokLen: P, blkIds: [], refcount: 0, activated: false };
+      }
     });
     Object.keys(prefixGroupMap).forEach(gid => {
       let grp = requests.filter(r0 => r0.groupId === gid);
@@ -2246,8 +2252,8 @@ function runSimulation(strategy, overrides) {
         coveredTok += loc.blk.tokens;
         if (loc.tier === 'ssd') ssdCoveredTok += loc.blk.tokens; }
     });
-    // 命中量不超过自身前缀长度：组内小输入请求的 prefixTokLen 被 clamp 到 inputLen×0.7，
-    // 而组前缀块可能更长——直接累加会高估命中（覆盖掉应重算的部分）
+    // 命中量不超过自身前缀长度: 组前缀 P 覆盖到最长请求, 短请求 attach 全部 P 块但
+    // clamp 到自己的 inputLen×h——保证"不同长度请求命中固定比例 h"的语义
     if (req.groupId && !req.isFounder && coveredTok > req.prefixTokLen) {
       coveredTok = req.prefixTokLen;
       ssdCoveredTok = Math.min(ssdCoveredTok, req.prefixTokLen);
