@@ -249,14 +249,10 @@ select option{background:var(--surface2);color:var(--text)}
           <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b 的估计值并填入(无需实测)">🎯 自动估算 a/b</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
         </div>
         <div class="form-row" style="margin-top:6px">
-          <div><label>推理框架</label><select id="pFramework" onchange="applyFramework(this.value)">
-            <option value="generic" selected>通用</option>
-            <option value="vllm">vLLM</option>
-            <option value="sglang">sglang</option>
-          </select></div>
+          <div><label>推理引擎</label><span style="font-size:.75rem;color:var(--accent);line-height:1.7">sglang（默认, 2026-08-12 起固定）<br>RadixAttention 渐进前缀</span></div>
           <div><label>前缀缓存</label><select id="pPrefixCache">
-            <option value="hash" selected>整段哈希(vLLM)</option>
-            <option value="radix">前缀树·渐进(sglang)</option>
+            <option value="hash">整段哈希(vLLM 兼容)</option>
+            <option value="radix" selected>前缀树·渐进(sglang)</option>
           </select></div>
           <div><label>PD分离</label><select id="pPdSep">
             <option value="0" selected>关(混合批)</option>
@@ -529,7 +525,7 @@ function getParams(){
     chunkSize: gi('pChunkSize') || 2048,              // chunked-prefill 波大小（推导 a 的权重读分摊项）
     lenDist: $('pLenDist').value, multiTurn: gi('pMultiTurn')/100, seed: gi('pSeed'),
     arrivalDist: $('pArrivalDist') ? $('pArrivalDist').value : 'poisson',
-    framework: $('pFramework') ? $('pFramework').value : 'generic',
+    framework: 'sglang',   // 2026-08-12 起固定 sglang（移除推理引擎区分）
     prefixCache: $('pPrefixCache') ? $('pPrefixCache').value : 'hash',
     pdSep: gi('pPdSep') === 1, tieredKv: gi('pTieredKv') === 1
   };
@@ -792,21 +788,6 @@ function initParamsTab(){
 function toggleMlaFields(){
   let mla = $('pAttnType').value === 'mla';
   $('mlaFields').style.display = mla ? 'flex' : 'none';
-}
-
-// 推理框架预设：切换时自动设置 前缀缓存/PD分离/分层KV 的默认值（用户可再手动覆盖）
-function applyFramework(fw) {
-  if (fw === 'vllm') {
-    // vLLM: 整段哈希前缀缓存(block级) · 无PD分离 · 无分层KV卸载(HiCache 等价物)
-    $('pPrefixCache').value = 'hash'; $('pPdSep').value = '0'; $('pTieredKv').value = '0';
-  } else if (fw === 'sglang') {
-    // sglang: RadixAttention 前缀树(渐进可用) · 原生PD分离 · HiCache 分层KV
-    $('pPrefixCache').value = 'radix'; $('pPdSep').value = '1'; $('pTieredKv').value = '1';
-  } else {
-    // 通用: 保持当前默认行为(整段哈希 + 混合批 + 分层KV参与)
-    $('pPrefixCache').value = 'hash'; $('pPdSep').value = '0'; $('pTieredKv').value = '1';
-  }
-  recalcAll();
 }
 
 // ======================== 参数快速导入导出（2026-08-12） ========================
@@ -1818,6 +1799,7 @@ function dslToText(s) {
   let p = s.prefetch;
   if (p.type === 'none') lines.push('PREFETCH: none');
   else if (p.type === 'eager') lines.push('PREFETCH: eager');
+  else if (p.type === 'race') lines.push('PREFETCH: race');   // race: GPU前向后重算 + L3后向前拉取, 相遇即停
   else lines.push('PREFETCH: '+p.type+' from '+(p.from_tier||'dram')+' when hbm<'+(Math.round((p.prefetch_threshold||0.5)*100))+'%');
   let b = s.batching;
   lines.push('BATCH: '+b.type+' max('+(b.max_batch_size||8)+')');
@@ -2242,6 +2224,13 @@ function runSimulation(strategy, overrides) {
     // 前缀缓存的核心收益：sharer/后续轮 跳过已缓存前缀的 prefill 计算（降 TTFT）
     // founder 需全量 prefill 以建立共享块；普通请求全量 prefill
     req.prefillTokens = Math.max(64, req.inputLen - coveredTok);
+    // P0-3(2026-08-12): 位置成本偏移——未命中段真实位置从命中量起算（修复前从 0 起算,
+    // 低估 b·H·N 项: 命中越深偏移越大）。followUp 取历史总长(新 token 在其后)。
+    req._pfStartPos = req.retainIds ? req.prevTotalTok : coveredTok;
+    // P0-1/P0-2(2026-08-12): race 策略 —— GPU 从前往后重算 + L3 从后往前拉取, 相遇即停。
+    // 仅对"有 L3 命中(fetchTime>0)"的请求生效; 无命中请求走普通 prefill。
+    req._race = !!(s.prefetch && s.prefetch.type === 'race' && req.fetchTime > 0);
+    req._raceTok = 0;   // race: L3 从尾部已拉取 token 数
 
     // 3) 构造新块（PagedAttention 块；过多时合并为超级块保证性能）
     let totalNewTokens = groupPrefixTokens + ownTokens;
@@ -2564,7 +2553,7 @@ function runSimulation(strategy, overrides) {
     while (prefilling.length < prefillSlots && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
-      rq._pfTotal = rq.prefillTokens || rq.inputLen;
+      rq._pfTotal = rq._race ? rq.inputLen : (rq.prefillTokens || rq.inputLen);  // race: 全输入重算目标(相遇提前完成)
       rq._pfDone = 0;
       prefilling.push(rq);
       dirty = true;
@@ -2581,7 +2570,7 @@ function runSimulation(strategy, overrides) {
       // 新口径按 trace arrive 泊松分散发送 → TTFT-outLen 解耦(out64/256/1024: 396/478/396ms)。
       // vLLM(实测解耦)与 PD 分离模式不启用此耦合。
       let pfFactor = 1;
-      if (p.framework === 'sglang' && !p.pdSep) {
+      if (!p.pdSep) {   // sglang 混合批耦合（引擎已固定 sglang）
         let decodeUtil = decoding.length / Math.max(1, s.batching.max_batch_size || 8);
         pfFactor = 1 - 0.3 * Math.min(1, decodeUtil); // decode 满时 prefill 保留 70% 速率
       }
@@ -2593,17 +2582,28 @@ function runSimulation(strategy, overrides) {
       let sumCost = 0;
       for (let qi = 0; qi < prefilling.length; qi++) {
         let qq = prefilling[qi];
+        if (qq._race) {
+          // race: GPU 从头重算, 位置成本从 0 起算（不等待 fetch）
+          let pos = Math.min(qq._pfDone, Math.max(0, qq.inputLen - 1));
+          sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
+          continue;
+        }
         if ((qq.fetchTime || 0) > qq._fetchDone) continue; // 拉取中不占算力
-        let pos = Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
+        // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
+        let pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
       }
       let perReqTok = sumCost > 0 ? totalFlops * DT / sumCost : 0; // 每请求每步推进 token 数
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
-        // L3 命中拉取阶段（wait_complete）：KV 从 SSD 拉回期间只耗墙钟、不占 prefill 算力；
-        // 拉取完成才开始真正的 prefill 计算。fetchTime 计入 TTFT（prefillStart→prefillEnd）。
-        if ((q.fetchTime || 0) > q._fetchDone) { q._fetchDone += DT; continue; }
-        q._pfDone += perReqTok;
+        // race: GPU 从前往后重算(_pfDone) + L3 从后往前拉取(_raceTok), 相遇即停——
+        // 不等待 fetchTime(与 wait_complete 的串行等待本质区别, 收益核心)
+        if (q._race) {
+          q._pfDone += perReqTok;
+          q._raceTok += DT * (p.ssdBW * 1e9 * 0.9) / Math.max(kvPerTok, 1);
+          if (q._pfDone + q._raceTok >= q.inputLen) q._pfDone = q._pfTotal;  // 相遇 → 完成
+        } else if ((q.fetchTime || 0) > q._fetchDone) { q._fetchDone += DT; continue; }
+        else q._pfDone += perReqTok;
         // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
         // 即刻对组内后续请求可用（部分命中）。vLLM 整段哈希（hash）则等 founder 全部完成才激活。
         // 前缀预热组（首个块 prewarmed）跳过——预热块已驻留 SSD，不受 founder 建块流程覆盖；
@@ -2611,7 +2611,8 @@ function runSimulation(strategy, overrides) {
         let _gid1 = q.groupId && prefixGroupMap[q.groupId];
         let _pw1 = _gid1 && _gid1.blkIds.length && pools.ssd.blockIndex[_gid1.blkIds[0]]
           && pools.ssd.blockIndex[_gid1.blkIds[0]].prewarmed;
-        if (p.prefixCache === 'radix' && q.groupId && q.groupBlkIds && _gid1 && !_pw1) {
+        // race 请求 GPU 从头重算（含命中段）, 不参与渐进激活（保持注入/组状态）
+        if (!q._race && p.prefixCache === 'radix' && q.groupId && q.groupBlkIds && _gid1 && !_pw1) {
           let availN = Math.max(1, Math.min(q.groupBlkIds.length, Math.floor(q._pfDone / q._pfTotal * q.groupBlkIds.length)));
           prefixGroupMap[q.groupId].blkIds = q.groupBlkIds.slice(0, availN);
           prefixGroupMap[q.groupId].activated = true;
