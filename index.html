@@ -2013,7 +2013,7 @@ function runSimulation(strategy, overrides) {
       let grp = [];
       for (let i = 0; i < a.nTotal && pi < pool.length; i++, pi++) {
         let req = pool[pi];
-        req.groupId = a.group.id; req.prefixTokLen = Math.min(a.prefixTokLen, Math.round(req.inputLen * 0.7));
+        req.groupId = a.group.id; req.prefixTokLen = Math.min(a.prefixTokLen, req.inputLen); // 命中 ≤ 输入长度(短请求整段在前缀内)
         req.isFounder = (i === 0); grp.push(req);
       }
       if (grp.length >= 2) prefixGroupMap[a.group.id] = { prefixTokLen: a.prefixTokLen, blkIds: [], refcount: 0, activated: false };
