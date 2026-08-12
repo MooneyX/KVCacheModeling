@@ -800,13 +800,19 @@ function toggleMlaFields(){
 }
 
 // ======================== 参数快速导入导出（2026-08-12） ========================
-// 收集基础参数页全部 input/select（checkbox 存 checked，其余存 value 字符串），
+// 收集基础参数页全部 input/select/textarea（checkbox 存 checked，其余存 value 字符串），
 // 导出为 JSON 用于跨会话/跨机器复现；导入写回 DOM 后 recalcAll 刷新派生计算。
+// 2026-08-12 v2: 覆盖调度策略——sDsl(textarea) 与 _strategyMode(dsl/js) 一并导出,
+// 导入时按"先恢复模式→再写回控件→同步预取下拉"顺序恢复, 保证 DSL 与 UI 一致。
 function collectParamsJson() {
   let panel = document.getElementById('tab-params');
-  let els = panel ? panel.querySelectorAll('input[id], select[id]') : [];
+  let els = panel ? panel.querySelectorAll('input[id], select[id], textarea[id]') : [];
   let data = {};
-  els.forEach(el => { data[el.id] = el.type === 'checkbox' ? el.checked : el.value; });
+  els.forEach(el => {
+    if (el.id === 'paramsIo') return; // 跳过导入导出框自身
+    data[el.id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  data._strategyMode = (typeof strategyMode !== 'undefined') ? strategyMode : 'dsl';
   return JSON.stringify(data);
 }
 function exportParams() {
@@ -824,19 +830,28 @@ function importParamsFromBox() {
   let data;
   try { data = JSON.parse(box.value.trim()); }
   catch(e) { if (note) note.textContent = '✗ JSON 解析失败: ' + e.message; return; }
+  // 先恢复策略模式(dsl/js)——switchMode 可能改写 textarea(js 空文本加载预设), 之后再写回覆盖
+  if (data._strategyMode && typeof switchMode === 'function') {
+    try { switchMode(data._strategyMode === 'js' ? 'js' : 'dsl'); } catch(e) {}
+  }
   let panel = document.getElementById('tab-params');
-  let els = panel ? panel.querySelectorAll('input[id], select[id]') : [];
-  let applied = 0;
+  let els = panel ? panel.querySelectorAll('input[id], select[id], textarea[id]') : [];
+  let applied = 0, wroteDsl = false;
   els.forEach(el => {
-    if (!(el.id in data)) return;
+    if (!(el.id in data) || el.id === 'paramsIo') return;
     if (el.type === 'checkbox') el.checked = !!data[el.id];
     else el.value = String(data[el.id]);
+    if (el.id === 'sDsl') wroteDsl = true;
     applied++;
   });
   // 值已非预设默认 → 清除模型/硬件/策略预设高亮（视觉同步，不触发 applyFramework 避免覆盖导入值）
   (panel ? panel.querySelectorAll('.preset-tag') : []).forEach(b => b.classList.remove('active'));
+  // DSL 恢复后同步预取策略下拉(避免 sPrefetchPolicy 与 DSL 的 PREFETCH 行不一致)
+  if (wroteDsl && typeof syncPrefetchSelect === 'function') {
+    try { syncPrefetchSelect(); } catch(e) {}
+  }
   recalcAll();
-  if (note) note.textContent = '✓ 已应用 ' + applied + ' 个参数并重算';
+  if (note) note.textContent = '✓ 已应用 ' + applied + ' 个参数并重算' + (wroteDsl ? '（含调度策略 DSL）' : '');
 }
 
 function applyModel(name,el){
