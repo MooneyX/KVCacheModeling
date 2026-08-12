@@ -228,7 +228,7 @@ select option{background:var(--surface2);color:var(--text)}
           <div><label>多轮复用比例(%)</label><input type="number" id="pMultiTurn" value="0" min="0" max="100"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
-          <div><label>前缀共享命中率(%)</label><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="width:100%"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">40%</span></div>
+          <div><label>前缀命中比例(%)</label><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="width:100%" title="入组请求的前缀命中比例: 共享前缀长度 = 平均输入×此值, 命中请求跳过对应比例的前缀 prefill (h=99 → 命中请求跳过 ~99% prefill)"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">40%</span></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
         </div>
         <div class="form-row" style="margin-top:6px">
@@ -1988,19 +1988,23 @@ function runSimulation(strategy, overrides) {
     // 入组数按满命中(h=1)基准配比(与 h 无关)；单请求覆盖量随 h 缩放:
     // pTokLen = h×ratio×avgInput → 期望实际覆盖 = Σ nTotal×pTokLen = h×totalInput
     // (修复 2026-08-11: 旧版 pTokLen 固定、仅 nTotal 随 h 增长, maxAssign 封顶后命中率不敏感)
-    let k = sumRatioSq > 0 ? (totalInput / avgInput) / sumRatioSq : 0;
-    let assignments = [], totalAssigned = 0;
-    groupDefs.forEach(g => {
-      let pTokLen = Math.round(avgInput * g.ratio * h);   // h 缩放单请求覆盖
-      if (pTokLen <= 0) return;
-      let nTotal = Math.max(1, Math.round(k * g.ratio)) + 1;
-      assignments.push({ group: g, prefixTokLen: pTokLen, nTotal: nTotal });
-      totalAssigned += nTotal;
-    });
-    let maxAssign = Math.floor(N * 0.9);
-    if (totalAssigned > maxAssign) {
-      let scale = maxAssign / totalAssigned;
-      assignments.forEach(a => { a.nTotal = Math.max(2, Math.floor(a.nTotal * scale)); });
+    // 2026-08-12 语义重构: prefixHit = 入组请求的"前缀命中比例"——
+    // 共享前缀长度 = avgInput×h（组内统一, 与组 ratio 无关, 与解析层 prefixSavedPerReq 同口径),
+    // 每个入组请求命中 min(前缀长度, inputLen) 的输入。h=0.99 → 命中请求跳过 ~99% prefill。
+    // 修复旧版: nTotal=k×ratio+1 使 ΣnTotal≈3N 膨胀, 被 maxAssign 截断后实际覆盖≈h×0.29
+    // (h=99% 实测仅 27.7% 覆盖)。新版水桶分配 ΣnTotal=maxAssign, 无截断。
+    let assignments = [];
+    if (h > 0.001) {
+      let maxAssign = Math.max(4, Math.floor(N * 0.9));      // 入组名额目标(保底4, 兼容小N)
+      let sumRatio = groupDefs.reduce((s, g) => s + g.ratio, 0);
+      let quota = groupDefs.map(g => maxAssign * g.ratio / sumRatio);
+      let nTotals = quota.map(Math.floor);
+      let rem = maxAssign - nTotals.reduce((s, x) => s + x, 0);
+      let order = quota.map((q, i) => [i, q - Math.floor(q)]).sort((a, b) => b[1] - a[1]);
+      for (let j = 0; j < rem; j++) nTotals[order[j % order.length][0]]++;
+      groupDefs.forEach((g, i) => {
+        if (nTotals[i] >= 2) assignments.push({ group: g, prefixTokLen: Math.round(avgInput * h), nTotal: nTotals[i] });
+      });
     }
     let pool = requests.slice();
     for (let i = pool.length - 1; i > 0; i--) { let j = Math.floor(rng() * (i + 1)); let tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp; }
@@ -2150,7 +2154,9 @@ function runSimulation(strategy, overrides) {
     let ssdCoveredTok = 0;
     attachIds.forEach(id => {
       let loc = findBlock(id);
-      if (loc) { req.prefixBlkIds.push(id); loc.blk.refcount++; coveredTok += loc.blk.tokens;
+      if (loc) { req.prefixBlkIds.push(id);
+        if (!loc.blk.prewarmed) loc.blk.refcount++;   // 预热块 L3 常驻, 不参与引用计数(防 founder 完成归零误删)
+        coveredTok += loc.blk.tokens;
         if (loc.tier === 'ssd') ssdCoveredTok += loc.blk.tokens; }
     });
     // 命中量不超过自身前缀长度：组内小输入请求的 prefixTokLen 被 clamp 到 inputLen×0.7，
@@ -2368,7 +2374,8 @@ function runSimulation(strategy, overrides) {
     req.ownBlkIds.forEach(id => { ['hbm','dram','ssd'].forEach(t0 => poolRemove(t0, id)); });
     req.prefixBlkIds.forEach(id => {
       let loc = findBlock(id);
-      if (loc) { loc.blk.refcount--; if (loc.blk.refcount <= 0) poolRemove(loc.tier, id); }
+      // 预热块为 L3 常驻数据, 不随请求完成释放(否则 founder 完成时 refcount 归零 → 后续 sharer miss)
+      if (loc && !loc.blk.prewarmed) { loc.blk.refcount--; if (loc.blk.refcount <= 0) poolRemove(loc.tier, id); }
     });
     completedReqs.push(req);
   }
