@@ -1636,6 +1636,10 @@ var strategyPresets = {
   'Tiered-3L':  'ADMIT: threshold(hbm=0.7)\nEVICT: lfu from hbm when 85% -> dram, lru from dram when 90% -> ssd\nPREFETCH: eager from dram when hbm<40%\nBATCH: dynamic max(32)\nPLACE: tiered',
   'Aggressive':'ADMIT: always\nEVICT: lfu from hbm when 75% -> dram, lfu from dram when 80% -> ssd\nPREFETCH: eager\nBATCH: static max(64)\nPLACE: hbm_first',
   'Conservative':'ADMIT: priority(<2048:hbm, >=2048:dram)\nEVICT: lru from hbm when 95% -> dram\nPREFETCH: none\nBATCH: priority max(4)\nPLACE: hbm_first',
+  // SGLang 默认语义(2026-08-12): continuous batching + RadixAttention(lru 驱逐)
+  // + HiCache tiered 分层 + 静态内存池(mem-fraction≈0.9 准入)。
+  // PREFETCH: none = wait_complete(命中即等 KV 拉齐再算); 改 race 即 SuffixPrefetchV2 race 调度
+  'SGLang-Default': 'ADMIT: threshold(hbm=0.9)\nEVICT: lru from hbm when 90% -> dram, lru from dram when 90% -> ssd\nPREFETCH: none\nBATCH: continuous max(8)\nPLACE: tiered',
 };
 
 var strategyPresetsJS = {
@@ -1721,6 +1725,20 @@ function evict(pool, name) {
 }
 function shouldPrefetch() { return false; }
 function place() { return hbmUsage() < 0.95 ? 'hbm' : 'dram'; }`,
+
+  'SGLang-Default':
+`function admit(req) { return hbmUsage() < 0.9 ? 'hbm' : 'dram'; }
+function evict(pool, name) {
+  if (name === 'hbm' && hbmUsage() > 0.9) {
+    return pool.blocks.reduce(function(a,b){return (a.lastTouch||0)<(b.lastTouch||0)?a:b;});
+  }
+  if (name === 'dram' && dramUsage() > 0.9) {
+    return pool.blocks.reduce(function(a,b){return (a.lastTouch||0)<(b.lastTouch||0)?a:b;});
+  }
+  return null;
+}
+function shouldPrefetch() { return false; }
+function place() { return hbmUsage() < 0.9 ? 'hbm' : 'dram'; }`,
 };
 
 // ======================== DSL PARSER ========================
