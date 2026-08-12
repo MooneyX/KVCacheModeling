@@ -383,9 +383,9 @@ select option{background:var(--surface2);color:var(--text)}
       </select></div>
       <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div><label>③ 观察指标(纵轴)</label><select id="sSweepMetric">
-        <option value="hit_rate">HBM命中率(%)</option><option value="p99_latency">P99延迟(ms)</option>
+        <option value="hit_rate">HBM命中率(%)</option><option value="latency">平均延迟(ms)</option><option value="latency_p50">延迟P50(ms)</option><option value="p99_latency">延迟P99(ms)</option>
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
-        <option value="tpot">平均TPOT(ms/tok)</option>
+        <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
       </select></div>
       <div><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
@@ -2947,7 +2947,7 @@ function runSimulation(strategy, overrides) {
 
   return {
     name: strategy.name || autoNameStrategy(strategy),
-    hitRate, p50, p99, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
+    hitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
     throughput: stats.outTokens / simEnd,
     memUtilAvg: stats.memUtilSamples ? stats.memUtilSum / stats.memUtilSamples * 100 : 0,
     memUtilPeak: stats.memUtilPeak * 100,
@@ -3224,6 +3224,7 @@ function drawStrategyComparisonGantt() {
 let sensCache = {};
 function extractSensMetrics(r) {
   return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
+    tpot_p50: r.p50Tpot, tpot_p99: r.p99Tpot, latency: r.avgLatency, latency_p50: r.p50,
     throughput: r.throughput, hit_rate: r.hitRate, mem_util: r.memUtilPeak, p99_latency: r.p99 };
 }
 
@@ -3289,7 +3290,7 @@ function runSensitivity() {
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', p99_latency:'P99延迟(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
+  let metricLabel = {hit_rate:'HBM命中率(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
   // 对比参数（第三维=颜色）：显式下拉选择，档位从输入框读取（自动填充默认，可编辑）
