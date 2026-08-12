@@ -125,6 +125,14 @@ select option{background:var(--surface2);color:var(--text)}
     <h2><span>模型与硬件</span> 参数配置</h2>
     <p class="subtitle">模型架构（GQA/MLA/MoE）、权重与KV精度分离、算力与带宽、三级存储</p>
 
+    <!-- 参数快速导入导出（2026-08-12） -->
+    <div style="display:flex;gap:8px;align-items:center;margin:10px 0 14px;flex-wrap:wrap">
+      <button class="btn btn-sm" onclick="exportParams()" title="收集本页全部输入参数为 JSON，填入右侧框并复制到剪贴板">📤 导出参数</button>
+      <button class="btn btn-sm" onclick="importParamsFromBox()" title="解析右侧 JSON 并写回全部输入参数，自动刷新计算">📥 导入参数</button>
+      <input id="paramsIo" placeholder="参数 JSON 在此粘贴/生成" style="flex:1;min-width:220px;font-family:monospace;font-size:.7rem;padding:4px 8px">
+      <span id="paramsIoNote" style="font-size:.7rem;color:var(--accent);white-space:nowrap"></span>
+    </div>
+
     <div class="row2">
       <!-- Model -->
       <div>
@@ -799,6 +807,46 @@ function applyFramework(fw) {
     $('pPrefixCache').value = 'hash'; $('pPdSep').value = '0'; $('pTieredKv').value = '1';
   }
   recalcAll();
+}
+
+// ======================== 参数快速导入导出（2026-08-12） ========================
+// 收集基础参数页全部 input/select（checkbox 存 checked，其余存 value 字符串），
+// 导出为 JSON 用于跨会话/跨机器复现；导入写回 DOM 后 recalcAll 刷新派生计算。
+function collectParamsJson() {
+  let panel = document.getElementById('tab-params');
+  let els = panel ? panel.querySelectorAll('input[id], select[id]') : [];
+  let data = {};
+  els.forEach(el => { data[el.id] = el.type === 'checkbox' ? el.checked : el.value; });
+  return JSON.stringify(data);
+}
+function exportParams() {
+  let box = $('paramsIo'), note = $('paramsIoNote');
+  if (!box) return;
+  let json = collectParamsJson();
+  box.value = json;
+  try { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(json); } catch(e) {}
+  if (note) note.textContent = '✓ ' + Object.keys(JSON.parse(json)).length + ' 个参数已生成并复制';
+  box.focus(); box.select();
+}
+function importParamsFromBox() {
+  let box = $('paramsIo'), note = $('paramsIoNote');
+  if (!box) return;
+  let data;
+  try { data = JSON.parse(box.value.trim()); }
+  catch(e) { if (note) note.textContent = '✗ JSON 解析失败: ' + e.message; return; }
+  let panel = document.getElementById('tab-params');
+  let els = panel ? panel.querySelectorAll('input[id], select[id]') : [];
+  let applied = 0;
+  els.forEach(el => {
+    if (!(el.id in data)) return;
+    if (el.type === 'checkbox') el.checked = !!data[el.id];
+    else el.value = String(data[el.id]);
+    applied++;
+  });
+  // 值已非预设默认 → 清除模型/硬件/策略预设高亮（视觉同步，不触发 applyFramework 避免覆盖导入值）
+  (panel ? panel.querySelectorAll('.preset-tag') : []).forEach(b => b.classList.remove('active'));
+  recalcAll();
+  if (note) note.textContent = '✓ 已应用 ' + applied + ' 个参数并重算';
 }
 
 function applyModel(name,el){
