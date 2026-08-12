@@ -242,11 +242,11 @@ select option{background:var(--surface2);color:var(--text)}
         <div class="form-row" style="margin-top:6px">
           <div><label>Prefill位置成本a(μs/tok)</label><input type="number" id="pPrefillA" value="79.5" min="0" step="0.1" title="位置感知 prefill: τ_rec(i)=a+b·i。a=固定项。推导值见右侧按钮: 权重读/chunk + 算力/mfu + TP通信"></div>
           <div><label>Prefill斜率b(μs/tok²)</label><input type="number" id="pPrefillB" value="0.00533" min="0" step="0.0001" title="attention 累计项斜率。推导公式: b = kv/token ÷ HBM聚合带宽 (物理确定, 无需实测)"></div>
-          <div><label>L3拉取固定延迟(μs)</label><input type="number" id="pFetchFixedUs" value="209" min="0" step="1" title="τ_pf 每块固定开销。推导 = NVMe单请求延迟(100) + RPC/软件每页开销(110)。拉取耗时 = n块×τ_pf + 字节/带宽"></div>
+          <div><label>L3拉取固定延迟(μs)</label><input type="number" id="pFetchFixedUs" value="0" min="0" step="1" title="简化传输模型: 传输延迟 = 传输大小/带宽 (τ_pf 每块固定开销默认置 0, 2026-08-12)。如需模拟 NVMe 每请求延迟(RPC/软件开销)可手动调大, 原推导 = NVMe单请求(100) + RPC/软件(110)"></div>
           <div><label>Prefill Chunk(tok)</label><input type="number" id="pChunkSize" value="2048" min="16" step="16" title="chunked-prefill 波大小(框架配置, 默认 2048=sglang 默认)。用于推导 a 的权重读分摊项"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
-          <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b/τ_pf 的估计值并填入(无需实测)">🎯 自动估算 a/b/τ_pf</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
+          <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b 的估计值并填入(无需实测)">🎯 自动估算 a/b</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>推理框架</label><select id="pFramework" onchange="applyFramework(this.value)">
@@ -601,11 +601,11 @@ function calcKvPerToken(p){
 }
 
 // ======================== prefill 参数估算（纯推导，不依赖实测） ========================
-// 目标: 换模型/硬件时可预测未测配置——a/b/τ_pf 全部由模型架构+硬件规格+执行配置推导
+// 目标: 换模型/硬件时可预测未测配置——a/b 全部由模型架构+硬件规格+执行配置推导
 //  b(位置斜率, μs/tok²): attention 第 i 位置多读 1 个 KV → b = kvPerToken / HBM聚合带宽（物理确定）
 //  a(固定项, μs/tok): chunked-prefill 下 = 权重读/chunk(每 chunk 读一次权重, 被波大小分摊)
 //      + 非attention算力(2×actParams/tok ÷ 有效算力) + TP通信固定延迟(2L×5μs 分摊) + KV写(小项)
-//  τ_pf(每块固定开销, μs): NVMe 单请求延迟(≈100μs) + RPC/软件每页开销(≈110μs)——硬件/框架规格常数
+//  τ_pf(每块固定开销, μs): NVMe 单请求延迟(≈100μs) + RPC/软件每页开销(≈110μs)。2026-08-12 简化后默认置 0(传输延迟=大小/带宽), 保留推导供手动恢复
 function estimatePrefillParams(p){
   let aggHbmBW = Math.max(p.hbmBW * 1e12 * p.gpus, 1);       // B/s 聚合 HBM 带宽
   let kvPerTok = calcKvPerToken(p);                          // B/tok
@@ -629,9 +629,9 @@ function applyEstimatedParams(){
   let e = estimatePrefillParams(p);
   $('pPrefillA').value = e.a.toFixed(2);
   $('pPrefillB').value = e.b.toFixed(6);
-  $('pFetchFixedUs').value = e.tauPf.toFixed(0);
+  $('pFetchFixedUs').value = 0;   // 简化传输模型(2026-08-12): 传输延迟=大小/带宽, 每块固定开销 τ_pf 不再自动填入
   let n = $('estParamsNote');
-  if (n) n.textContent = '推导: a='+e.a.toFixed(1)+' · b='+(e.b*1e3).toFixed(2)+'e-3 · τ_pf='+e.tauPf.toFixed(0)+'μs';
+  if (n) n.textContent = '推导: a='+e.a.toFixed(1)+' · b='+(e.b*1e3).toFixed(2)+'e-3 · 传输=大小/带宽(τ_pf=0)';
   recalcAll();
 }
 
@@ -780,7 +780,7 @@ function initParamsTab(){
         $('pHbm').value=hw.hbm;$('pHbmBW').value=hw.hbmBW;$('pTflops').value=hw.tflops;
         $('pTpSize').value=hw.tp;$('pNvlinkBW').value=hw.nvlink;$('pPcieBW').value=hw.pcie;
         $('pDram').value=hw.dram;$('pDramBW').value=hw.dramBW;$('pSsd').value=hw.ssd;$('pSsdBW').value=hw.ssdBW;$('pGpuCount').value=hw.gpus;
-        applyEstimatedParams(); // 硬件变化 → a/b/τ_pf 按新规格自动重估（无需实测）
+        applyEstimatedParams(); // 硬件变化 → a/b 按新规格自动重估（τ_pf 简化置 0）
       }
     };
   });
@@ -867,10 +867,10 @@ function applyModel(name,el){
     $('pPrefillA').value = m.calibA;
     $('pPrefillB').value = m.calibB;
     let n = $('estParamsNote');
-    if (n) n.textContent = '实测校准: a='+m.calibA+' · b='+(m.calibB*1e3).toFixed(2)+'e-3 · τ_pf=209μs (2026-08-10 DS-V3×8×H20)';
+    if (n) n.textContent = '实测校准: a='+m.calibA+' · b='+(m.calibB*1e3).toFixed(2)+'e-3 · 传输=大小/带宽(2026-08-10 DS-V3×8×H20)';
     recalcAll();
   } else {
-    applyEstimatedParams(); // 模型变化 → a/b/τ_pf 按新架构自动重估（无需实测）
+    applyEstimatedParams(); // 模型变化 → a/b 按新架构自动重估（τ_pf 简化置 0）
   }
 }
 
@@ -2213,7 +2213,10 @@ function runSimulation(strategy, overrides) {
       coveredTok = req.prefixTokLen;
       ssdCoveredTok = Math.min(ssdCoveredTok, req.prefixTokLen);
     }
-    // L3(SSD) 命中：前缀 KV 需从 L3 拉回 GPU。P0-4: 拉取耗时 = n块×τ_pf(固定) + 字节/有效带宽
+    // L3(SSD) 命中：前缀 KV 需从 L3 拉回 GPU。简化传输模型(2026-08-12):
+    // 传输延迟 = 传输大小/有效带宽 = ssdCoveredTok×kvPerTok / (ssdBW×0.9)。
+    // p.fetchFixedUs 默认 0（纯带宽）；填 >0 恢复"每块固定开销 + 带宽"双项模型
+    //（原模型: n块×τ_pf + 字节/有效带宽, τ_pf=209μs 使 blockSize 小时带宽敏感性被淹没）。
     //（ssdBW 反映 page_size 效应：实测 sglang mooncake page1≈1.05GB/s → page64≈27GB/s）。
     // wait_complete 下 prefill 等 KV 到齐；HBM/DRAM 前缀命中近似免费（片内/近存拷贝 ~μs-ms 级）。
     // 双路径合并后：followUp（retainIds 含公共前缀块）命中 SSD 块同样计 L3 拉取
@@ -3349,7 +3352,7 @@ function initStrategyTab() {
 function init(){
   initParamsTab();
   initStrategyTab();
-  applyEstimatedParams(); // 初始即用纯推导的 a/b/τ_pf（不依赖实测），用户可手动覆盖
+  applyEstimatedParams(); // 初始即用纯推导的 a/b（τ_pf 简化置 0），用户可手动覆盖
   // 策略仿真结果区初始占位（运行入口在结果卡片内）
   let mg = $('strategyMetricsGrid');
   if (mg) mg.innerHTML = '<div style="color:var(--text-dim);padding:10px 0;grid-column:1/-1;font-size:.8rem">暂无结果 —— 点击上方「▶️ 运行当前策略」或「📋 运行全部已保存」开始仿真（同一策略×参数只跑一次，结果缓存）</div>';
