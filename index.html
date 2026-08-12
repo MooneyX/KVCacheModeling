@@ -354,7 +354,7 @@ select option{background:var(--surface2);color:var(--text)}
   <!-- Sensitivity Analysis -->
   <div class="card" id="sensitivityPanel" style="display:none">
     <h2><span>参数敏感性</span> 分析</h2>
-    <p class="subtitle">三参数敏感性：横轴「扫描参数」+ 颜色「对比参数」分档 + 纵轴「观察指标」；固定其他参数与随机种子（共同随机数法）。留空对比参数则单参数扫描。「扫描范围/对比档位」支持 <code>起点,终点,步长</code>（如 1,10,2 → 1,3,5,7,9）或显式逗号列表（空用默认档位）</p>
+    <p class="subtitle">三参数敏感性：横轴「扫描参数」+ 颜色「对比参数」分档 + 纵轴「观察指标」；固定其他参数与随机种子（共同随机数法）。留空对比参数则单参数扫描。「扫描范围/对比档位」支持 <code>起点,终点,步长</code>（如 1,10,2 → 1,3,5,7,9）或显式逗号列表（空用参数默认档位）</p>
     <div class="form-row" style="margin-bottom:8px">
       <div><label>① 扫描参数(横轴)</label><select id="sSweepParam">
         <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
@@ -368,13 +368,13 @@ select option{background:var(--surface2);color:var(--text)}
         <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
         <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">SSD带宽</option>
       </select></div>
+      <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div><label>③ 观察指标(纵轴)</label><select id="sSweepMetric">
         <option value="hit_rate">HBM命中率(%)</option><option value="p99_latency">P99延迟(ms)</option>
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
         <option value="tpot">平均TPOT(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
       </select></div>
-      <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="自动生成,可编辑" style="width:120px"></div>
       <div><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
     <div id="chartSensitivity" class="chart-container"></div>
@@ -3130,20 +3130,13 @@ function parseRangeOrList(str) {
   return nums;
 }
 
-// 对比参数选择时自动填充默认档位
-function autofillCompareLevels() {
-  let el = $('sSweepCompareParam'); if (!el) return;
-  let cmp = el.value, lv = SENS_LEVELS[cmp];
-  let inp = $('sSweepCompare');
-  if (inp) inp.value = lv ? lv.join(',') : '';
-}
 // 扫描/对比参数互斥提示（运行时自动忽略相同项，UI 上也即时标注）
 function guardCompareParam() {
   let sp = $('sSweepParam').value, cp = $('sSweepCompareParam').value;
-  if (cp && cp === sp) { $('sSweepCompareParam').value = ''; autofillCompareLevels(); }
+  if (cp && cp === sp) { $('sSweepCompareParam').value = ''; }
 }
 document.addEventListener('change', function(e) {
-  if (e.target && e.target.id === 'sSweepCompareParam') { autofillCompareLevels(); guardCompareParam(); }
+  if (e.target && e.target.id === 'sSweepCompareParam') guardCompareParam();
   if (e.target && e.target.id === 'sSweepParam') guardCompareParam();
 });
 
