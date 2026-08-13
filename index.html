@@ -793,7 +793,7 @@ function initParamsTab(){
       }
     };
   });
-  $('pPrefixHit').oninput=()=>{$('pPrefixHitVal').textContent=$('pPrefixHit').value+'%';updatePrefixHitFill();recalcAll();};
+  $('pPrefixHit').oninput=()=>{updatePrefixHitFill();recalcAll();};
   updatePrefixHitFill();
   $('pAttnType').onchange=()=>{toggleMlaFields(); recalcAll();};
   toggleMlaFields();
@@ -804,11 +804,13 @@ function toggleMlaFields(){
   $('mlaFields').style.display = mla ? 'flex' : 'none';
 }
 
-// 前缀命中比例滑块填充色随 value 动态更新（滑到 100% 时轨道全填充、无右侧空白）
+// 前缀命中比例滑块 UI 同步: 填充色 + 数值标签(如 "40%") 随 value 刷新
+// （滑到 100% 时轨道全填充、无右侧空白；oninput 与参数导入共用此函数避免遗漏）
 function updatePrefixHitFill(){
   let el = $('pPrefixHit'); if (!el) return;
   let pct = ((+el.value - +el.min) / (+el.max - +el.min)) * 100;
   el.style.background = 'linear-gradient(to right, var(--accent) 0%, var(--accent) ' + pct + '%, var(--border) ' + pct + '%, var(--border) 100%)';
+  let val = $('pPrefixHitVal'); if (val) val.textContent = el.value + '%';
 }
 
 // ======================== 参数快速导入导出（2026-08-12） ========================
