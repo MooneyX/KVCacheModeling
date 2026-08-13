@@ -2669,7 +2669,7 @@ function runSimulation(strategy, overrides) {
     while (prefilling.length < prefillSlots && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
-      rq._pfTotal = rq._race ? rq.inputLen : (rq.prefillTokens ?? rq.inputLen);  // race: 全输入重算目标(相遇提前完成); 命中100%→0(无剩余计算)
+      rq._pfTotal = rq._race ? Math.max(0, rq.inputLen - (rq._pfStartPos || 0)) : (rq.prefillTokens ?? rq.inputLen);  // race: 重算未命中后缀(前缀命中段走 L3 拉取); 命中100%→0
       rq._pfDone = 0;
       prefilling.push(rq);
       dirty = true;
@@ -2699,8 +2699,10 @@ function runSimulation(strategy, overrides) {
       for (let qi = 0; qi < prefilling.length; qi++) {
         let qq = prefilling[qi];
         if (qq._race) {
-          // race: GPU 从头重算, 位置成本从 0 起算（不等待 fetch）
-          let pos = Math.min(qq._pfDone, Math.max(0, qq.inputLen - 1));
+          // race: GPU 重算未命中后缀[命中量, L](位置递增) → 重算完后缀回头重算前缀尾部[命中量→0](位置递减),
+          // 与 L3 从后往前拉前缀相遇——相遇点依赖命中量(命中越多, 前缀越长, L3 拉取越多/GPU 重算越少)
+          let H = qq._pfStartPos || 0, N = qq._pfTotal, d = qq._pfDone;
+          let pos = d <= N ? H + d : Math.max(0, H - (d - N));
           sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
           continue;
         }
@@ -2720,7 +2722,7 @@ function runSimulation(strategy, overrides) {
         let fq = prefilling[fi];
         let bytesLeft;
         if (fq._race) {
-          bytesLeft = Math.max(0, fq.inputLen - fq._pfDone - fq._raceTok) * kvPerTok;  // race 从尾拉取剩余
+          bytesLeft = Math.max(0, (fq._pfStartPos || 0) - fq._raceTok) * kvPerTok;  // race 拉取命中前缀[0, H]剩余(未命中后缀由 GPU 重算)
         } else if ((fq.fetchTime || 0) > fq._fetchDone || fq._be) {
           bytesLeft = Math.max(0, (fq.fetchTime || 0) - fq._fetchDone) * (p.ssdBW * 1e9 * 0.9);  // 剩余拉取字节
         } else {
@@ -2760,7 +2762,9 @@ function runSimulation(strategy, overrides) {
           prefixGroupMap[q.groupId].activated = true;
         }
         // best_effort 完成需 计算+拉取 都到齐（decode 需全部 KV）
-        let _done = q._pfDone >= q._pfTotal && (!q._be || q._fetchDone >= (q.fetchTime || 0));
+        // race 同理: 需"重算完后缀 + 拉完命中前缀"(否则命中100%时 _pfTotal=0 会立即完成、跳过前缀拉取)
+        let _done = q._pfDone >= q._pfTotal && (!q._be || q._fetchDone >= (q.fetchTime || 0))
+          && (!q._race || q._raceTok >= (q._pfStartPos || 0));
         if (_done) {
           prefilling.splice(i, 1);
           q.prefillEnd = now;
