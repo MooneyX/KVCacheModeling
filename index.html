@@ -218,7 +218,7 @@ select option{background:var(--surface2);color:var(--text)}
           <div><label>平均输出长度(tok)</label><input type="number" id="pOutputLen" value="1024" min="1"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
-          <div><label>到达率QPS</label><input type="number" id="pQps" value="8" min="0.1" step="0.1"></div>
+          <div><label>到达率QPS</label><input type="number" id="pQps" value="8" min="0" step="0.001" title="请求到达率。低 qps(如 0.001)表示近乎串行无并发; 注意配合仿真窗口上限——qps 太低时窗口内到达的请求数会很少, 统计样本不足"></div>
           <div><label>到达分布</label><select id="pArrivalDist">
             <option value="poisson" selected>泊松(有突发)</option>
             <option value="uniform">均匀(等间隔)</option>
@@ -2064,7 +2064,7 @@ function runSimulation(strategy, overrides) {
   // ---------- 请求生成 ----------
   // N = 2×并发（让请求流足以形成排队压力），上限256为性能保护；可通过 overrides.nreq 指定
   let N = overrides.nreq || Math.min(p.concurrency * 2, 256);
-  let requests = [], t = 0, lambda = Math.max(p.qps, 0.1);
+  let requests = [], t = 0, lambda = Math.max(p.qps, 1e-9); // qps 真实生效; 仅防 0/负导致除零(极小值→无请求到达)
   let sigma = 0.6, muL = Math.log(Math.max(p.inputLen,1)) - sigma*sigma/2;
   let muO = Math.log(Math.max(p.outputLen,1)) - sigma*sigma/2;
   function sampleLen(avg, mu){
