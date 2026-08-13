@@ -395,9 +395,9 @@ select option{background:var(--surface2);color:var(--text)}
       <div><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <label style="margin:0;font-size:.72rem;white-space:nowrap;color:var(--text);text-transform:none;letter-spacing:0">④ 预取策略(形状)</label>
-        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="sPfWait" checked style="margin:0"> wait_complete</label>
-        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="sPfBest" checked style="margin:0"> best_effort</label>
-        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="sPfRace" checked style="margin:0"> race</label>
+        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfWait" checked style="margin:0 4px 0 0;vertical-align:middle">wait_complete</label>
+        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfBest" checked style="margin:0 4px 0 0;vertical-align:middle">best_effort</label>
+        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfRace" checked style="margin:0 4px 0 0;vertical-align:middle">race</label>
       </div>
     </div>
     <div id="chartSensitivity" class="chart-container"></div>
@@ -3427,8 +3427,24 @@ function runSensitivity() {
         lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
         itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
     }
+    function symbolMarker(sym, color) {
+      if (sym === 'square') return '<svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"><rect x="1" y="1" width="8" height="8" fill="'+color+'"/></svg>';
+      if (sym === 'triangle') return '<svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"><polygon points="5,1 9,9 1,9" fill="'+color+'"/></svg>';
+      return '<svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"><circle cx="5" cy="5" r="4" fill="'+color+'"/></svg>';
+    }
     let opt = {
-      tooltip: { trigger: 'axis' },
+      tooltip: {
+        trigger: 'axis',
+        formatter: function(params) {
+          if (!params || !params.length) return '';
+          let html = '<div style="font-weight:600;margin-bottom:4px">' + (params[0].axisValueLabel || params[0].name) + '</div>';
+          params.forEach(function(p) {
+            let sym = (series[p.seriesIndex] && series[p.seriesIndex].symbol) || 'circle';
+            html += '<div style="display:flex;align-items:center;line-height:18px">' + symbolMarker(sym, p.color) + '<span style="color:#9ca0b0;margin-right:8px">' + p.seriesName + '</span><span style="margin-left:auto;font-weight:600;color:#e4e4e7">' + p.value + '</span></div>';
+          });
+          return html;
+        }
+      },
       legend: (compareParam || hasPf) ? { top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } } : undefined,
       grid: { left: 70, right: 20, top: (compareParam || hasPf) ? 36 : 20, bottom: 40 },
       xAxis: { type: 'category', data: labels, name: paramLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
