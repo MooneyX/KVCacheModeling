@@ -1973,8 +1973,9 @@ function runSimulation(strategy, overrides) {
   let pools = {};
   ['hbm','dram','ssd'].forEach(t => pools[t] = { blocks: [], blockIndex: {}, used: 0, cap: caps[t], accessOrder: [], freq: {} });
 
-  const DT = 0.02;
-  const TOUCH_EVERY = 10;          // 每10步(0.2s)刷新一次位置统计与访问记录
+  const DT = 0.002;                 // 时间步长 2ms(原 20ms): fetchTime 亚步长分辨率——原 20ms 使 fetchTime<20ms 时
+  // 被量化为 1 步, L3 带宽 >90GB/s 后 TTFT 假性饱和(带宽提升不再体现)。2ms 可分辨到 ~500GB/s。
+  const TOUCH_EVERY = 10;          // 每10步(0.02s)刷新一次位置统计与访问记录
   const MAX_SIM_BLOCKS = 256;      // 单请求仿真块数上限（超出合并为超级块）
   const PREFILL_UTIL_CAP = 0.9;    // 并行 prefill 利用率上限：单请求利用率≈MFU，并行 batch 把 GPU 填满至该上限
   // decode 每请求开销见顶层 perReqMs()（校准: Qwen3-32B 单卡 6.4×n^0.75; DS-V3 8卡 5.2+3.7×n^0.75）
@@ -2117,7 +2118,7 @@ function runSimulation(strategy, overrides) {
       let order = quota.map((q, i) => [i, q - Math.floor(q)]).sort((a, b) => b[1] - a[1]);
       for (let j = 0; j < rem; j++) nTotals[order[j % order.length][0]]++;
       groupDefs.forEach((g, i) => {
-        if (nTotals[i] >= 2) assignments.push({ group: g, nTotal: nTotals[i] });
+        if (nTotals[i] >= 1) assignments.push({ group: g, nTotal: nTotals[i] });  // >=1: 全请求入组(1人组也建组, 预热开时命中自己的前缀)
       });
     }
     let pool = requests.slice();
@@ -2131,7 +2132,7 @@ function runSimulation(strategy, overrides) {
         req.prefixTokLen = Math.max(1, Math.round(req.inputLen * h)); // 每请求固定命中比例(与其自身长度无关)
         req.isFounder = false; grp.push(req);
       }
-      if (grp.length >= 2) {
+      if (grp.length >= 1) {
         // founder = 组内最长请求: 能 prefill 出完整组前缀(ownTokens = maxInput - P ≥ 0)
         grp.sort((x, y) => y.inputLen - x.inputLen);
         grp[0].isFounder = true;
