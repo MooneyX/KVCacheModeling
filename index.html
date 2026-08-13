@@ -2308,16 +2308,18 @@ function runSimulation(strategy, overrides) {
       groupPrefixTokens = req.prefixTokLen;
       ownTokens = req.inputLen - groupPrefixTokens;
     } else if (req.groupId) {
-      ownTokens = Math.max(64, req.inputLen - coveredTok);
+      ownTokens = Math.max(0, req.inputLen - coveredTok);
       if (coveredTok > 0) { stats.prefixHits++; stats.prefixSavedBytes += coveredTok * kvPerTok; }
     } else {
       ownTokens = req.inputLen;
     }
     if (req.retainIds && coveredTok > 0) { stats.sessionHits = (stats.sessionHits || 0) + 1; stats.prefixSavedBytes += coveredTok * kvPerTok; }
-    ownTokens = Math.max(64, Math.round(ownTokens));
+    ownTokens = Math.max(0, Math.round(ownTokens));
     // 前缀缓存的核心收益：sharer/后续轮 跳过已缓存前缀的 prefill 计算（降 TTFT）
     // founder 需全量 prefill 以建立共享块；普通请求全量 prefill
-    req.prefillTokens = Math.max(64, req.inputLen - coveredTok);
+    // (2026-08-13): 命中 100% 时 ownTokens/prefillTokens=0——完全跳过 prefill 计算,
+    // 不再保底 64 token(那会让"100% 命中"仍有 ~7% compute 占比)
+    req.prefillTokens = Math.max(0, req.inputLen - coveredTok);
     // P0-3(2026-08-12): 位置成本偏移——未命中段真实位置从命中量起算（修复前从 0 起算,
     // 低估 b·H·N 项: 命中越深偏移越大）。followUp 取历史总长(新 token 在其后)。
     req._pfStartPos = req.retainIds ? req.prevTotalTok : coveredTok;
@@ -2478,6 +2480,12 @@ function runSimulation(strategy, overrides) {
     let _pW = Math.max(0, (req.prefillStart || 0) - req.admitTime);
     let _fW = Math.min(req.fetchTime || 0, req._fetchDone || 0);
     let _cW = Math.max(0, req.prefillEnd - req.prefillStart - _fW);
+    // 命中 100%(无剩余计算): prefill 阶段纯 fetch 等待, DT 粒度残差(20ms 步长累加超出
+    // fetchTime 的部分)与完成前空转应归 fetch 而非 compute——否则"100% 命中"仍有假性 compute 占比
+    if ((req._pfTotal ?? 0) <= 0) {
+      _cW = 0;
+      _fW = Math.max(0, req.prefillEnd - req.prefillStart);
+    }
     stats.ttftQ += _qW; stats.ttftP += _pW; stats.ttftF += _fW; stats.ttftC += _cW;
     let _dW = Math.max(0, (req.decodeStart || req.prefillEnd) - req.prefillEnd);
     let _dT = Math.max(0, req.completeTime - (req.decodeStart || req.prefillEnd));
@@ -2652,7 +2660,7 @@ function runSimulation(strategy, overrides) {
     while (prefilling.length < prefillSlots && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
-      rq._pfTotal = rq._race ? rq.inputLen : (rq.prefillTokens || rq.inputLen);  // race: 全输入重算目标(相遇提前完成)
+      rq._pfTotal = rq._race ? rq.inputLen : (rq.prefillTokens ?? rq.inputLen);  // race: 全输入重算目标(相遇提前完成); 命中100%→0(无剩余计算)
       rq._pfDone = 0;
       prefilling.push(rq);
       dirty = true;
@@ -2689,6 +2697,7 @@ function runSimulation(strategy, overrides) {
         }
         // best_effort 计算进行中占算力（与拉取并行）；wait_complete 拉取中不占算力
         if (!qq._be && (qq.fetchTime || 0) > qq._fetchDone) continue;
+        if (qq._pfTotal <= 0) continue;  // 命中 100%: 无剩余计算, 不占算力(避免位置成本幽灵占权摊薄他人)
         // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
         let pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
@@ -2707,6 +2716,7 @@ function runSimulation(strategy, overrides) {
           q._pfDone += perReqTok;
           q._fetchDone = Math.min(q.fetchTime || 0, (q._fetchDone || 0) + DT);
         } else if ((q.fetchTime || 0) > q._fetchDone) { q._fetchDone += DT; continue; }
+        else if (q._pfTotal <= 0) { /* 命中 100%: 无剩余计算, 不推进, 交由下方 _done 判定完成 */ }
         else q._pfDone += perReqTok;
         // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
         // 即刻对组内后续请求可用（部分命中）。vLLM 整段哈希（hash）则等 founder 全部完成才激活。
