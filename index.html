@@ -393,11 +393,11 @@ select option{background:var(--surface2);color:var(--text)}
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
       </select></div>
       <div><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <label style="margin:0;font-size:.72rem;white-space:nowrap;color:var(--text)">④ 预取策略(形状)</label>
-        <label style="font-size:.7rem;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="sPfWait" checked> wait_complete</label>
-        <label style="font-size:.7rem;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="sPfBest" checked> best_effort</label>
-        <label style="font-size:.7rem;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="sPfRace" checked> race</label>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <label style="margin:0;font-size:.72rem;white-space:nowrap;color:var(--text);text-transform:none;letter-spacing:0">④ 预取策略(形状)</label>
+        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="sPfWait" checked style="margin:0"> wait_complete</label>
+        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="sPfBest" checked style="margin:0"> best_effort</label>
+        <label style="margin:0;font-size:.7rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="sPfRace" checked style="margin:0"> race</label>
       </div>
     </div>
     <div id="chartSensitivity" class="chart-container"></div>
