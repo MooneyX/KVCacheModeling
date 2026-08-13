@@ -3268,8 +3268,11 @@ function drawStrategyComparisonGantt() {
 // 对比参数档位默认自动生成（可选「无」回退单参数扫描），档位文本可编辑。
 // 扫描结果缓存（2026-08-11）：key = (全局参数+策略DSL+扫描参数+扫描档位+对比参数+对比档位+种子) → 轻量全指标记录数组。
 // 命中缓存时直接重绘（切换纵轴指标零仿真重跑）；未命中才跑 runSimulation 并缓存全部指标。
-// FIFO 上限 20 条。
+// 批次级缓存 FIFO 上限 20 条。
+// 点级缓存（2026-08-13）：key = (全局参数+DSL+扫描参数值+对比参数值+预取策略+种子) → 单点全指标记录，
+// 跨批次复用——改档位范围(如 10,100,10→50,100,10)时重叠点直接命中, 不再整批重跑。
 let sensCache = {};
+let sensPointCache = {};
 function extractSensMetrics(r) {
   return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
     tpot_p50: r.p50Tpot, tpot_p99: r.p99Tpot, latency: r.avgLatency, latency_p50: r.p50,
@@ -3366,7 +3369,8 @@ function runSensitivity() {
   // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数 + 扫描档位 + 对比参数/档位 + 种子），不含 metric——
   // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑；含扫描档位 values（修复 2026-08-11:
   // 旧版漏 values → 改扫描档位重跑命中旧缓存显示旧曲线）
-  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, prefetchList, gi('pSeed')]);
+  let paramsFp = getParams(); // 基础参数指纹（含基础 prefixHit/ssdBW，扫描/对比值经 overrides 注入，不在此指纹内）
+  let cacheKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, prefetchList, gi('pSeed')]);
   let cached = sensCache[cacheKey];
 
   let chartEl = $('chartSensitivity');
@@ -3450,27 +3454,37 @@ function runSensitivity() {
     let cv = compareParam ? compareVals[ci] : null;
     let pf = hasPf ? prefetchList[pi] : null;
     setTimeout(() => {
-      let rec = null;
-      try {
-        let s = JSON.parse(JSON.stringify(baseStrategy));
-        let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
-        if (param === 'hbm_threshold') s.admission.hbm_threshold = v / 100;
-        if (param === 'evict_threshold') s.eviction.hbm_evict_threshold = v / 100;
-        if (param === 'prefetch_threshold') s.prefetch.prefetch_threshold = v / 100;
-        if (param === 'max_batch_size') s.batching.max_batch_size = v;
-        if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
-        if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
-        // 对比参数（颜色维度）注入：与扫描参数同样的映射
-        if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
-        if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
-        if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
-        if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
-        if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
-        if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
-        // 预取策略（形状维度）注入：wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
-        if (hasPf) s.prefetch.type = PF_TYPE[pf];
-        rec = extractSensMetrics(runSimulation(s, overrides));
-      } catch(e) { rec = null; }
+      // 点级缓存：单个参数组合(扫描值×对比值×预取策略×种子)跨批次复用——改档位范围时重叠点直接命中
+      let pointKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name, param, v, compareParam, cv, pf, gi('pSeed')]);
+      let rec = sensPointCache[pointKey];
+      if (rec === undefined) {
+        rec = null;
+        try {
+          let s = JSON.parse(JSON.stringify(baseStrategy));
+          let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
+          if (param === 'hbm_threshold') s.admission.hbm_threshold = v / 100;
+          if (param === 'evict_threshold') s.eviction.hbm_evict_threshold = v / 100;
+          if (param === 'prefetch_threshold') s.prefetch.prefetch_threshold = v / 100;
+          if (param === 'max_batch_size') s.batching.max_batch_size = v;
+          if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
+          if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
+          // 对比参数（颜色维度）注入：与扫描参数同样的映射
+          if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
+          if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
+          if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
+          if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
+          if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
+          if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
+          // 预取策略（形状维度）注入：wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
+          if (hasPf) s.prefetch.type = PF_TYPE[pf];
+          rec = extractSensMetrics(runSimulation(s, overrides));
+        } catch(e) { rec = null; }
+        if (rec) {
+          sensPointCache[pointKey] = rec;
+          let pkeys = Object.keys(sensPointCache);
+          if (pkeys.length >= 1000) delete sensPointCache[pkeys[0]]; // 点级 FIFO 淘汰（上限1000点）
+        }
+      }
       if (hasPf) { if (compareParam) results[ci][pi][idx] = rec; else results[pi][idx] = rec; }
       else if (compareParam) results[ci][idx] = rec; else results[idx] = rec;
       let prog = (compareParam ? ci * (hasPf ? prefetchList.length : 1) * values.length : 0) + (hasPf ? pi * values.length : 0) + idx + 1;
