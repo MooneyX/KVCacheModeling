@@ -393,6 +393,12 @@ select option{background:var(--surface2);color:var(--text)}
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
       </select></div>
       <div><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <label style="margin:0;font-size:.72rem;white-space:nowrap;color:var(--text)">④ 预取策略(形状)</label>
+        <label style="font-size:.7rem;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="sPfWait" checked> wait_complete</label>
+        <label style="font-size:.7rem;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="sPfBest" checked> best_effort</label>
+        <label style="font-size:.7rem;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="sPfRace" checked> race</label>
+      </div>
     </div>
     <div id="chartSensitivity" class="chart-container"></div>
     <div class="formula-box" id="formulaSensitivity"></div>
@@ -3335,6 +3341,15 @@ function runSensitivity() {
   let metricLabel = {hit_rate:'HBM命中率(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
+  // ④ 预取策略（第三维=节点形状）：勾选的要对比的策略；prefetch.type 映射 wait_complete→none
+  let prefetchList = [];
+  if ($('sPfWait') && $('sPfWait').checked) prefetchList.push('wait_complete');
+  if ($('sPfBest') && $('sPfBest').checked) prefetchList.push('best_effort');
+  if ($('sPfRace') && $('sPfRace').checked) prefetchList.push('race');
+  let hasPf = prefetchList.length >= 1;
+  const PF_SYMBOL = { wait_complete: 'circle', best_effort: 'square', race: 'triangle' };
+  const PF_TYPE = { wait_complete: 'none', best_effort: 'best_effort', race: 'race' };
+
   // 对比参数（第三维=颜色）：显式下拉选择，档位从输入框读取（自动填充默认，可编辑）
   let compareParam = ($('sSweepCompareParam') ? $('sSweepCompareParam').value : '') || null;
   let compareVals = [];
@@ -3351,7 +3366,7 @@ function runSensitivity() {
   // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数 + 扫描档位 + 对比参数/档位 + 种子），不含 metric——
   // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑；含扫描档位 values（修复 2026-08-11:
   // 旧版漏 values → 改扫描档位重跑命中旧缓存显示旧曲线）
-  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, gi('pSeed')]);
+  let cacheKey = JSON.stringify([getParams(), baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, prefetchList, gi('pSeed')]);
   let cached = sensCache[cacheKey];
 
   let chartEl = $('chartSensitivity');
@@ -3362,14 +3377,28 @@ function runSensitivity() {
   function paint(results) {
     let ch = initChart('chartSensitivity');
     let series = [];
-    if (compareParam) {
-      let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
-      compareVals.forEach((cv, k) => {
-        series.push({ name: cmpLabel(cv), type: 'line', smooth: true,
-          data: results[k].map(rec => +metricOf(rec).toFixed(1)),
-          lineStyle: { color: palette[k % palette.length], width: 2 },
-          itemStyle: { color: palette[k % palette.length] } });
-      });
+    let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
+    if (compareParam || hasPf) {
+      let cmpLoop = compareParam ? compareVals.length : 1;
+      let pfLoop = hasPf ? prefetchList.length : 1;
+      for (let ci = 0; ci < cmpLoop; ci++) {
+        for (let pi = 0; pi < pfLoop; pi++) {
+          let data;
+          if (hasPf) data = compareParam ? results[ci][pi] : results[pi];
+          else data = results[ci];
+          let nameParts = [];
+          if (compareParam) nameParts.push(cmpLabel(compareVals[ci]));
+          if (hasPf) nameParts.push(prefetchList[pi]);
+          series.push({
+            name: nameParts.join(' · '), type: 'line', smooth: true,
+            data: data.map(rec => +metricOf(rec).toFixed(1)),
+            lineStyle: { color: palette[ci % palette.length], width: 2 },
+            itemStyle: { color: palette[ci % palette.length] },
+            symbol: hasPf ? PF_SYMBOL[prefetchList[pi]] : 'circle',
+            symbolSize: hasPf ? 7 : 6
+          });
+        }
+      }
     } else {
       series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(rec => +metricOf(rec).toFixed(1)),
         lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
@@ -3377,20 +3406,20 @@ function runSensitivity() {
     }
     let opt = {
       tooltip: { trigger: 'axis' },
-      legend: compareParam ? { top: 0, textStyle: { color: '#9ca0b0' } } : undefined,
-      grid: { left: 70, right: 20, top: compareParam ? 32 : 20, bottom: 40 },
+      legend: (compareParam || hasPf) ? { top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } } : undefined,
+      grid: { left: 70, right: 20, top: (compareParam || hasPf) ? 36 : 20, bottom: 40 },
       xAxis: { type: 'category', data: labels, name: paramLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
       yAxis: { type: 'value', name: metricLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
       series: series
     };
     ch.setOption(opt);
-    formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+
-      (compareParam
-        ? '三参数敏感性：固定其他策略参数与随机种子（共同随机数法），横轴扫描 <code>'+paramLabel+'</code>，'+
-          '每条曲线 = 一个 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> 档位（颜色）：<code>'+compareVals.join(', ')+'</code>，纵轴 <code>'+metricLabel+'</code><br>'+
-          '三维联动可观察「两个参数 × 指标」的耦合（如命中率 × 带宽 → TTFT）：低带宽下命中率收益被放大，高带宽收敛；曲线收敛点 ≈ 该场景带宽需求（l3BWp99）'
-        : '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>')+
-      '<br>基准策略: <code>'+baseStrategy.name+'</code> · 对比参数选择后自动填充档位（可编辑）· 同一扫描切换纵轴即时（缓存）'+
+    let desc;
+    if (compareParam && hasPf) desc = '四维敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> × 形状「预取策略」('+prefetchList.map(p=>p).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>（共同随机数法，固定其他参数与种子）';
+    else if (compareParam) desc = '三参数敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code>（'+compareVals.join(', ')+'），纵轴 <code>'+metricLabel+'</code>';
+    else if (hasPf) desc = '双维敏感性：横轴 <code>'+paramLabel+'</code> × 形状「预取策略」('+prefetchList.join(' / ')+')，纵轴 <code>'+metricLabel+'</code>';
+    else desc = '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>';
+    formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+desc+
+      '<br>基准策略: <code>'+baseStrategy.name+'</code> · 同一扫描切换纵轴即时（缓存）'+
       (cached ? ' · <span style="color:var(--accent)">⚡ 缓存命中，未重跑仿真（切换纵轴即时）</span>' : '');
     if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
     // 注意: 不要清空 chartEl.innerHTML——echarts.init 已接管元素并渲染 canvas, 清空会销毁图表
@@ -3399,15 +3428,18 @@ function runSensitivity() {
   if (cached) { paint(cached); return; } // 缓存命中：零仿真，按当前指标直接重绘（快速切换纵轴）
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 分析中...'; }
 
-  // results: 单参数 → 一维数组; 双参数 → compareVals.length × values.length 二维（元素=全指标记录）
-  let results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
-  let totalRuns = compareParam ? compareVals.length * values.length : values.length;
+  // results: 单参数→一维; 双参数→compareVals×values 二维; 三维(含预取策略)→compareVals×策略×values（元素=全指标记录）
+  let results;
+  if (hasPf) results = compareParam ? compareVals.map(() => prefetchList.map(() => new Array(values.length))) : prefetchList.map(() => new Array(values.length));
+  else results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
+  let totalRuns = (compareParam ? compareVals.length : 1) * (hasPf ? prefetchList.length : 1) * values.length;
   chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... 0/'+totalRuns+'</div>';
   formulaEl.innerHTML = '';
 
-  let ci = 0, idx = 0; // ci=对比档位索引, idx=扫描档位索引
+  let ci = 0, pi = 0, idx = 0; // ci=对比档位索引, pi=预取策略索引, idx=扫描档位索引
   function runNext() {
-    if (compareParam ? ci >= compareVals.length : idx >= values.length) {
+    let done = compareParam ? ci >= compareVals.length : (hasPf ? pi >= prefetchList.length : idx >= values.length);
+    if (done) {
       sensCache[cacheKey] = results; // 全指标记录入缓存（后续切纵轴/重跑直接复用）
       let keys = Object.keys(sensCache);
       if (keys.length >= 20) delete sensCache[keys[0]]; // FIFO 淘汰最旧
@@ -3416,6 +3448,7 @@ function runSensitivity() {
     }
     let v = values[idx];
     let cv = compareParam ? compareVals[ci] : null;
+    let pf = hasPf ? prefetchList[pi] : null;
     setTimeout(() => {
       let rec = null;
       try {
@@ -3434,12 +3467,20 @@ function runSensitivity() {
         if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
         if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
         if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
+        // 预取策略（形状维度）注入：wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
+        if (hasPf) s.prefetch.type = PF_TYPE[pf];
         rec = extractSensMetrics(runSimulation(s, overrides));
       } catch(e) { rec = null; }
-      if (compareParam) results[ci][idx] = rec; else results[idx] = rec;
-      chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... '+(compareParam ? ci*values.length+idx+1 : idx+1)+'/'+totalRuns+'</div>';
+      if (hasPf) { if (compareParam) results[ci][pi][idx] = rec; else results[pi][idx] = rec; }
+      else if (compareParam) results[ci][idx] = rec; else results[idx] = rec;
+      let prog = (compareParam ? ci * (hasPf ? prefetchList.length : 1) * values.length : 0) + (hasPf ? pi * values.length : 0) + idx + 1;
+      chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... '+prog+'/'+totalRuns+'</div>';
       idx++;
-      if (idx >= values.length && compareParam) { idx = 0; ci++; }
+      if (idx >= values.length) {
+        idx = 0;
+        if (hasPf) { pi++; if (pi >= prefetchList.length) { pi = 0; ci++; } }
+        else { ci++; }
+      }
       runNext();
     }, 0);
   }
