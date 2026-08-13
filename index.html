@@ -57,6 +57,7 @@ label{display:block;font-size:.68rem;color:var(--text-dim);text-transform:upperc
 input,select{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:6px 10px;color:var(--text);font-size:.8rem;outline:none;transition:border-color .2s}
 input:focus,select:focus{border-color:var(--accent)}
 select option{background:var(--surface2);color:var(--text)}
+input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;cursor:pointer;accent-color:var(--accent);vertical-align:middle}
 /* 前缀命中比例滑块: 覆盖全局 input 的 padding/border(否则滑到 max 右侧留白), 自定义轨道填充 + thumb */
 #pPrefixHit{-webkit-appearance:none;appearance:none;width:100%;height:6px;padding:0;border:none;border-radius:3px;background:var(--border);outline:none;cursor:pointer}
 #pPrefixHit::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;margin-top:-5px}
@@ -3440,7 +3441,7 @@ function runSensitivity() {
           let html = '<div style="font-weight:600;margin-bottom:4px">' + (params[0].axisValueLabel || params[0].name) + '</div>';
           params.forEach(function(p) {
             let sym = (series[p.seriesIndex] && series[p.seriesIndex].symbol) || 'circle';
-            html += '<div style="display:flex;align-items:center;line-height:18px">' + symbolMarker(sym, p.color) + '<span style="color:#9ca0b0;margin-right:8px">' + p.seriesName + '</span><span style="margin-left:auto;font-weight:600;color:#e4e4e7">' + p.value + '</span></div>';
+            html += '<div style="display:flex;align-items:center;line-height:18px">' + symbolMarker(sym, p.color) + '<span style="color:#9ca0b0;margin-right:8px">' + p.seriesName + '</span><span style="margin-left:auto;color:#9ca0b0">' + p.value + '</span></div>';
           });
           return html;
         }
