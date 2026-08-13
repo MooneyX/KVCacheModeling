@@ -2710,19 +2710,38 @@ function runSimulation(strategy, overrides) {
         sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
       }
       let perReqTok = sumCost > 0 ? totalFlops * DT / sumCost : 0; // 每请求每步推进 token 数
+      // ===== L3 拉取排队（2026-08-13）：并发 fetch/prefetch 共享 ssd>dram 带宽，先到先服务 =====
+      // 之前 fetch 用 _fetchDone += DT / _raceTok += DT×BW 理想化并行，多 sharer 并发命中时不竞争带宽，
+      // 系统性低估"低带宽 × 多并发命中"场景的 TTFT（生产级 HiCache prefetch 是单线程串行队列）。
+      let l3FetchBudget = p.ssdBW * 1e9 * 0.9 * DT;  // 本步 L3 拉取字节预算
+      for (let fi = 0; fi < prefilling.length && l3FetchBudget > 1; fi++) {
+        let fq = prefilling[fi];
+        let bytesLeft;
+        if (fq._race) {
+          bytesLeft = Math.max(0, fq.inputLen - fq._pfDone - fq._raceTok) * kvPerTok;  // race 从尾拉取剩余
+        } else if ((fq.fetchTime || 0) > fq._fetchDone || fq._be) {
+          bytesLeft = Math.max(0, (fq.fetchTime || 0) - fq._fetchDone) * (p.ssdBW * 1e9 * 0.9);  // 剩余拉取字节
+        } else {
+          bytesLeft = 0;
+        }
+        if (bytesLeft <= 0) continue;
+        let take = Math.min(bytesLeft, l3FetchBudget);
+        l3FetchBudget -= take;
+        if (fq._race) fq._raceTok += take / Math.max(kvPerTok, 1);
+        else fq._fetchDone += take / (p.ssdBW * 1e9 * 0.9);
+      }
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
         // race: GPU 从前往后重算(_pfDone) + L3 从后往前拉取(_raceTok), 相遇即停——
         // 不等待 fetchTime(与 wait_complete 的串行等待本质区别, 收益核心)
         if (q._race) {
           q._pfDone += perReqTok;
-          q._raceTok += DT * (p.ssdBW * 1e9 * 0.9) / Math.max(kvPerTok, 1);
+          // _raceTok 已在 L3 拉取排队循环推进（共享带宽）
           if (q._pfDone + q._raceTok >= q.inputLen) q._pfDone = q._pfTotal;  // 相遇 → 完成
         } else if (q._be) {
-          // best_effort: 计算与拉取并行推进, 完成 = max(计算完, 拉取完)
           q._pfDone += perReqTok;
-          q._fetchDone = Math.min(q.fetchTime || 0, (q._fetchDone || 0) + DT);
-        } else if ((q.fetchTime || 0) > q._fetchDone) { q._fetchDone += DT; continue; }
+          // _fetchDone 已在 L3 拉取排队循环推进（共享带宽）
+        } else if ((q.fetchTime || 0) > q._fetchDone) { continue; }  // fetch 未完成，不推进计算
         else if (q._pfTotal <= 0) { /* 命中 100%: 无剩余计算, 不推进, 交由下方 _done 判定完成 */ }
         else q._pfDone += perReqTok;
         // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
