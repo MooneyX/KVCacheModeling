@@ -209,11 +209,11 @@ select option{background:var(--surface2);color:var(--text)}
 
   <div class="card">
     <h2><span>推理负载</span> 配置</h2>
-    <p class="subtitle">请求特征（可选长尾分布）、并发模型、多轮会话复用与可复现随机种子 · 仿真请求数 N = min(2×并发, 256)</p>
+    <p class="subtitle">请求特征（可选长尾分布）、请求规模、多轮会话复用与可复现随机种子 · 仿真请求数 N = 请求数</p>
     <div class="row2">
       <div>
         <div class="form-row">
-          <div><label>并发请求数</label><input type="number" id="pConcurrency" value="32" min="1"></div>
+          <div><label>请求数</label><input type="number" id="pConcurrency" value="32" min="1" title="仿真请求总数(1:1 直接对应)。峰值并发由 QPS×延迟(Little 定律)自然形成; 需求推导的 KV 容量/批大小按'请求数=峰值并发'保守估算"></div>
           <div><label>平均输入长度(tok)</label><input type="number" id="pInputLen" value="4096" min="1"></div>
           <div><label>平均输出长度(tok)</label><input type="number" id="pOutputLen" value="1024" min="1"></div>
         </div>
@@ -914,7 +914,7 @@ function updateQuickResults(){
     {l:'TTFT(估计)',v:(r.ttftEst*1000).toFixed(0)+' ms',c:'accent'},
     {l:'TPOT(估计)',v:(r.tpotEst*1000).toFixed(2)+' ms/tok',c:'accent'},
     {l:'TP通信开销/步',v:(r.commOverhead*1000).toFixed(2)+' ms',c:r.commOverhead>r.passTime*0.1?'orange':'green'},
-    {l:'稳态并发(Little定律)',v:r.littleConcurrency.toFixed(0)+' vs 设定'+p.concurrency,c:littleOk?'green':'orange'},
+    {l:'稳态并发(Little定律)',v:r.littleConcurrency.toFixed(0)+' vs 请求数'+p.concurrency,c:littleOk?'green':'orange'},
   ].map(d=>'<div class="result-item"><div class="rl">'+d.l+'</div><div class="rv '+d.c+'">'+d.v+'</div></div>').join('');
   setFormula('formulaQuick',
     '<b>📐 核心公式（Roofline 分相建模）</b><br>'+
@@ -926,7 +926,7 @@ function updateQuickResults(){
     '• Prefill(位置感知): <code>τ(i)=a+b·i = '+p.prefillA+'+'+p.prefillB+'·i μs/tok</code> → T<sub>prefill</sub> = a·L + b·L²/2 = '+(r.ttftEst*1000).toFixed(0)+'ms（含 TP通信；a/b 来自实测拟合）<br>'+
     '• Decode(带宽瓶颈): <code>passTime = max[(权重+批次KV)/HBM带宽, 2×激活参数×B/算力] + TP通信 = '+(r.passTime*1000).toFixed(2)+' ms</code> → 每请求 '+r.decodeTpsPerReq.toFixed(0)+' tok/s（KV 读取量随输出增长）<br>'+
     '• TP通信(AllReduce): <code>2×L×(2(TP−1)/TP × B×hidden×2B)/NVLink + 2×L×5μs = '+(r.commOverhead*1000).toFixed(2)+' ms/步</code>（TP='+r.tpSize+'，占 passTime '+(r.commOverhead/r.passTime*100).toFixed(0)+'%）<br>'+
-    '• Little定律: <code>稳态并发 = QPS × 估计延迟('+r.estLatency.toFixed(2)+'s) = '+r.littleConcurrency.toFixed(0)+'</code>'+(littleOk?' ✓ 与设定并发一致':' ⚠ 与设定并发('+p.concurrency+')偏差较大，仿真中多余请求将排队')
+    '• Little定律: <code>稳态并发 = QPS × 估计延迟('+r.estLatency.toFixed(2)+'s) = '+r.littleConcurrency.toFixed(0)+'</code>'+(littleOk?' ✓ 与请求数基本一致':' ⚠ 稳态并发与请求数('+p.concurrency+')偏差较大，仿真中请求将排队或空转')
   );
   updateTierDemand();
 }
@@ -1142,7 +1142,7 @@ function drawConcurrency(){
     tooltip:{trigger:'axis',axisPointer:{type:'shadow'},valueFormatter:v=>v.toFixed(1)+' GB'},
     legend:{data:['HBM占用','DRAM占用','SSD占用'],top:0,textStyle:{color:'#9ca0b0'}},
     grid:{left:60,right:20,top:40,bottom:40},
-    xAxis:{type:'category',data:levels,name:'并发请求数',nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
+    xAxis:{type:'category',data:levels,name:'并发数',nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
     yAxis:{type:'value',name:'存储占用(GB)',nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
     series:[
       {name:'HBM占用',type:'bar',stack:'total',data:hbmVals,itemStyle:{color:'#f87171'},
@@ -1486,7 +1486,7 @@ function drawCrossAnalysis(){
       try{
         let overrides = job.type==='heat'
           ? {concurrency:job.c, nreq:Math.min(job.c*1.5,60), seed:p.seed}
-          : {nreq:Math.min(p.concurrency*2,80), seed:p.seed};
+          : {nreq:Math.min(p.concurrency,80), seed:p.seed};
         let r=runSimulation(job.s, overrides);
         if(job.type==='heat'){
           // 无完成请求 → 延迟无定义，显示 ∞ 而非误导性的 0
@@ -1567,7 +1567,7 @@ function drawCrossAnalysis(){
       '<b>📐 计算方式（全部来自仿真）</b><br>'+
       '• 吞吐量: 各策略 ÷ 最优 ×100 · P50/P99延迟: 相对最差值的反向映射<br>'+
       '• 显存利用率: 仿真时间加权平均 HBM 占用 · 低碎片: 100 − 块碎片率 · 公平性: 100 − 延迟变异系数CV%<br>'+
-      '仿真条件: 当前参数 · 请求数=min(2×并发,80) · 种子='+p.seed
+      '仿真条件: 当前参数 · 请求数=min(请求数,80) · 种子='+p.seed
     );
   }
   runNext();
@@ -2062,8 +2062,8 @@ function runSimulation(strategy, overrides) {
   }
 
   // ---------- 请求生成 ----------
-  // N = 2×并发（让请求流足以形成排队压力），上限256为性能保护；可通过 overrides.nreq 指定
-  let N = overrides.nreq || Math.min(p.concurrency * 2, 256);
+  // N = 请求数（1:1 直接对应，不再 ×2）；上限256为性能保护；可通过 overrides.nreq 指定
+  let N = overrides.nreq || Math.min(p.concurrency, 256);
   let requests = [], t = 0, lambda = Math.max(p.qps, 1e-9); // qps 真实生效; 仅防 0/负导致除零(极小值→无请求到达)
   let sigma = 0.6, muL = Math.log(Math.max(p.inputLen,1)) - sigma*sigma/2;
   let muO = Math.log(Math.max(p.outputLen,1)) - sigma*sigma/2;
@@ -3245,8 +3245,8 @@ function drawStrategyComparisonGantt() {
   });
   setFormula('formulaStrategySim',
     '<b>📐 仿真说明（事件驱动，全部指标来自真实统计）</b><br>'+
-    '• 请求生成: <code>N = min(2×并发, 256) = '+Math.min(gi('pConcurrency')*2,256)+'</code> 个 · 到达: '+($('pArrivalDist')&&$('pArrivalDist').value==='uniform'
-      ? '均匀等间隔(间隔 1/λ='+(1/Math.max(gv('pQps'),0.1)).toFixed(3)+'s)'
+    '• 请求生成: <code>N = 请求数 = '+Math.min(gi('pConcurrency'),256)+'</code> 个 · 到达: '+($('pArrivalDist')&&$('pArrivalDist').value==='uniform'
+      ? '均匀等间隔(间隔 1/λ='+(1/Math.max(gv('pQps'),1e-9)).toFixed(3)+'s)'
       : '泊松过程(λ='+gv('pQps')+', seed='+gi('pSeed')+')')+' · 长度分布: '+$('pLenDist').value+' · 多轮复用: '+gi('pMultiTurn')+'%<br>'+
     '• 准入: batch槽位≤max_batch_size 且显存可放置，否则排队 · Prefill: 并行 <code>并发≤min(maxBatch,4)，per-token τ(i)=a+b·i μs 位置感知</code>，总算力按各请求当前位置成本加权分摊（sharer 的 prefill 只含非前缀部分——前缀缓存的 TTFT 收益，且组前缀在 founder prefill 完成后才可命中）<br>'+
     '• Decode: 批次共享前向 <code>passTime = max[(W+ΣKV<sub>hbm</sub>)/BW<sub>hbm</sub> + ΣKV<sub>dram</sub>/min(PCIe,DRAM) + ΣKV<sub>ssd</sub>/NVMe, 2P×B/FLOPS]</code><br>'+
