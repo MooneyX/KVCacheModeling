@@ -249,6 +249,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div><label>Prefill斜率b(μs/tok²)</label><input type="number" id="pPrefillB" value="0.00533" min="0" step="0.0001" title="attention 累计项斜率。推导公式: b = kv/token ÷ HBM聚合带宽 (物理确定, 无需实测)"></div>
           <div><label>L3拉取固定延迟(μs)</label><input type="number" id="pFetchFixedUs" value="0" min="0" step="1" title="简化传输模型: 传输延迟 = 传输大小/带宽 (τ_pf 每块固定开销默认置 0, 2026-08-12)。如需模拟 NVMe 每请求延迟(RPC/软件开销)可手动调大, 原推导 = NVMe单请求(100) + RPC/软件(110)"></div>
           <div><label>Prefill Chunk(tok)</label><input type="number" id="pChunkSize" value="2048" min="16" step="16" title="chunked-prefill 波大小(框架配置, 默认 2048=sglang 默认)。用于推导 a 的权重读分摊项"></div>
+          <div><label>Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b 的估计值并填入(无需实测)">🎯 自动估算 a/b</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
@@ -545,6 +546,7 @@ function getParams(){
     prefillB: (function(){ var v=parseFloat($('pPrefillB').value); return isFinite(v) ? v : 5.33e-3; })(),     // μs/tok² 位置斜率(0=关闭)
     fetchFixedUs: (function(){ var v=parseFloat($('pFetchFixedUs').value); return isFinite(v) ? v : 209; })(), // 每块固定拉取开销 μs(0=纯带宽)
     chunkSize: gi('pChunkSize') || 2048,              // chunked-prefill 波大小（推导 a 的权重读分摊项）
+    prefillSlotsCap: Math.max(1, gi('pPrefillSlots') || 16),  // prefill 并发上限(2026-08-14 放开, 原硬编码 4)
     lenDist: $('pLenDist').value, multiTurn: gi('pMultiTurn')/100, seed: gi('pSeed'),
     arrivalDist: $('pArrivalDist') ? $('pArrivalDist').value : 'poisson',
     framework: 'sglang',   // 2026-08-12 起固定 sglang（移除推理引擎区分）
@@ -2641,7 +2643,7 @@ function runSimulation(strategy, overrides) {
     // 检查自然约束；prefill→decode 转换处由 decode 槽位上限单独执行。static 波次不变。
     if (s.batching.type === 'priority') waitQueue.sort((a, b) => a.inputLen - b.inputLen);
     if (s.batching.type === 'static' && decoding.length === 0 && prefillQ.length === 0 && prefilling.length === 0) staticWaveOpen = true;
-    let prefillSlots = Math.max(1, Math.min(s.batching.max_batch_size || 8, 4));
+    let prefillSlots = Math.max(1, Math.min(s.batching.max_batch_size || 8, p.prefillSlotsCap || 16));  // prefill 并发上限: min(max_batch, 可配 16) (2026-08-14 放开原硬编码 4)
     let fastCap = (caps.hbm + caps.dram) * 0.98; // 快层容量：HBM+DRAM 为"软家"，SSD 是最后手段
     for (let i = 0; i < waitQueue.length; i++) {
       if (s.batching.type === 'static') {
@@ -3328,7 +3330,7 @@ function drawStrategyComparisonGantt() {
     '• 请求生成: <code>N = 请求数 = '+Math.min(gi('pConcurrency'),256)+'</code> 个 · 到达: '+($('pArrivalDist')&&$('pArrivalDist').value==='uniform'
       ? '均匀等间隔(间隔 1/λ='+(1/Math.max(gv('pQps'),1e-9)).toFixed(3)+'s)'
       : '泊松过程(λ='+gv('pQps')+', seed='+gi('pSeed')+')')+' · 长度分布: '+$('pLenDist').value+' · 多轮复用: '+gi('pMultiTurn')+'%<br>'+
-    '• 准入: batch槽位≤max_batch_size 且显存可放置，否则排队 · Prefill: 并行 <code>并发≤min(maxBatch,4)，per-token τ(i)=a+b·i μs 位置感知</code>，总算力按各请求当前位置成本加权分摊（sharer 的 prefill 只含非前缀部分——前缀缓存的 TTFT 收益，且组前缀在 founder prefill 完成后才可命中）<br>'+
+    '• 准入: batch槽位≤max_batch_size 且显存可放置，否则排队 · Prefill: 并行 <code>并发≤min(maxBatch, 上限默认16)，per-token τ(i)=a+b·i μs 位置感知</code>，总算力按各请求当前位置成本加权分摊（sharer 的 prefill 只含非前缀部分——前缀缓存的 TTFT 收益，且组前缀在 founder prefill 完成后才可命中）<br>'+
     '• Decode: 批次共享前向 <code>passTime = max[(W+ΣKV<sub>hbm</sub>)/BW<sub>hbm</sub> + ΣKV<sub>dram</sub>/min(PCIe,DRAM) + ΣKV<sub>ssd</sub>/NVMe, 2P×B/FLOPS]</code><br>'+
     '• <b>L2/L3 实测带宽</b>: 平均口径 = 累计 ΣKV<sub>dram</sub>/ΣKV<sub>ssd</sub> 读取字节÷仿真时长；<b>需求口径</b> = 瞬时链路速率分位数（含预取/淘汰突发，见上方「L2/L3 带宽需求」图与指标网格）<br>'+
     '• <b>仿真窗口</b>: 时长 = <code>min(自适应排水估计, 仿真窗口上限 '+gi('pSimMaxTime')+'s)</code>。排水估计含 KV 下沉减速（HBM→DRAM→SSD 分层，与引擎同口径）。窗口触顶未排空 ⇒ 截断：完成样本不完整，TTFT/P99 跨配置比较会失真——结果会显示建议上限值（≈排水估计），调大「仿真窗口上限」即可跑完全部请求；重负载下亦可对比 TPOT/吞吐<br>'+
