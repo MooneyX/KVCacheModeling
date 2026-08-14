@@ -399,6 +399,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
         <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
+        <option value="fetch_ratio">L3拉取时间占比(%)</option>
       </select></div>
       <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
@@ -3346,9 +3347,12 @@ function drawStrategyComparisonGantt() {
 let sensCache = {};
 let sensPointCache = {};
 function extractSensMetrics(r) {
+  let b = r.ttftBreakdown || null;
+  let tt = b ? (b.queue + b.prefillQ + b.fetch + b.compute) : 0;
   return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
     tpot_p50: r.p50Tpot, tpot_p99: r.p99Tpot, latency: r.avgLatency, latency_p50: r.p50,
-    throughput: r.throughput, hit_rate: r.hitRate, mem_util: r.memUtilPeak, p99_latency: r.p99 };
+    throughput: r.throughput, hit_rate: r.hitRate, mem_util: r.memUtilPeak, p99_latency: r.p99,
+    fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0 };  // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
 }
 
 // 各参数默认档位（选择对比参数时自动填充；可手动编辑）
@@ -3413,7 +3417,7 @@ function runSensitivity() {
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)'}[metric];
+  let metricLabel = {hit_rate:'HBM命中率(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)'}[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
   // ③ 预取策略（第三维=节点形状）：勾选的要对比的策略；prefetch.type 映射 wait_complete→none
