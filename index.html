@@ -235,7 +235,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       </div>
       <div>
         <div class="form-row">
-          <div><label>Max Batch Size</label><input type="number" id="pMaxBatch" value="8" min="1"></div>
+          <div><label>Max Batch Size</label><input type="number" id="pMaxBatch" value="8" min="1" onchange="syncMaxBatchFromInput()" title="与 DSL 的 BATCH: max(N) 双向同步(2026-08-14): 改这里自动更新 DSL 的 BATCH 行(仿真唯一生效来源); 改 DSL 也会回填这里"></div>
           <div><label>Block Size (PageAttn)</label><input type="number" id="pBlockSize" value="16" min="1"></div>
           <div><label>仿真窗口上限(秒)</label><input type="number" id="pSimMaxTime" value="1200" min="60" step="60" title="仿真窗口 = min(排水估计, 此上限)。排水估计已含 KV 下沉减速(与引擎同口径)。重负载(长输入/高并发)下窗口触顶会截断, 完成请求数<总请求数, TTFT/P99 基于不完整样本——截断时结果会显示警示与实际排水建议值, 调大此值即可跑完全部请求"></div>
           <div><label>多轮复用比例(%)</label><input type="number" id="pMultiTurn" value="0" min="0" max="100"></div>
@@ -1810,13 +1810,33 @@ function setPrefetchPolicy(v) {
   let note = $('prefetchPolicyNote');
   if (note) note.textContent = '';
 }
-// DSL 被编辑/预设加载后同步下拉（从 PREFETCH 行反查）
+// DSL 被编辑/预设加载后同步下拉（从 PREFETCH 行反查）; 同时把 DSL 的 BATCH max(N) 回填 pMaxBatch 输入框(双向同步 2026-08-14)
 function syncPrefetchSelect() {
   let dslEl = $('sDsl'), sel = $('sPrefetchPolicy');
   if (!dslEl || !sel) return;
   let m = dslEl.value.match(/^PREFETCH:\s*(\w+)/m);
   let t = m ? m[1] : '';
   sel.value = t === 'race' ? 'suffix_race' : (t === 'best_effort' ? 'best_effort' : 'wait_complete');
+  let bm = dslEl.value.match(/^BATCH:\s*\w+\s*max\(\s*(\d+)\s*\)/m);
+  let mb = $('pMaxBatch');
+  if (bm && mb) mb.value = bm[1];
+}
+// pMaxBatch 输入框 → DSL BATCH 行(仿真唯一生效来源): 改输入框自动改写 DSL, 消除两处冲突(2026-08-14)
+function syncMaxBatchFromInput() {
+  let v = Math.max(1, parseInt($('pMaxBatch') ? $('pMaxBatch').value : '8') || 8);
+  let dslEl = $('sDsl');
+  if (!dslEl) return;
+  let lines = dslEl.value.split('\n');
+  let idx = lines.findIndex(l => l.trim().startsWith('BATCH:'));
+  if (idx >= 0) {
+    let nl = lines[idx].replace(/max\(\s*\d+\s*\)/i, 'max(' + v + ')');
+    if (nl === lines[idx]) nl = lines[idx].replace(/^(\s*BATCH:\s*\w+).*$/i, '$1 max(' + v + ')');
+    lines[idx] = nl;
+  } else {
+    lines.push('BATCH: continuous max(' + v + ')');
+  }
+  dslEl.value = lines.join('\n');
+  if (typeof syncPrefetchSelect === 'function') syncPrefetchSelect();
 }
 function parseDSL(text) {
   let s = {
