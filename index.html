@@ -291,7 +291,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <div><label>L3 预取策略 (sglang HiCache)</label><select id="sPrefetchPolicy" onchange="setPrefetchPolicy(this.value)" style="width:auto">
         <option value="wait_complete" selected>wait_complete（等 KV 拉齐再算）</option>
         <option value="best_effort">best_effort（边拉边算, 完成=max(计算,拉取)）</option>
-        <option value="suffix_race">suffix_race（GPU 前向重算 + L3 后向拉取, 相遇即停）</option>
+        <option value="suffix_race">suffix_race（前缀: GPU前向计算 + L3后向预取, 相遇即停, 再算非复用后缀）</option>
       </select></div>
       <span style="font-size:.7rem;color:var(--text-dim)">选择后自动写入 DSL 的 PREFETCH 行（wait_complete→none）</span>
     </div>
@@ -1688,7 +1688,7 @@ var strategyPresets = {
   'Conservative':'ADMIT: priority(<2048:hbm, >=2048:dram)\nEVICT: lru from hbm when 95% -> dram\nPREFETCH: none\nBATCH: priority max(4)\nPLACE: hbm_first',
   // SGLang 默认语义(2026-08-12): continuous batching + RadixAttention(lru 驱逐)
   // + HiCache tiered 分层 + 静态内存池(mem-fraction≈0.9 准入)。
-  // PREFETCH: none = wait_complete(命中即等 KV 拉齐再算); 改 race 即 SuffixPrefetchV2 race 调度
+  // PREFETCH: none = wait_complete(命中即等 KV 拉齐再算); 改 race = 前缀 GPU前向计算+L3后向预取, 相遇即停后再算后缀
   'SGLang-Default': 'ADMIT: threshold(hbm=0.9)\nEVICT: lru from hbm when 90% -> dram, lru from dram when 90% -> ssd\nPREFETCH: none\nBATCH: continuous max(8)\nPLACE: tiered',
 };
 
@@ -1793,7 +1793,7 @@ function place() { return hbmUsage() < 0.9 ? 'hbm' : 'dram'; }`,
 
 // ======================== DSL PARSER ========================
 // L3 预取策略开关 → DSL PREFETCH 行（2026-08-12）:
-// wait_complete→none(等拉齐), best_effort→best_effort(边拉边算), suffix_race→race(相遇即停)
+// wait_complete→none(等拉齐), best_effort→best_effort(边拉边算), suffix_race→race(前缀双向夹逼相遇即停, 再算后缀)
 function setPrefetchPolicy(v) {
   let map = { wait_complete: 'none', best_effort: 'best_effort', suffix_race: 'race' };
   let dsl = $('sDsl');
@@ -1890,7 +1890,7 @@ function dslToText(s) {
   let p = s.prefetch;
   if (p.type === 'none') lines.push('PREFETCH: none');
   else if (p.type === 'eager') lines.push('PREFETCH: eager');
-  else if (p.type === 'race') lines.push('PREFETCH: race');   // race: GPU前向后重算 + L3后向前拉取, 相遇即停
+  else if (p.type === 'race') lines.push('PREFETCH: race');   // race: 前缀 GPU前向计算 + L3后向预取, 相遇即停后再算非复用后缀
   else if (p.type === 'best_effort') lines.push('PREFETCH: best_effort');  // 边拉边算, 完成=max(计算,拉取)
   else lines.push('PREFETCH: '+p.type+' from '+(p.from_tier||'dram')+' when hbm<'+(Math.round((p.prefetch_threshold||0.5)*100))+'%');
   let b = s.batching;
@@ -2332,10 +2332,12 @@ function runSimulation(strategy, overrides) {
     // P0-3(2026-08-12): 位置成本偏移——未命中段真实位置从命中量起算（修复前从 0 起算,
     // 低估 b·H·N 项: 命中越深偏移越大）。followUp 取历史总长(新 token 在其后)。
     req._pfStartPos = req.retainIds ? req.prevTotalTok : coveredTok;
-    // P0-1/P0-2(2026-08-12): race 策略 —— GPU 从前往后重算 + L3 从后往前拉取, 相遇即停。
+    // P0-1/P0-2(2026-08-14): race 策略 —— 可复用前缀[0,H] 双向夹逼:
+    // GPU 从前往后计算前缀 + L3 从后往前拉取前缀, 相遇即停(前缀完整); 相遇后 GPU 计算非复用后缀[H,L]。
     // 仅对"有 L3 命中(fetchTime>0)"的请求生效; 无命中请求走普通 prefill。
     req._race = !!(s.prefetch && s.prefetch.type === 'race' && req.fetchTime > 0);
-    req._raceTok = 0;   // race: L3 从尾部已拉取 token 数
+    req._raceTok = 0;        // race: L3 从尾部(H端)已拉取的前缀 token 数
+    req._raceMeetTok = -1;   // race: 相遇点 GPU 已算前缀 token 数; -1=尚未相遇(阶段0: GPU 算前缀)
     // best_effort(2026-08-12): 边拉边算——计算不等待 fetch, 与拉取并行推进,
     // 完成 = max(计算完, 拉取完)。仅对命中请求(fetchTime>0)生效。
     req._be = !!(s.prefetch && s.prefetch.type === 'best_effort' && req.fetchTime > 0);
@@ -2669,7 +2671,7 @@ function runSimulation(strategy, overrides) {
     while (prefilling.length < prefillSlots && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
-      rq._pfTotal = rq._race ? Math.max(0, rq.inputLen - (rq._pfStartPos || 0)) : (rq.prefillTokens ?? rq.inputLen);  // race: 重算未命中后缀(前缀命中段走 L3 拉取); 命中100%→0
+      rq._pfTotal = rq._race ? 0 : (rq.prefillTokens ?? rq.inputLen);  // race: 阶段0 前缀双向 race, _pfTotal 相遇时重设为(已算前缀+后缀全量)
       rq._pfDone = 0;
       prefilling.push(rq);
       dirty = true;
@@ -2699,10 +2701,11 @@ function runSimulation(strategy, overrides) {
       for (let qi = 0; qi < prefilling.length; qi++) {
         let qq = prefilling[qi];
         if (qq._race) {
-          // race: GPU 重算未命中后缀[命中量, L](位置递增) → 重算完后缀回头重算前缀尾部[命中量→0](位置递减),
-          // 与 L3 从后往前拉前缀相遇——相遇点依赖命中量(命中越多, 前缀越长, L3 拉取越多/GPU 重算越少)
-          let H = qq._pfStartPos || 0, N = qq._pfTotal, d = qq._pfDone;
-          let pos = d <= N ? H + d : Math.max(0, H - (d - N));
+          // race: 阶段0 GPU 从前往后计算前缀[0, H](pos=已算前缀数, 位置从0递增);
+          // 相遇后阶段1 计算非复用后缀[H, L](pos=H+已算后缀数, 位置从H递增)
+          let H = qq._pfStartPos || 0;
+          let pos = qq._raceMeetTok < 0 ? qq._pfDone
+            : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
           sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
           continue;
         }
@@ -2722,7 +2725,8 @@ function runSimulation(strategy, overrides) {
         let fq = prefilling[fi];
         let bytesLeft;
         if (fq._race) {
-          bytesLeft = Math.max(0, (fq._pfStartPos || 0) - fq._raceTok) * kvPerTok;  // race 拉取命中前缀[0, H]剩余(未命中后缀由 GPU 重算)
+          // race 拉取命中前缀[0, H]剩余(从H端往前); 相遇后前缀已完整(GPU算+L3拉覆盖全前缀), 停止拉取
+          bytesLeft = fq._raceMeetTok >= 0 ? 0 : Math.max(0, (fq._pfStartPos || 0) - fq._raceTok) * kvPerTok;
         } else if ((fq.fetchTime || 0) > fq._fetchDone || fq._be) {
           bytesLeft = Math.max(0, (fq.fetchTime || 0) - fq._fetchDone) * (p.ssdBW * 1e9 * 0.9);  // 剩余拉取字节
         } else {
@@ -2736,12 +2740,19 @@ function runSimulation(strategy, overrides) {
       }
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
-        // race: GPU 从前往后重算(_pfDone) + L3 从后往前拉取(_raceTok), 相遇即停——
+        // race: 前缀[0,H] 双向夹逼——GPU 从前往后计算(_pfDone) + L3 从后往前拉取(_raceTok),
+        // 相遇即停(_pfDone+_raceTok>=H → 前缀完整), 相遇后 GPU 转算非复用后缀[H,L]。
         // 不等待 fetchTime(与 wait_complete 的串行等待本质区别, 收益核心)
         if (q._race) {
           q._pfDone += perReqTok;
-          // _raceTok 已在 L3 拉取排队循环推进（共享带宽）
-          if (q._pfDone + q._raceTok >= q.inputLen) q._pfDone = q._pfTotal;  // 相遇 → 完成
+          if (q._raceMeetTok < 0) {
+            // 阶段0: GPU 算前缀; 相遇判定(已算+已拉覆盖全前缀)
+            if (q._pfDone + q._raceTok >= (q._pfStartPos || 0)) {
+              q._raceMeetTok = q._pfDone;   // 相遇点: GPU 已算前缀 token 数
+              q._pfTotal = q._raceMeetTok + Math.max(0, q.inputLen - (q._pfStartPos || 0));  // 总任务=已算前缀+后缀全量
+            }
+          }
+          // 阶段1(相遇后): _pfDone 继续累加即后缀进度, 无需分支
         } else if (q._be) {
           q._pfDone += perReqTok;
           // _fetchDone 已在 L3 拉取排队循环推进（共享带宽）
@@ -2762,9 +2773,9 @@ function runSimulation(strategy, overrides) {
           prefixGroupMap[q.groupId].activated = true;
         }
         // best_effort 完成需 计算+拉取 都到齐（decode 需全部 KV）
-        // race 同理: 需"重算完后缀 + 拉完命中前缀"(否则命中100%时 _pfTotal=0 会立即完成、跳过前缀拉取)
+        // race: 需"已相遇(前缀完整) + 后缀算完"——相遇后 _pfTotal 才有效(否则命中100%时 _pfTotal=0 会误判完成)
         let _done = q._pfDone >= q._pfTotal && (!q._be || q._fetchDone >= (q.fetchTime || 0))
-          && (!q._race || q._raceTok >= (q._pfStartPos || 0));
+          && (!q._race || q._raceMeetTok >= 0);
         if (_done) {
           prefilling.splice(i, 1);
           q.prefillEnd = now;
