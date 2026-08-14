@@ -2312,6 +2312,7 @@ function runSimulation(strategy, overrides) {
       ? Math.ceil(ssdCoveredTok / p.blockSize) * (isFinite(p.fetchFixedUs) ? p.fetchFixedUs : 209) * 1e-6
         + ssdCoveredTok * kvPerTok / Math.max(p.ssdBW * 1e9 * 0.9, 1) : 0;
     req._fetchDone = 0;
+    req._fetchWait = 0;   // 拉取墙钟等待(秒): 并发带宽排队时每步累计, fetch 分解改墙钟口径(2026-08-14)
     // 2) 计算自有 token（前缀块被丢弃的部分需要重算）
     let groupPrefixTokens = 0, ownTokens;
     if (req.retainIds) {
@@ -2495,7 +2496,10 @@ function runSimulation(strategy, overrides) {
     // cW=实际prefill计算, dW=decode槽位等待, dT=decode执行。校验: qW+pW+fW+cW+dW+dT = 延迟。
     let _qW = Math.max(0, req.admitTime - req.arrive);
     let _pW = Math.max(0, (req.prefillStart || 0) - req.admitTime);
-    let _fW = Math.min(req.fetchTime || 0, req._fetchDone || 0);
+    // 2026-08-14: fetch 分解改墙钟口径——_fetchWait 累计并发带宽排队等待(每步DT);
+    // 无等待记录时回退独占折算(min(fetchTime,_fetchDone))。修正前 fetch=独占折算时间,
+    // 并发拉取的排队等待被错误计入 compute(见 cap=4→64 验证: compute 760→8502ms 含等带宽)。
+    let _fW = (req._fetchWait || 0) > 0 ? (req._fetchWait || 0) : Math.min(req.fetchTime || 0, req._fetchDone || 0);
     let _cW = Math.max(0, req.prefillEnd - req.prefillStart - _fW);
     // 命中 100%(无剩余计算): prefill 阶段纯 fetch 等待, DT 粒度残差(20ms 步长累加超出
     // fetchTime 的部分)与完成前空转应归 fetch 而非 compute——否则"100% 命中"仍有假性 compute 占比
@@ -2770,6 +2774,11 @@ function runSimulation(strategy, overrides) {
       // be(2026-08-14): 排队期尽力拉取——遍历 waitQueue+prefillQ 中所有已到达未准入的 be 请求
       // (拉取从 arrive 起持续到准入 prefilling, 与 prefilling 共享带宽);
       // 准入后即终止 —— 对齐 sglang best_effort("调度即停, 未拉重算")
+      for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
+        let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
+        // 累计 be 排队期拉取墙钟等待(每步, 无论是否分到带宽——带宽不足时也在等)
+        if (bq._be && (bq.fetchTime || 0) > (bq._fetchDone || 0)) bq._fetchWait += DT;
+      }
       for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length && l3FetchBudget > 1; qi2++) {
         let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
         if (!bq._be || (bq.fetchTime || 0) <= (bq._fetchDone || 0)) continue;
@@ -2795,7 +2804,7 @@ function runSimulation(strategy, overrides) {
           // 阶段1(相遇后): _pfDone 继续累加即后缀进度, 无需分支
         } else if (q._be) {
           if (q._pfTotal > 0) q._pfDone += perReqTok;  // be: 排队期拉取已定格, 只算未拉前缀+后缀; 拉完则直接完成
-        } else if ((q.fetchTime || 0) > q._fetchDone) { continue; }  // fetch 未完成，不推进计算
+        } else if ((q.fetchTime || 0) > q._fetchDone) { q._fetchWait += DT; continue; }  // fetch 未完成: 累计拉取墙钟等待, 不推进计算
         else if (q._pfTotal <= 0) { /* 命中 100%: 无剩余计算, 不推进, 交由下方 _done 判定完成 */ }
         else q._pfDone += perReqTok;
         // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
