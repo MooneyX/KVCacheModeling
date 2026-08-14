@@ -39,3 +39,6 @@ s1.txt
 s2o.txt
 sim_l2l3*.js
 sim_race*.js
+
+# 外部克隆源码(分析用, 不入库)
+sglang/
