@@ -2021,6 +2021,7 @@ function runSimulation(strategy, overrides) {
     // 延迟 = TTFT + decode槽位等待 + decode执行（L3 读占比的落点）
     ttftQ: 0, ttftP: 0, ttftF: 0, ttftC: 0, latDw: 0, latDt: 0,
     fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
+    fetchSpanSum: 0,                                        // prefill 传输过程实际耗时累计(_ft1-_ft0, 含带宽排队/不含计算)
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
     hbmReadBytes: 0, dramReadBytes: 0, ssdReadBytes: 0,       // 每步批次读取量的时间累计（÷仿真时长=平均读带宽）
     dramPeak: 0, ssdPeak: 0, dramUsedSum: 0, ssdUsedSum: 0,   // L2/L3 峰值与时间加权均值占用
@@ -2564,6 +2565,10 @@ function runSimulation(strategy, overrides) {
     }
     stats.ttftQ += _qW; stats.ttftP += _pW; stats.ttftF += _fW; stats.ttftC += _cW;
     stats.fetchSoloSum += (req.fetchTime || 0); // prefill 传输独立用时(不重叠时 L3 拉取单独耗时): race/be 与计算重叠后实际等待≈0, 但独立用时仍在
+    // 仿真过程中的实际传输耗时(含 L3 带宽排队, 不含计算): wc=prefillStart→拉完;
+    // race=prefillStart→相遇点(被计算覆盖的拉取过程); be=到达→拉完或准入终止
+    if ((req.fetchTime || 0) > 0 && req._ft0 !== undefined && req._ft1 !== undefined)
+      stats.fetchSpanSum += Math.max(0, req._ft1 - req._ft0);
     let _dW = Math.max(0, (req.decodeStart || req.prefillEnd) - req.prefillEnd);
     let _dT = Math.max(0, req.completeTime - (req.decodeStart || req.prefillEnd));
     stats.latDw += _dW; stats.latDt += _dT;
@@ -2742,6 +2747,8 @@ function runSimulation(strategy, overrides) {
     while (prefilling.length < prefillSlots && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
+      // 传输过程计时起点: wc/race 自进入 prefilling(进入拉取队列)起; be 已于排队期置 _ft0=arrive
+      if ((rq.fetchTime || 0) > 0 && rq._ft0 === undefined) rq._ft0 = now;
       if (rq._race) {
         rq._pfTotal = 0;  // race: 阶段0 前缀双向 race, _pfTotal 相遇时重设为(已算前缀+后缀全量)
       } else if (rq._be) {
@@ -2751,6 +2758,7 @@ function runSimulation(strategy, overrides) {
         let H = rq._pfStartPos || 0;
         let fetchTok = H > 0 ? Math.min(H, Math.floor((rq._fetchDone || 0) / Math.max(rq.fetchTime, 1e-9) * H)) : 0;
         rq._beFetchedTok = fetchTok;
+        if (rq._ft0 !== undefined && rq._ft1 === undefined) rq._ft1 = now; // be: 准入即终止拉取, 传输过程结束
         rq._bePrefixCap = Math.max(0, H - fetchTok);
         rq._pfTotal = rq._bePrefixCap + Math.max(0, rq.prefillTokens ?? rq.inputLen);  // = inputLen - fetchTok
       } else {
@@ -2830,7 +2838,10 @@ function runSimulation(strategy, overrides) {
         let take = Math.min(bytesLeft, l3FetchBudget);
         l3FetchBudget -= take;
         if (fq._race) fq._raceTok += take / Math.max(kvPerTok, 1);
-        else fq._fetchDone += take / (p.ssdBW * 1e9 * 0.9);
+        else {
+          fq._fetchDone += take / (p.ssdBW * 1e9 * 0.9);
+          if (fq._fetchDone >= (fq.fetchTime || 0) && fq._ft1 === undefined) fq._ft1 = now; // wc: 拉取完成时刻
+        }
       }
       // be(2026-08-14): 排队期尽力拉取——遍历 waitQueue+prefillQ 中所有已到达未准入的 be 请求
       // (拉取从 arrive 起持续到准入 prefilling, 与 prefilling 共享带宽);
@@ -2840,11 +2851,13 @@ function runSimulation(strategy, overrides) {
       for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length && l3FetchBudget > 1; qi2++) {
         let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
         let bfte = beFetchTimeEst(bq);
+        if (bfte > 0 && bq._ft0 === undefined) bq._ft0 = bq.arrive; // be: 传输过程自到达起(排队期拉取语义)
         if (bfte <= 0 || bfte <= (bq._fetchDone || 0)) continue;
         let bytesLeft = Math.max(0, bfte - (bq._fetchDone || 0)) * (p.ssdBW * 1e9 * 0.9);
         let take = Math.min(bytesLeft, l3FetchBudget);
         l3FetchBudget -= take;
         bq._fetchDone = (bq._fetchDone || 0) + take / (p.ssdBW * 1e9 * 0.9);
+        if (bq._fetchDone >= bfte && bq._ft1 === undefined) bq._ft1 = now; // be: 排队期拉取完成时刻
       }
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
@@ -2857,6 +2870,7 @@ function runSimulation(strategy, overrides) {
             // 阶段0: GPU 算前缀; 相遇判定(已算+已拉覆盖全前缀)
             if (q._pfDone + q._raceTok >= (q._pfStartPos || 0)) {
               q._raceMeetTok = q._pfDone;   // 相遇点: GPU 已算前缀 token 数
+              if (q._ft1 === undefined) q._ft1 = now;  // race: 相遇即停止拉取, 传输过程结束
               q._pfTotal = q._raceMeetTok + Math.max(0, q.inputLen - (q._pfStartPos || 0));  // 总任务=已算前缀+后缀全量
             }
           }
@@ -3173,7 +3187,10 @@ function runSimulation(strategy, overrides) {
       dTime: stats.latDt / stats.completed * 1000,
       // prefill 传输独立用时（ms, 未与计算重叠前）: wait_complete 下 ≈fetch(串行);
       // race/best_effort 下与计算重叠 → 实际等待 fetch≈0 但独立用时仍在此体现(重叠收益 = fetchSolo − fetch)
-      fetchSolo: stats.fetchSoloSum / stats.completed * 1000
+      fetchSolo: stats.fetchSoloSum / stats.completed * 1000,
+      // prefill 传输过程实际耗时（ms, 仿真中传输的真实时长）: 含 L3 并发带宽排队、不含计算——
+      // 为避免被计算延迟覆盖而单列为"独立"展示; wc 下 ≈fetch(实际等待), race/be 下为被计算重叠隐藏的拉取过程时长
+      fetchReal: stats.fetchSpanSum / stats.completed * 1000
     } : null,
     // decode 每 pass 名义分量的绝对用时（ms/pass, 未 max 取大前的单独耗时）：
     // 传输 = l2+l3（跨层 KV 读含链路排队）; 计算侧 = hbm(权重+KV读+每请求开销) + cmp(算力下限) + comm(TP通信)
@@ -3261,7 +3278,9 @@ function drawStrategyMetrics() {
       ['P99延迟', sr.p99.toFixed(0)+' ms', 'red'],
       ['平均排队', sr.avgQueue.toFixed(2)+' s', 'orange'],
       // 传输 vs 计算「重叠之前」的独立用时（2026-08-18）：看清带宽/算力各作用于哪个阶段
-      ['Prefill 传输(独立)', sr.ttftBreakdown ? (sr.ttftBreakdown.fetchSolo||0).toFixed(0)+' ms' : '—', 'orange'],
+      // Prefill 传输(独立) = 仿真过程中的实际传输耗时(含 L3 带宽排队, 不含计算)——
+      // 为防被计算延迟覆盖而单列; wc 下≈传输等待(实际), race/be 下为被计算重叠隐藏的拉取过程时长
+      ['Prefill 传输(独立)', sr.ttftBreakdown ? (sr.ttftBreakdown.fetchReal||0).toFixed(0)+' ms' : '—', 'orange'],
       ['Prefill 计算(独立)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
       ['Prefill 传输等待(实际)', sr.ttftBreakdown ? sr.ttftBreakdown.fetch.toFixed(0)+' ms' : '—', sr.ttftBreakdown && sr.ttftBreakdown.fetch > sr.ttftBreakdown.compute ? 'red' : 'orange'],
       ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
@@ -3388,7 +3407,7 @@ function drawStrategyTierDemand(){
     '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
-    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=L3 拉取若<b>独占全部有效带宽(0.9×BW)</b>的理论耗时(fetchTime)，<code>Prefill 计算(独立)</code>=实际 prefill 计算，<code>Prefill 传输等待(实际)</code>=墙钟等待。三者关系: wait_complete 独占带宽时 实际≈独立；<b>多请求并发拉取共享带宽(FCFS 排队)时 实际&gt;独立</b>，比值≈平均并发拉取数；race/best_effort 与计算重叠，实际≈0（独立−实际=重叠收益）。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时<br>'+
+    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——含 L3 并发带宽排队、不含计算，为避免被计算延迟覆盖而单列（wc=prefill开始→拉完, ≈传输等待(实际); race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(独立)</code>=实际 prefill 计算；<code>Prefill 传输等待(实际)</code>=计入 TTFT 的墙钟等待（race/be 与计算重叠 → ≈0）。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
