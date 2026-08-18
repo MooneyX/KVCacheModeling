@@ -243,7 +243,8 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <div class="form-row" style="margin-top:6px">
           <div><label>前缀命中比例(%)</label><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="width:100%" title="入组请求的前缀命中比例: 共享前缀长度 = 平均输入×此值, 命中请求跳过对应比例的前缀 prefill (h=99 → 命中请求跳过 ~99% prefill)"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">40%</span></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
-          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选后: 已拉取的前缀 KV 在 decode 阶段仍按 SSD/L3 读计费(C4 修复前行为)——模拟用户回复间隔较长、请求 KV cache 已被逐出 HBM/DRAM、decode 时每 pass 需重新从 L3 拉取的场景。不勾选(默认): 拉取的 KV 驻留 HBM, decode 读 HBM(与 wait_complete'拉齐再算'语义一致)"><input type="checkbox" id="pDecodeL3Read" style="width:auto"><label style="margin:0;font-size:.75rem" for="pDecodeL3Read">Decode 从 L3 重读(KV 被驱逐场景)</label></div>
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选后: 已拉取的前缀 KV 在 decode 阶段仍按 SSD/L3 读计费(C4 修复前行为)——模拟用户回复间隔较长、请求 KV cache 已被逐出 HBM/DRAM、decode 时每 pass 需重新从 L3 拉取的场景。不勾选(默认): 拉取的 KV 驻留 HBM, decode 读 HBM(与 wait_complete'拉齐再算'语义一致)。decode 的 L3 重读与 prefill 拉取共享同一 NVMe 总线且按需读优先(2026-08-18 问题②修复): 低带宽下重读饱和会挤占后续请求的拉取, TTFT 显著上升——这正是'KV 被驱逐+带宽不足'系统不可用的信号"><input type="checkbox" id="pDecodeL3Read" style="width:auto"><label style="margin:0;font-size:.75rem" for="pDecodeL3Read">Decode 从 L3 重读(KV 被驱逐场景)</label></div>
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选后: 同组共享前缀的 L3 拉取只发生一次, 后续请求等待并共享该次拉取(HiCache 单飞/去重语义——前缀拉取后驻留快层, 后续请求直接命中)。不勾选(默认): 每个请求独立重新拉取完整前缀——模拟前缀在两个请求之间被逐出快层(如用户回复间隔长)的场景。与「Decode 从 L3 重读」开关搭配使用"><input type="checkbox" id="pFetchCoalesce" style="width:auto"><label style="margin:0;font-size:.75rem" for="pFetchCoalesce">前缀拉取单飞(同组共享去重)</label></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>Prefill位置成本a(μs/tok)</label><input type="number" id="pPrefillA" value="79.5" min="0" step="0.1" title="位置感知 prefill: τ_rec(i)=a+b·i。a=固定项。推导值见右侧按钮: 权重读/chunk + 算力/mfu + TP通信"></div>
@@ -546,6 +547,9 @@ function getParams(){
     // Decode 从 L3 重读开关(2026-08-18): 勾选=已拉取前缀块 decode 期仍按 SSD 读计费(C4 前行为),
     // 模拟回复间隔长导致请求 KV 被逐出 HBM/DRAM、decode 每 pass 重新从 L3 拉取的场景
     decodeL3Read: !!(document.getElementById('pDecodeL3Read') && document.getElementById('pDecodeL3Read').checked),
+    // 前缀拉取单飞开关(2026-08-18): 勾选=同组前缀的 L3 拉取只发生一次, 后续请求共享已拉取
+    // 副本(HiCache 单飞/去重); 默认关=每请求独立重拉(模拟前缀在两请求间被逐出快层的场景)
+    fetchCoalesce: !!(document.getElementById('pFetchCoalesce') && document.getElementById('pFetchCoalesce').checked),
     // 位置感知 prefill 参数：显式 0 合法（b=0 关闭位置项 / fetchFixedUs=0 纯带宽），
     // 仅未设置(NaN)时回退默认值（与仿真引擎的实测校准一致）
     prefillA: (function(){ var v=parseFloat($('pPrefillA').value); return isFinite(v)&&v>0 ? v : 79.5; })(),   // μs/tok 固定项
@@ -2026,6 +2030,7 @@ function runSimulation(strategy, overrides) {
     ttftQ: 0, ttftP: 0, ttftF: 0, ttftC: 0, latDw: 0, latDt: 0,
     fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
     fetchSpanSum: 0,                                        // prefill 传输过程实际耗时累计(_ft1-_ft0, 含带宽排队/不含计算)
+    fetchBytesPulled: 0,                                    // prefill 拉取字节总量(统一共享池口径, 单飞去重效果可由此观察)
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
     hbmReadBytes: 0, dramReadBytes: 0, ssdReadBytes: 0,       // 每步批次读取量的时间累计（÷仿真时长=平均读带宽）
     dramPeak: 0, ssdPeak: 0, dramUsedSum: 0, ssdUsedSum: 0,   // L2/L3 峰值与时间加权均值占用
@@ -2079,6 +2084,10 @@ function runSimulation(strategy, overrides) {
   links['dram>hbm'].shared = links['hbm>dram'];
   links['dram>ssd'].shared = links['ssd>dram'];
   links['ssd>dram'].shared = links['dram>ssd'];
+  // 前缀拉取单飞状态(2026-08-18, pFetchCoalesce 开关): gid → 该组前缀 L3 拉取的完成时刻
+  // (完成或在飞)。开启后同组请求共享一次拉取(HiCache 单飞/去重); 关闭=每请求独立重拉
+  let groupPull = {};
+  let coalesce = !!p.fetchCoalesce;
   function scheduleTransfer(blk, from, to) {
     let link = links[from + '>' + to];
     if (!link) return 0;
@@ -2667,6 +2676,12 @@ function runSimulation(strategy, overrides) {
   }
   let dirty = true;
   let drained = false; // 是否因请求全部排空而正常结束（否则=窗口截断）
+  // L3 统一共享池(2026-08-18, 问题②修复): prefill 拉取与 decode L3 读共享同一条 NVMe
+  // 总线——decode 按需读优先(全速), prefill 拉取使用剩余带宽(替代原独立 l3FetchBudget
+  // 池与 busyUntil 双通道互不排队的旧模型)
+  let effL3BW = p.ssdBW * 1e9 * 0.9;
+  let l3PoolBytes = effL3BW * DT;   // 每步 L3 容量池(字节)
+  let prevDecodeL3 = 0;             // 上一步 decode L3 读需求(字节/步), 从拉取预算中扣除(2ms 滞后)
 
   function refreshLocations() {
     decoding.forEach(q => {
@@ -2823,47 +2838,90 @@ function runSimulation(strategy, overrides) {
         sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
       }
       let perReqTok = sumCost > 0 ? totalFlops * DT / sumCost : 0; // 每请求每步推进 token 数
-      // ===== L3 拉取排队（2026-08-13）：并发 fetch/prefetch 共享 ssd>dram 带宽，先到先服务 =====
-      // 之前 fetch 用 _fetchDone += DT / _raceTok += DT×BW 理想化并行，多 sharer 并发命中时不竞争带宽，
-      // 系统性低估"低带宽 × 多并发命中"场景的 TTFT（生产级 HiCache prefetch 是单线程串行队列）。
-      let l3FetchBudget = p.ssdBW * 1e9 * 0.9 * DT;  // 本步 L3 拉取字节预算
-      for (let fi = 0; fi < prefilling.length && l3FetchBudget > 1; fi++) {
+      // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
+      // prefill fetch / race 拉取 / be 排队期拉取 与 decode 的 L3 读共享同一条 NVMe 总线
+      // (effL3BW)——替代原独立 l3FetchBudget 预算池(与 decode 读互不排队, decode L3 重读
+      // 无法挤占 prefill 拉取)。优先级: **decode 按需读优先**(与生产存储系统一致:
+      // on-demand IO > 后台预取), prefill 拉取使用剩余带宽 fetchBudget = 池−decode需求
+      // (上一步, 2ms 滞后)——decode L3 重读饱和时拉取被挤占变慢, TTFT 随之上升。
+      // 注意: 按比例共享在 decode 自适应节流(passTime 伸缩使需求∝1/passTime)下会塌缩成
+      // 拉取优先(decode 需求越饿越小), 不能产生挤占效果, 故采用优先级模型。
+      // 单飞(coalesce, 默认关): 同组前缀拉取只发生一次(groupPull={frac,doneAt}, 拉取者推进
+      // frac, 等待者共享进度/完成时刻, 前缀完整点: wc=拉完 / race=相遇 / be=prefill完成);
+      // 关 = 每请求独立重拉(模拟前缀在两请求之间被逐出快层的场景, 与 pDecodeL3Read 同源)。
+      let fetchJobs = [];
+      for (let fi = 0; fi < prefilling.length; fi++) {
         let fq = prefilling[fi];
-        let bytesLeft;
         if (fq._race) {
-          // race 拉取命中前缀[0, H]剩余(从H端往前); 相遇后前缀已完整(GPU算+L3拉覆盖全前缀), 停止拉取
-          bytesLeft = fq._raceMeetTok >= 0 ? 0 : Math.max(0, (fq._pfStartPos || 0) - fq._raceTok) * kvPerTok;
+          if (fq._raceMeetTok >= 0) continue;
+          let H = fq._pfStartPos || 0;
+          if (coalesce && fq.groupId) {
+            let gp = groupPull[fq.groupId];
+            if (gp && fq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
+              fq._coGp = gp;
+              fq._raceTok = gp.doneAt !== null ? H : Math.max(fq._raceTok, gp.frac * H);
+              continue;
+            }
+            if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
+          }
+          let rem = Math.max(0, H - fq._raceTok) * kvPerTok;
+          if (rem > 0) fetchJobs.push({ req: fq, rem: rem, kind: 'race' });
         } else if (fq._be) {
-          bytesLeft = 0;  // be: 准入时已终止拉取(排队期尽力拉的量已定格), 剩余由 GPU 重算
-        } else if ((fq.fetchTime || 0) > fq._fetchDone) {
-          bytesLeft = Math.max(0, (fq.fetchTime || 0) - fq._fetchDone) * (p.ssdBW * 1e9 * 0.9);  // 剩余拉取字节
-        } else {
-          bytesLeft = 0;
-        }
-        if (bytesLeft <= 0) continue;
-        let take = Math.min(bytesLeft, l3FetchBudget);
-        l3FetchBudget -= take;
-        if (fq._race) fq._raceTok += take / Math.max(kvPerTok, 1);
-        else {
-          fq._fetchDone += take / (p.ssdBW * 1e9 * 0.9);
-          if (fq._fetchDone >= (fq.fetchTime || 0) && fq._ft1 === undefined) fq._ft1 = now; // wc: 拉取完成时刻
+          // be: 准入时已终止拉取(排队期尽力拉的量已定格), 剩余由 GPU 重算, 无拉取
+        } else if ((fq.fetchTime || 0) > (fq._fetchDone || 0)) {
+          if (coalesce && fq.groupId) {
+            let gp = groupPull[fq.groupId];
+            if (gp && fq._coGpPuller !== gp) { fq._coGp = gp; continue; }  // 单飞等待者(完成判定在推进循环)
+            if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
+          }
+          fetchJobs.push({ req: fq, rem: (fq.fetchTime - (fq._fetchDone || 0)) * effL3BW, kind: 'wc' });
         }
       }
       // be(2026-08-14): 排队期尽力拉取——遍历 waitQueue+prefillQ 中所有已到达未准入的 be 请求
-      // (拉取从 arrive 起持续到准入 prefilling, 与 prefilling 共享带宽);
+      // (拉取从 arrive 起持续到准入 prefilling, 与 prefilling/decode 共享容量池);
       // 准入后即终止 —— 对齐 sglang best_effort("调度即停, 未拉重算")
-      // C5/C7(2026-08-18): 用 beFetchTimeEst 覆盖未准入请求(原 _be 准入才置位, 且
-      // _fetchDone 未初始化 → NaN, 排队期拉取完全失效)。拉取与排队重叠, 不单独计 fetch 组件。
-      for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length && l3FetchBudget > 1; qi2++) {
+      for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
         let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
         let bfte = beFetchTimeEst(bq);
-        if (bfte > 0 && bq._ft0 === undefined) bq._ft0 = bq.arrive; // be: 传输过程自到达起(排队期拉取语义)
-        if (bfte <= 0 || bfte <= (bq._fetchDone || 0)) continue;
-        let bytesLeft = Math.max(0, bfte - (bq._fetchDone || 0)) * (p.ssdBW * 1e9 * 0.9);
-        let take = Math.min(bytesLeft, l3FetchBudget);
-        l3FetchBudget -= take;
-        bq._fetchDone = (bq._fetchDone || 0) + take / (p.ssdBW * 1e9 * 0.9);
-        if (bq._fetchDone >= bfte && bq._ft1 === undefined) bq._ft1 = now; // be: 排队期拉取完成时刻
+        if (bfte <= 0) continue;
+        if (bq._ft0 === undefined) bq._ft0 = bq.arrive; // be: 传输过程自到达起(排队期拉取语义)
+        if (coalesce && bq.groupId) {
+          let gp = groupPull[bq.groupId];
+          if (gp && bq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
+            bq._fetchDone = gp.frac * bfte;
+            if (gp.frac < 1) bq._fetchWait += DT;
+            else if (gp.doneAt !== null && bq._ft1 === undefined) bq._ft1 = gp.doneAt;
+            continue;
+          }
+          if (!gp) bq._coGpPuller = groupPull[bq.groupId] = { frac: 0, doneAt: null };
+        }
+        let rem = (bfte - (bq._fetchDone || 0)) * effL3BW;
+        if (rem > 0) { fetchJobs.push({ req: bq, rem: rem, kind: 'be', bfte: bfte }); bq._fetchWait += DT; }
+        else if (bq._ft1 === undefined) bq._ft1 = now;
+      }
+      // decode 按需读优先: 拉取只用剩余带宽(上一步 decode L3 读需求, 2ms 滞后)
+      let fetchBudget = Math.max(0, l3PoolBytes - prevDecodeL3);
+      for (let j of fetchJobs) {
+        if (fetchBudget <= 1) break;
+        let take = Math.min(Math.min(j.rem, l3PoolBytes), fetchBudget);
+        fetchBudget -= take;
+        stats.transferL3Bytes += take; stats.fetchBytesPulled += take;
+        let q2 = j.req;
+        if (j.kind === 'race') {
+          q2._raceTok += take / Math.max(kvPerTok, 1);
+          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._raceTok / Math.max(q2._pfStartPos || 1, 1));
+        } else if (j.kind === 'wc') {
+          q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
+          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(q2.fetchTime, 1e-9));
+          if (q2._fetchDone >= (q2.fetchTime || 0)) {
+            if (q2._ft1 === undefined) q2._ft1 = now;
+            if (q2._coGpPuller && q2._coGpPuller.doneAt === null) q2._coGpPuller.doneAt = now;
+          }
+        } else { // be: 进度(时间当量), 准入时按 _fetchDone/fetchTime 定格已拉前缀
+          q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
+          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(j.bfte, 1e-9));
+          if (q2._fetchDone >= j.bfte && q2._ft1 === undefined) q2._ft1 = now;
+        }
       }
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
@@ -2877,13 +2935,21 @@ function runSimulation(strategy, overrides) {
             if (q._pfDone + q._raceTok >= (q._pfStartPos || 0)) {
               q._raceMeetTok = q._pfDone;   // 相遇点: GPU 已算前缀 token 数
               if (q._ft1 === undefined) q._ft1 = now;  // race: 相遇即停止拉取, 传输过程结束
+              if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: 相遇 ⇒ 组前缀完整
               q._pfTotal = q._raceMeetTok + Math.max(0, q.inputLen - (q._pfStartPos || 0));  // 总任务=已算前缀+后缀全量
             }
           }
           // 阶段1(相遇后): _pfDone 继续累加即后缀进度, 无需分支
         } else if (q._be) {
           if (q._pfTotal > 0) q._pfDone += perReqTok;  // be: 排队期拉取已定格, 只算未拉前缀+后缀; 拉完则直接完成
-        } else if ((q.fetchTime || 0) > q._fetchDone) { q._fetchWait += DT; continue; }  // fetch 未完成: 累计拉取墙钟等待, 不推进计算
+        } else if ((q.fetchTime || 0) > q._fetchDone) {
+          // 单飞等待者: 共享拉取完成 ⇒ 命中完成; 否则与拉取中请求一样累计墙钟等待, 不推进计算
+          let gp = q._coGp;
+          if (gp && gp.doneAt !== null && now >= gp.doneAt) {
+            q._fetchDone = q.fetchTime;
+            if (q._ft1 === undefined) q._ft1 = gp.doneAt;
+          } else { q._fetchWait += DT; continue; }
+        }
         else if (q._pfTotal <= 0) { /* 命中 100%: 无剩余计算, 不推进, 交由下方 _done 判定完成 */ }
         else q._pfDone += perReqTok;
         // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
@@ -2906,6 +2972,7 @@ function runSimulation(strategy, overrides) {
         if (_done) {
           prefilling.splice(i, 1);
           q.prefillEnd = now;
+          if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: be/race 拉取者 prefill 完成 ⇒ 组前缀完整(拉取+重算合并)
           // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续
           // 请求命中（此前到达的组内请求按全量 prefill 处理——实测 vLLM 行为一致：
           // 组内请求同时到达时前缀完全未命中，TTFT 与 founder 相同）。
@@ -3010,19 +3077,26 @@ function runSimulation(strategy, overrides) {
       // PD 分离（sglang）时 prefill/decode 各用独立资源，无算力竞争。
       if (!p.pdSep && prefilling.length) cmpFloor *= (1 + 0.5 * prefilling.length);
       passTime = Math.max(passTime, cmpFloor, 1e-6) + r.commTime(decoding.length);
-      // ---- L2/L3 读链路排队（P1 修复核心：decode 读与预取/淘汰共享带宽）----
-      let l2Link = links['dram>hbm'], l3Link = links['ssd>dram'];
-      // 迭代: 本步 decode 读字节(按 passes 缩放)排入链路 → 排队等待并入 passTime → 重算 passes
-      let l2Fin = now, l3Fin = now;
+      // ---- L2 读链路排队(busyUntil) + L3 读统一共享池(2026-08-18, 问题②修复) ----
+      // L2(dram>hbm): 维持 busyUntil 排队模型(decode 读与预取/淘汰共享带宽)。
+      // L3(ssd>dram): decode 按需读优先于 prefill 拉取(见拉取段注释)——decode 始终按全速
+      // effL3BW 读, prefill 拉取只能用剩余带宽(本步 decode 需求经 prevDecodeL3 影响下一步
+      // 拉取预算); 同一根 NVMe 总线上 decode 重读饱和 ⇒ 拉取被挤占 ⇒ TTFT 上升。
+      // (注: 淘汰/swap-in 的 scheduleTransfer 仍走 busyUntil, 与本池是剩余的小口径差异——
+      //  容量危机场景的淘汰突发与拉取/读不互斥, 影响有限, 记录为已知简化)
+      let l2Link = links['dram>hbm'];
+      let l3RateAvail = effL3BW;  // decode 按需读优先: 全速读取(不受拉取影响)
+      let l2Fin = now;
+      let l3ReadPerPass = sumS > 0 ? sumS / Math.max(l3RateAvail, 1) : 0;
       for (let it = 0; it < 4; it++) {
         let pIt = DT / Math.max(passTime, 1e-9);
-        let l2B = sumD * pIt, l3B = sumS * pIt;                  // 本步读字节
+        let l2B = sumD * pIt;                                     // 本步 L2 读字节
         // 排队: 读请求从 max(now, 本方向+反方向共享总线忙到何时) 开始传输
         let l2Start = Math.max(now, l2Link.busyUntil, l2Link.shared.busyUntil);
-        let l3Start = Math.max(now, l3Link.busyUntil, l3Link.shared.busyUntil);
         l2Fin = l2B > 0 ? l2Start + l2B / Math.max(l2Link.bw, 1) : l2Start;
-        l3Fin = l3B > 0 ? l3Start + l3B / Math.max(l3Link.bw * 0.9, 1) : l3Start;
-        let stepWait = Math.max(0, Math.max(l2Fin, l3Fin) - now); // 本步读完成所需墙钟(含排队)
+        let l2Wait = Math.max(0, l2Fin - now);                    // 本步 L2 读完成所需墙钟(含排队)
+        // L3: 每 pass 读时间 = 需求/可用速率(共享池, 无需迭代)
+        let stepWait = Math.max(l2Wait, l3ReadPerPass * pIt);     // 取 L2/L3 较大者(与旧 max 语义一致)
         let readPerPass = stepWait / Math.max(pIt, 1e-9);          // 分摊到每 pass
         // passTime = 基础项 + 排队读时间(累加, 与旧模型 sumD/bw+sumS/bw 语义一致)
         let newPt = (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
@@ -3032,18 +3106,15 @@ function runSimulation(strategy, overrides) {
         if (Math.abs(newPt - passTime) < 1e-12) break;
         passTime = newPt;
       }
-      // 提交链路占用: decode 读推进共享总线 busyUntil（后续预取/淘汰在此排队）
+      // 提交链路占用: decode L2 读推进共享总线 busyUntil（后续预取/淘汰在此排队）;
+      // L3 读不再写 busyUntil(共享池口径), 改为记录需求供下一步拉取份额分配
       let pFinal = DT / Math.max(passTime, 1e-9);
       if (sumD > 0) {
         let st = Math.max(now, l2Link.busyUntil, l2Link.shared.busyUntil);
         let fin = st + sumD * pFinal / Math.max(l2Link.bw, 1);
         l2Link.busyUntil = fin; l2Link.shared.busyUntil = fin;
       }
-      if (sumS > 0) {
-        let st = Math.max(now, l3Link.busyUntil, l3Link.shared.busyUntil);
-        let fin = st + sumS * pFinal / Math.max(l3Link.bw * 0.9, 1);
-        l3Link.busyUntil = fin; l3Link.shared.busyUntil = fin;
-      }
+      prevDecodeL3 = sumS * pFinal; // 本步 decode L3 读需求(字节/步, 供下一步拉取预算扣除)
       // decode 读字节计入链路累计 → 瞬时差分(instL2/L3)同时含 decode 读 + 预取/淘汰突发
       stats.transferL2Bytes += sumD * pFinal;
       stats.transferL3Bytes += sumS * pFinal;
@@ -3062,7 +3133,7 @@ function runSimulation(strategy, overrides) {
         + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000;
       // 实际读等待(含排队)分摊到每 pass —— 与 tHbm/comm 同量纲(每 pass 名义时间)
       let tL2 = Math.max(0, l2Fin - now) / Math.max(passes, 1e-9);
-      let tL3 = Math.max(0, l3Fin - now) / Math.max(passes, 1e-9);
+      let tL3 = l3ReadPerPass; // L3 共享池口径: 每 pass 读时间 = ΣKV_ssd/可用速率(含拉取挤占)
       stats.ptHbm += tHbm; stats.ptL2 += tL2; stats.ptL3 += tL3;
       stats.ptCmp += cmpFloor; stats.ptComm += r.commTime(decoding.length);
       stats.ptSamples++;
@@ -3165,6 +3236,7 @@ function runSimulation(strategy, overrides) {
     evictions: stats.evictions, activeEvictions: stats.activeEvictions,
     prefetches: stats.prefetches, drops: stats.drops,
     transferGB: stats.transferBytes / 1e9,
+    fetchGB: stats.fetchBytesPulled / 1e9,  // prefill 拉取字节总量(单飞开启时应显著下降)
     // L2/L3 实测：平均读带宽（累计读字节÷仿真时长）、跨层传输带宽、峰值/均值占用
     l2ReadBW: simEnd > 0 ? stats.dramReadBytes / simEnd : 0,
     l3ReadBW: simEnd > 0 ? stats.ssdReadBytes / simEnd : 0,
@@ -3412,7 +3484,7 @@ function drawStrategyTierDemand(){
     '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
-    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——含 L3 并发带宽排队、不含计算，为避免被计算延迟覆盖而单列（wc=prefill开始→拉完; race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(独立)</code>=实际 prefill 计算。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时。勾选「Decode 从 L3 重读」后已拉取前缀块 decode 期按 SSD 读计费(模拟 KV 被驱逐场景)，Decode 传输/pass 将显著上升<br>'+
+    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——含 L3 并发带宽排队、不含计算，为避免被计算延迟覆盖而单列（wc=prefill开始→拉完; race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(独立)</code>=实际 prefill 计算。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时。勾选「Decode 从 L3 重读」后已拉取前缀块 decode 期按 SSD 读计费(模拟 KV 被驱逐场景)，Decode 传输/pass 将显著上升；decode 的 L3 重读与 prefill 拉取共享同一总线且按需读优先 ⇒ 低带宽下 Prefill 传输(独立) 也会因挤占而上升。勾选「前缀拉取单飞」后同组前缀只拉一次 ⇒ 拉取字节与 Prefill 传输(独立) 显著下降<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
