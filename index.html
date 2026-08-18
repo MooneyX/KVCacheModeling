@@ -378,14 +378,16 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <div><label>① 扫描参数(横轴)</label><select id="sSweepParam">
         <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
         <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
-        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">SSD带宽</option>
+        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
+        <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
       </select></div>
       <div><label>扫描范围(起,止,步长)</label><input id="sSweepRange" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div><label>② 对比参数(颜色, 可空)</label><select id="sSweepCompareParam">
         <option value="">无(单参数)</option>
         <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
         <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
-        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">SSD带宽</option>
+        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
+        <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
       </select></div>
       <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div style="flex:2"><label style="text-transform:none;letter-spacing:0">③ 预取策略(形状)</label>
@@ -2018,6 +2020,7 @@ function runSimulation(strategy, overrides) {
     // TTFT/延迟分解累计（秒）：TTFT = 到达排队 + prefill排队 + L3拉取fetch + prefill计算；
     // 延迟 = TTFT + decode槽位等待 + decode执行（L3 读占比的落点）
     ttftQ: 0, ttftP: 0, ttftF: 0, ttftC: 0, latDw: 0, latDt: 0,
+    fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
     hbmReadBytes: 0, dramReadBytes: 0, ssdReadBytes: 0,       // 每步批次读取量的时间累计（÷仿真时长=平均读带宽）
     dramPeak: 0, ssdPeak: 0, dramUsedSum: 0, ssdUsedSum: 0,   // L2/L3 峰值与时间加权均值占用
@@ -2328,11 +2331,21 @@ function runSimulation(strategy, overrides) {
     //（ssdBW 反映 page_size 效应：实测 sglang mooncake page1≈1.05GB/s → page64≈27GB/s）。
     // wait_complete 下 prefill 等 KV 到齐；HBM/DRAM 前缀命中近似免费（片内/近存拷贝 ~μs-ms 级）。
     // 双路径合并后：followUp（retainIds 含公共前缀块）命中 SSD 块同样计 L3 拉取
-    req.fetchTime = ((req.groupId && !req.isFounder) || req.retainIds) && ssdCoveredTok > 0
+    // C6 修正(2026-08-18): 去掉 !req.isFounder 排除——预热(HiCache)语义下 founder 同样 attach
+    // L3 常驻前缀块, 同样需把 KV 拉回 GPU 才能计算, 排除导致 founder 不付拉取时间且 decode 期
+    // 前缀块按 SSD 读计费(与 sharer 口径不一致)。非预热组 founder 的 blkIds 为空 → ssdCoveredTok=0
+    // → fetchTime=0, 行为不变。
+    req.fetchTime = (req.groupId || req.retainIds) && ssdCoveredTok > 0
       ? Math.ceil(ssdCoveredTok / p.blockSize) * (isFinite(p.fetchFixedUs) ? p.fetchFixedUs : 209) * 1e-6
         + ssdCoveredTok * kvPerTok / Math.max(p.ssdBW * 1e9 * 0.9, 1) : 0;
-    req._fetchDone = 0;
-    req._fetchWait = 0;   // 拉取墙钟等待(秒): 并发带宽排队时每步累计, fetch 分解改墙钟口径(2026-08-14)
+    req._fetchDone = req._fetchDone || 0;   // C7(2026-08-18): 保留排队期已拉取进度, 不覆盖(best_effort)
+    req._fetchWait = req._fetchWait || 0;   // 拉取墙钟等待(秒): 并发带宽排队时每步累计, fetch 分解改墙钟口径(2026-08-14)
+    // C4 修复(2026-08-18): 记录本请求已从 L3 命中拉取的前缀块——fetch 物理上把前缀 KV 搬入
+    // GPU(HBM), 运行期 decode 每 pass 应读 HBM 而非按 SSD 读速重复计费(原实现前缀块常驻 SSD,
+    // 高命中场景 decode 被 L3 带宽瓶颈化, TPOT/延迟虚高 20-30× 并反向挤压 prefill 抬高 TTFT)。
+    // 池位置不变(L3 常驻/共享语义), 仅 decode 读账归 HBM; 因容量压力被真实淘汰到 SSD 的块不受影响。
+    req._fetchedIds = (req.fetchTime > 0 && ssdCoveredTok > 0) ? {} : null;
+    if (req._fetchedIds) attachIds.forEach(id => { let loc = findBlock(id); if (loc && loc.tier === 'ssd') req._fetchedIds[id] = loc.blk.tokens; });
     // 2) 计算自有 token（前缀块被丢弃的部分需要重算）
     let groupPrefixTokens = 0, ownTokens;
     if (req.retainIds) {
@@ -2477,6 +2490,26 @@ function runSimulation(strategy, overrides) {
     return null;
   }
 
+  // C5 修复(2026-08-18): best_effort 排队期拉取对"未准入"请求同样生效。
+  // 原实现 _be 在 placeRequest(准入)才置位, 而排队期拉取循环只遍历 waitQueue/prefillQ 中
+  // _be=true 的请求 → waitQueue 请求永远不被拉取, 准入即终止 → fetchTok≈0 → 全量重算
+  // (h95/in8k 下 TTFT ≈ 13.6s, 60× 劣于 wait_complete 的 0.22s, 语义完全失效)。
+  // 修复: 对未准入的 best_effort 候选按 groupId + 已激活组前缀实时估计 fetchTime(与
+  // placeRequest 同口径: 块数×τ_fp + 字节/有效带宽), 排队期即开始拉取, 准入时定格。
+  function beFetchTimeEst(r0) {
+    if (r0._beFetchEst !== undefined) return r0._beFetchEst;
+    r0._beFetchEst = 0;
+    if (s.prefetch && s.prefetch.type === 'best_effort' && r0.groupId && prefixGroupMap[r0.groupId] && prefixGroupMap[r0.groupId].activated) {
+      let ssdTok = 0;
+      prefixGroupMap[r0.groupId].blkIds.forEach(id => { let loc = findBlock(id); if (loc && loc.tier === 'ssd') ssdTok += loc.blk.tokens; });
+      let cap = r0.prefixTokLen || 0;
+      if (ssdTok > cap) ssdTok = cap;
+      if (ssdTok > 0) r0._beFetchEst = Math.ceil(ssdTok / p.blockSize) * (isFinite(p.fetchFixedUs) ? p.fetchFixedUs : 209) * 1e-6
+        + ssdTok * kvPerTok / Math.max(p.ssdBW * 1e9 * 0.9, 1);
+    }
+    return r0._beFetchEst;
+  }
+
   // 预取：把请求在 DRAM 中可用的块搬回 HBM（占用链路，有耗时）
   function doPrefetchFor(req) {
     if (!s.prefetch || s.prefetch.type === 'none') return;
@@ -2519,7 +2552,9 @@ function runSimulation(strategy, overrides) {
     // 2026-08-14: fetch 分解改墙钟口径——_fetchWait 累计并发带宽排队等待(每步DT);
     // 无等待记录时回退独占折算(min(fetchTime,_fetchDone))。修正前 fetch=独占折算时间,
     // 并发拉取的排队等待被错误计入 compute(见 cap=4→64 验证: compute 760→8502ms 含等带宽)。
-    let _fW = (req._fetchWait || 0) > 0 ? (req._fetchWait || 0) : Math.min(req.fetchTime || 0, req._fetchDone || 0);
+    // C7(2026-08-18): best_effort 的排队期拉取与排队重叠(拉取时间已计入 queue), 不再
+    // 重复计 fetch 组件; 无排队期拉取记录时回退独占折算(与旧口径一致)。
+    let _fW = req._be ? 0 : ((req._fetchWait || 0) > 0 ? (req._fetchWait || 0) : Math.min(req.fetchTime || 0, req._fetchDone || 0));
     let _cW = Math.max(0, req.prefillEnd - req.prefillStart - _fW);
     // 命中 100%(无剩余计算): prefill 阶段纯 fetch 等待, DT 粒度残差(20ms 步长累加超出
     // fetchTime 的部分)与完成前空转应归 fetch 而非 compute——否则"100% 命中"仍有假性 compute 占比
@@ -2528,6 +2563,7 @@ function runSimulation(strategy, overrides) {
       _fW = Math.max(0, req.prefillEnd - req.prefillStart);
     }
     stats.ttftQ += _qW; stats.ttftP += _pW; stats.ttftF += _fW; stats.ttftC += _cW;
+    stats.fetchSoloSum += (req.fetchTime || 0); // prefill 传输独立用时(不重叠时 L3 拉取单独耗时): race/be 与计算重叠后实际等待≈0, 但独立用时仍在
     let _dW = Math.max(0, (req.decodeStart || req.prefillEnd) - req.prefillEnd);
     let _dT = Math.max(0, req.completeTime - (req.decodeStart || req.prefillEnd));
     stats.latDw += _dW; stats.latDt += _dT;
@@ -2642,7 +2678,12 @@ function runSimulation(strategy, overrides) {
         let db = pools.dram.blockIndex[id];
         if (db) { if (db.available) { d += sizeInTier(db, 'dram'); touchBlock('dram', id); stats.dramAcc++; } else chargeInFlight(db); return; }
         let sb = pools.ssd.blockIndex[id];
-        if (sb) { if (sb.available) { sd += sizeInTier(sb, 'ssd'); stats.ssdAcc++; } else chargeInFlight(sb); return; }
+        if (sb) {
+          // C4(2026-08-18): 已拉取(命中)前缀块 decode 期按 HBM 读计费(见 placeRequest 注释)。
+          if (q._fetchedIds && q._fetchedIds[id]) { h += sb.size; stats.hbmAcc++; }
+          else if (sb.available) { sd += sizeInTier(sb, 'ssd'); stats.ssdAcc++; } else chargeInFlight(sb);
+          return;
+        }
         // P0-3: 已丢弃块不再按 SSD 读速计费（原 sd += avgBlkSize），
         // 改为累计重算 token 数——decode 阶段按 GPU 位置感知重算代价消化
         q._recomputeTok += Math.max(1, Math.round(avgBlkSize / kvPerTok));
@@ -2794,18 +2835,16 @@ function runSimulation(strategy, overrides) {
       // be(2026-08-14): 排队期尽力拉取——遍历 waitQueue+prefillQ 中所有已到达未准入的 be 请求
       // (拉取从 arrive 起持续到准入 prefilling, 与 prefilling 共享带宽);
       // 准入后即终止 —— 对齐 sglang best_effort("调度即停, 未拉重算")
-      for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
-        let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
-        // 累计 be 排队期拉取墙钟等待(每步, 无论是否分到带宽——带宽不足时也在等)
-        if (bq._be && (bq.fetchTime || 0) > (bq._fetchDone || 0)) bq._fetchWait += DT;
-      }
+      // C5/C7(2026-08-18): 用 beFetchTimeEst 覆盖未准入请求(原 _be 准入才置位, 且
+      // _fetchDone 未初始化 → NaN, 排队期拉取完全失效)。拉取与排队重叠, 不单独计 fetch 组件。
       for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length && l3FetchBudget > 1; qi2++) {
         let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
-        if (!bq._be || (bq.fetchTime || 0) <= (bq._fetchDone || 0)) continue;
-        let bytesLeft = Math.max(0, (bq.fetchTime || 0) - (bq._fetchDone || 0)) * (p.ssdBW * 1e9 * 0.9);
+        let bfte = beFetchTimeEst(bq);
+        if (bfte <= 0 || bfte <= (bq._fetchDone || 0)) continue;
+        let bytesLeft = Math.max(0, bfte - (bq._fetchDone || 0)) * (p.ssdBW * 1e9 * 0.9);
         let take = Math.min(bytesLeft, l3FetchBudget);
         l3FetchBudget -= take;
-        bq._fetchDone += take / (p.ssdBW * 1e9 * 0.9);
+        bq._fetchDone = (bq._fetchDone || 0) + take / (p.ssdBW * 1e9 * 0.9);
       }
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
@@ -3131,7 +3170,19 @@ function runSimulation(strategy, overrides) {
       fetch: stats.ttftF / stats.completed * 1000,
       compute: stats.ttftC / stats.completed * 1000,
       dWait: stats.latDw / stats.completed * 1000,
-      dTime: stats.latDt / stats.completed * 1000
+      dTime: stats.latDt / stats.completed * 1000,
+      // prefill 传输独立用时（ms, 未与计算重叠前）: wait_complete 下 ≈fetch(串行);
+      // race/best_effort 下与计算重叠 → 实际等待 fetch≈0 但独立用时仍在此体现(重叠收益 = fetchSolo − fetch)
+      fetchSolo: stats.fetchSoloSum / stats.completed * 1000
+    } : null,
+    // decode 每 pass 名义分量的绝对用时（ms/pass, 未 max 取大前的单独耗时）：
+    // 传输 = l2+l3（跨层 KV 读含链路排队）; 计算侧 = hbm(权重+KV读+每请求开销) + cmp(算力下限) + comm(TP通信)
+    passMs: stats.ptSamples > 0 ? {
+      hbm: stats.ptHbm / stats.ptSamples * 1000,
+      l2: stats.ptL2 / stats.ptSamples * 1000,
+      l3: stats.ptL3 / stats.ptSamples * 1000,
+      cmp: stats.ptCmp / stats.ptSamples * 1000,
+      comm: stats.ptComm / stats.ptSamples * 1000
     } : null,
     ptBreakdown: stats.ptSamples > 0 ? {
       hbm: stats.ptHbm / (stats.ptHbm + stats.ptL2 + stats.ptL3 + stats.ptCmp + stats.ptComm) * 100,
@@ -3209,6 +3260,12 @@ function drawStrategyMetrics() {
       ['P50延迟', sr.p50.toFixed(0)+' ms', 'accent'],
       ['P99延迟', sr.p99.toFixed(0)+' ms', 'red'],
       ['平均排队', sr.avgQueue.toFixed(2)+' s', 'orange'],
+      // 传输 vs 计算「重叠之前」的独立用时（2026-08-18）：看清带宽/算力各作用于哪个阶段
+      ['Prefill 传输(独立)', sr.ttftBreakdown ? (sr.ttftBreakdown.fetchSolo||0).toFixed(0)+' ms' : '—', 'orange'],
+      ['Prefill 计算(独立)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
+      ['Prefill 传输等待(实际)', sr.ttftBreakdown ? sr.ttftBreakdown.fetch.toFixed(0)+' ms' : '—', sr.ttftBreakdown && sr.ttftBreakdown.fetch > sr.ttftBreakdown.compute ? 'red' : 'orange'],
+      ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
+      ['Decode 计算/pass(独立)', sr.passMs ? (sr.passMs.hbm+sr.passMs.cmp+sr.passMs.comm).toFixed(2)+' ms' : '—', 'accent'],
       ['吞吐', formatNum(sr.throughput)+' tok/s', 'green'],
       ['显存利用率(峰值)', sr.memUtilPeak.toFixed(1)+'%', 'accent'],
       ['显存利用率(平均)', sr.memUtilAvg.toFixed(1)+'%', 'accent'],
@@ -3331,6 +3388,7 @@ function drawStrategyTierDemand(){
     '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
+    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=L3 拉取若不重叠的单独耗时(fetchTime)，<code>Prefill 计算(独立)</code>=实际 prefill 计算；重叠收益 = 独立 − 实际等待（wait_complete 无重叠两者相等; race/best_effort 实际等待≈0，独立耗时即被计算吸收的部分）。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
@@ -3393,12 +3451,17 @@ const SENS_LEVELS = {
   prefetch_threshold: [10,30,50,70,90],
   max_batch_size: [4,8,16,32,64,128,256],
   prefix_hit: [0,25,50,75,100],
-  ssd_bw: [1,2,5,10,20,40,80]
+  // 2026-08-18: 默认档位改为覆盖整机8卡聚合带宽 50→400GB/s 收益区间（原 1..80 停在收益饱和点之前）
+  ssd_bw: [10,25,50,100,150,200,300,400],
+  input_len: [2048,8192,16384,32768,65536],
+  qps: [0.1,0.3,1,3,8]
 };
-const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'SSD带宽'};
+const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'L3聚合带宽', input_len:'输入长度', qps:'到达率QPS'};
 function sensParamUnit(param, v) {
   if (param === 'ssd_bw') return v + 'GB/s';
   if (param === 'max_batch_size') return 'B=' + v;
+  if (param === 'input_len') return v >= 1024 ? (v / 1024) + 'k tok' : v + ' tok';
+  if (param === 'qps') return v + ' qps';
   return v + '%';
 }
 
@@ -3443,7 +3506,9 @@ function runSensitivity() {
   if (!values) {
     if (param === 'max_batch_size') values = [1,2,4,8,16,32,64,128,256];
     else if (param === 'prefix_hit') values = [0,10,20,30,40,50,60,70,80,90];
-    else if (param === 'ssd_bw') values = [1,2,5,10,20,40,80];
+    else if (param === 'ssd_bw') values = [50,100,150,200,250,300,350,400]; // 8卡聚合带宽收益区间(2026-08-18)
+    else if (param === 'input_len') values = [2048,4096,8192,16384,32768,65536];
+    else if (param === 'qps') values = [0.1,0.3,1,3,8];
     else values = [10,20,30,40,50,60,70,80,90];
   }
   let labels = values.map(v => sensParamUnit(param, v));
@@ -3591,6 +3656,8 @@ function runSensitivity() {
           if (param === 'max_batch_size') s.batching.max_batch_size = v;
           if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
           if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
+          if (param === 'input_len') overrides.inputLen = v; // 负载参数：平均输入长度
+          if (param === 'qps') overrides.qps = v;            // 负载参数：到达率
           // 对比参数（颜色维度）注入：与扫描参数同样的映射
           if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
           if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
@@ -3598,6 +3665,8 @@ function runSensitivity() {
           if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
           if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
           if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
+          if (compareParam === 'input_len') overrides.inputLen = cv;
+          if (compareParam === 'qps') overrides.qps = cv;
           // 预取策略（形状维度）注入：wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
           if (hasPf) s.prefetch.type = PF_TYPE[pf];
           rec = extractSensMetrics(runSimulation(s, overrides));
