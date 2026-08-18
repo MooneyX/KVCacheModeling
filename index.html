@@ -243,6 +243,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <div class="form-row" style="margin-top:6px">
           <div><label>前缀命中比例(%)</label><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="width:100%" title="入组请求的前缀命中比例: 共享前缀长度 = 平均输入×此值, 命中请求跳过对应比例的前缀 prefill (h=99 → 命中请求跳过 ~99% prefill)"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">40%</span></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选后: 已拉取的前缀 KV 在 decode 阶段仍按 SSD/L3 读计费(C4 修复前行为)——模拟用户回复间隔较长、请求 KV cache 已被逐出 HBM/DRAM、decode 时每 pass 需重新从 L3 拉取的场景。不勾选(默认): 拉取的 KV 驻留 HBM, decode 读 HBM(与 wait_complete'拉齐再算'语义一致)"><input type="checkbox" id="pDecodeL3Read" style="width:auto"><label style="margin:0;font-size:.75rem" for="pDecodeL3Read">Decode 从 L3 重读(KV 被驱逐场景)</label></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>Prefill位置成本a(μs/tok)</label><input type="number" id="pPrefillA" value="79.5" min="0" step="0.1" title="位置感知 prefill: τ_rec(i)=a+b·i。a=固定项。推导值见右侧按钮: 权重读/chunk + 算力/mfu + TP通信"></div>
@@ -542,6 +543,9 @@ function getParams(){
     simMaxTime: gi('pSimMaxTime') || 1200,  // 仿真窗口上限(秒)：窗口 = min(排水估计, 此值)
     prefixHit: gi('pPrefixHit')/100,
     prefixWarm: !!(document.getElementById('pPrefixWarm') && document.getElementById('pPrefixWarm').checked),
+    // Decode 从 L3 重读开关(2026-08-18): 勾选=已拉取前缀块 decode 期仍按 SSD 读计费(C4 前行为),
+    // 模拟回复间隔长导致请求 KV 被逐出 HBM/DRAM、decode 每 pass 重新从 L3 拉取的场景
+    decodeL3Read: !!(document.getElementById('pDecodeL3Read') && document.getElementById('pDecodeL3Read').checked),
     // 位置感知 prefill 参数：显式 0 合法（b=0 关闭位置项 / fetchFixedUs=0 纯带宽），
     // 仅未设置(NaN)时回退默认值（与仿真引擎的实测校准一致）
     prefillA: (function(){ var v=parseFloat($('pPrefillA').value); return isFinite(v)&&v>0 ? v : 79.5; })(),   // μs/tok 固定项
@@ -2685,7 +2689,9 @@ function runSimulation(strategy, overrides) {
         let sb = pools.ssd.blockIndex[id];
         if (sb) {
           // C4(2026-08-18): 已拉取(命中)前缀块 decode 期按 HBM 读计费(见 placeRequest 注释)。
-          if (q._fetchedIds && q._fetchedIds[id]) { h += sb.size; stats.hbmAcc++; }
+          // pDecodeL3Read 开关: 勾选时回退 C4 前行为(按 SSD 读)——模拟回复间隔长 KV 被逐出快层、
+          // decode 每 pass 重新从 L3 拉取的场景。
+          if (q._fetchedIds && q._fetchedIds[id] && !p.decodeL3Read) { h += sb.size; stats.hbmAcc++; }
           else if (sb.available) { sd += sizeInTier(sb, 'ssd'); stats.ssdAcc++; } else chargeInFlight(sb);
           return;
         }
@@ -3282,7 +3288,6 @@ function drawStrategyMetrics() {
       // 为防被计算延迟覆盖而单列; wc 下≈传输等待(实际), race/be 下为被计算重叠隐藏的拉取过程时长
       ['Prefill 传输(独立)', sr.ttftBreakdown ? (sr.ttftBreakdown.fetchReal||0).toFixed(0)+' ms' : '—', 'orange'],
       ['Prefill 计算(独立)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
-      ['Prefill 传输等待(实际)', sr.ttftBreakdown ? sr.ttftBreakdown.fetch.toFixed(0)+' ms' : '—', sr.ttftBreakdown && sr.ttftBreakdown.fetch > sr.ttftBreakdown.compute ? 'red' : 'orange'],
       ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
       ['Decode 计算/pass(独立)', sr.passMs ? (sr.passMs.hbm+sr.passMs.cmp+sr.passMs.comm).toFixed(2)+' ms' : '—', 'accent'],
       ['吞吐', formatNum(sr.throughput)+' tok/s', 'green'],
@@ -3407,7 +3412,7 @@ function drawStrategyTierDemand(){
     '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
-    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——含 L3 并发带宽排队、不含计算，为避免被计算延迟覆盖而单列（wc=prefill开始→拉完, ≈传输等待(实际); race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(独立)</code>=实际 prefill 计算；<code>Prefill 传输等待(实际)</code>=计入 TTFT 的墙钟等待（race/be 与计算重叠 → ≈0）。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时<br>'+
+    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——含 L3 并发带宽排队、不含计算，为避免被计算延迟覆盖而单列（wc=prefill开始→拉完; race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(独立)</code>=实际 prefill 计算。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时。勾选「Decode 从 L3 重读」后已拉取前缀块 decode 期按 SSD 读计费(模拟 KV 被驱逐场景)，Decode 传输/pass 将显著上升<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
