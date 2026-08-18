@@ -245,13 +245,15 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选=decode 重复拉取: 已拉取的前缀 KV 在 decode 阶段每 pass 都重新从 L3 拉取(按 SSD 读计费)——模拟用户回复间隔较长、请求 KV cache 已被逐出 HBM/DRAM 的场景。不勾选(默认): prefill 只拉取一次, 之后驻留 HBM, decode 读 HBM(与 wait_complete'拉齐再算'语义一致)。勾选后 decode 的 L3 重读与 prefill 拉取共享同一 NVMe 总线且按需读优先: 低带宽下重读饱和会挤占后续请求的拉取, TTFT 显著上升——这正是'KV 被驱逐+带宽不足'系统不可用的信号"><input type="checkbox" id="pDecodeL3Read" style="width:auto"><label style="margin:0;font-size:.75rem" for="pDecodeL3Read">Decode 重复拉取 L3(KV 被驱逐)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选(默认)=prefill 重复拉取: 每个请求独立从 L3 重新拉取完整前缀——模拟前缀在两个请求之间被逐出快层(如用户回复间隔长、热前缀集合超过快层容量)的场景。不勾选: 同组前缀的 L3 拉取只发生一次, 后续请求等待并共享该次拉取(HiCache 单飞/去重语义——前缀拉取后驻留快层, 后续请求直接命中)"><input type="checkbox" id="pFetchRepull" checked style="width:auto"><label style="margin:0;font-size:.75rem" for="pFetchRepull">Prefill 每请求重复拉取(KV 被驱逐)</label></div>
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选后 prefill 按 token 预算组波次执行(对齐 sglang chunked-prefill): 每波总 token ≤ Prefill token预算, 长请求按 Prefill Chunk 切分跨波, 整波算完才组下一波, 筹备波的 L3 拉取与执行波计算重叠(overlap 事件循环); 准入不再有请求数槽位上限。仅 wait_complete 策略生效, race/best_effort 回退连续流体模型。不勾(默认): 连续流体模型(prefill 并发=min(max_batch, Prefill并发上限) 个请求连续分摊算力)"><input type="checkbox" id="pPrefillWave" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefillWave">波次组批(sglang chunked)</label></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>Prefill位置成本a(μs/tok)</label><input type="number" id="pPrefillA" value="79.5" min="0" step="0.1" title="位置感知 prefill: τ_rec(i)=a+b·i。a=固定项。推导值见右侧按钮: 权重读/chunk + 算力/mfu + TP通信"></div>
           <div><label>Prefill斜率b(μs/tok²)</label><input type="number" id="pPrefillB" value="0.00533" min="0" step="0.0001" title="attention 累计项斜率。推导公式: b = kv/token ÷ HBM聚合带宽 (物理确定, 无需实测)"></div>
           <div><label>L3拉取固定延迟(μs)</label><input type="number" id="pFetchFixedUs" value="0" min="0" step="1" title="简化传输模型: 传输延迟 = 传输大小/带宽 (τ_pf 每块固定开销默认置 0, 2026-08-12)。如需模拟 NVMe 每请求延迟(RPC/软件开销)可手动调大, 原推导 = NVMe单请求(100) + RPC/软件(110)"></div>
           <div><label>Prefill Chunk(tok)</label><input type="number" id="pChunkSize" value="2048" min="16" step="16" title="chunked-prefill 波大小(框架配置, 默认 2048=sglang 默认)。用于推导 a 的权重读分摊项"></div>
-          <div><label>Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)"></div>
+          <div><label>Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)。仅连续流体模式(默认)生效; 波次组批开启后由 token 预算替代"></div>
+          <div><label>Prefill token预算</label><input type="number" id="pMaxPrefillTok" value="16384" min="256" step="1024" title="sglang max_prefill_tokens(默认 16384): 每个 prefill 波次的总 token 预算; 长请求按 Prefill Chunk 切分跨波执行。仅勾选「波次组批」时生效"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b 的估计值并填入(无需实测)">🎯 自动估算 a/b</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
@@ -549,9 +551,9 @@ function getParams(){
     decodeL3Read: !!(document.getElementById('pDecodeL3Read') && document.getElementById('pDecodeL3Read').checked),
     // 前缀拉取开关(2026-08-18 v2, 语义反转): pFetchRepull 勾选(默认)=每请求独立从 L3 重复拉取
     // 完整前缀(模拟前缀在两请求间被逐出快层); 不勾=同组前缀只拉一次、后续请求共享(HiCache
-    // 单飞/去重)。引擎内部仍用 fetchCoalesce(单飞)标志, 取反得到。元素缺失(旧导出 JSON/无头
-    // harness 未设置)时回退默认: 重复拉取(coalesce=false)
-    fetchCoalesce: (function(){ var el = document.getElementById('pFetchRepull'); if (!el) return false; return !el.checked; })(),
+    // 单飞/去重)。引擎内部仍用 fetchCoalesce(单飞)标志, 取反得到。元素缺失或 checked 非布尔
+    // (旧导出 JSON/无头 harness 桩元素)时回退默认: 重复拉取(coalesce=false)
+    fetchCoalesce: (function(){ var el = document.getElementById('pFetchRepull'); if (!el || el.checked === undefined) return false; return !el.checked; })(),
     // 位置感知 prefill 参数：显式 0 合法（b=0 关闭位置项 / fetchFixedUs=0 纯带宽），
     // 仅未设置(NaN)时回退默认值（与仿真引擎的实测校准一致）
     prefillA: (function(){ var v=parseFloat($('pPrefillA').value); return isFinite(v)&&v>0 ? v : 79.5; })(),   // μs/tok 固定项
@@ -559,6 +561,8 @@ function getParams(){
     fetchFixedUs: (function(){ var v=parseFloat($('pFetchFixedUs').value); return isFinite(v) ? v : 209; })(), // 每块固定拉取开销 μs(0=纯带宽)
     chunkSize: gi('pChunkSize') || 2048,              // chunked-prefill 波大小（推导 a 的权重读分摊项）
     prefillSlotsCap: Math.max(1, gi('pPrefillSlots') || 16),  // prefill 并发上限(2026-08-14 放开, 原硬编码 4)
+    maxPrefillTok: Math.max(256, gi('pMaxPrefillTok') || 16384),  // prefill 波次 token 预算(sglang max_prefill_tokens, 波次组批开启时生效)
+    prefillWave: !!(document.getElementById('pPrefillWave') && document.getElementById('pPrefillWave').checked),  // 波次组批开关(2026-08-18): 对齐 sglang chunked-prefill
     lenDist: $('pLenDist').value, multiTurn: gi('pMultiTurn')/100, seed: gi('pSeed'),
     arrivalDist: $('pArrivalDist') ? $('pArrivalDist').value : 'poisson',
     framework: 'sglang',   // 2026-08-12 起固定 sglang（移除推理引擎区分）
@@ -2506,6 +2510,55 @@ function runSimulation(strategy, overrides) {
     return null;
   }
 
+  // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块即刻
+  // 对组内后续请求可用。预热组跳过（预热块已驻留 SSD）；race 请求 GPU 从头重算不参与。
+  // 流体模式每步调用; 波次模式在波结算时调用(波次粒度)
+  function progressiveActivate(q) {
+    let gid = q.groupId && prefixGroupMap[q.groupId];
+    let pw = gid && gid.blkIds.length && pools.ssd.blockIndex[gid.blkIds[0]]
+      && pools.ssd.blockIndex[gid.blkIds[0]].prewarmed;
+    if (!q._race && p.prefixCache === 'radix' && q.groupId && q.groupBlkIds && gid && !pw) {
+      let availN = Math.max(1, Math.min(q.groupBlkIds.length, Math.floor(q._pfDone / q._pfTotal * q.groupBlkIds.length)));
+      prefixGroupMap[q.groupId].blkIds = q.groupBlkIds.slice(0, availN);
+      prefixGroupMap[q.groupId].activated = true;
+    }
+  }
+
+  // prefill 完成统一出口（2026-08-18, 波次模式提取共用）：单飞组状态 + 前缀激活 + 转 decode/decodeWait
+  function finishPrefill(q) {
+    q.prefillEnd = now;
+    if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: be/race 拉取者 prefill 完成 ⇒ 组前缀完整(拉取+重算合并)
+    // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续请求命中
+    // （此前到达的组内请求按全量 prefill 处理——实测 vLLM 行为一致：组内请求同时到达时前缀
+    //   完全未命中，TTFT 与 founder 相同）。hash 模式一次性激活全部；radix 渐进激活后此处兜底补齐。
+    let gid = q.groupId && prefixGroupMap[q.groupId];
+    let pw = gid && gid.blkIds.length && pools.ssd.blockIndex[gid.blkIds[0]]
+      && pools.ssd.blockIndex[gid.blkIds[0]].prewarmed;
+    if (q.groupId && q.groupBlkIds && gid && !pw) {
+      if (p.prefixCache === 'hash' && !prefixGroupMap[q.groupId].activated) {
+        prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
+        prefixGroupMap[q.groupId].activated = true;
+      } else if (p.prefixCache === 'radix') {
+        prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
+      }
+    }
+    // prefill 完成 → 转 decode。continuous 批下 decode 并发受 max_batch_size 约束：
+    // 槽位满时先入 decodeWait（不占 prefill 流水线），槽位释放后补入。
+    let decodeSlots = s.batching.max_batch_size || 8;
+    let decodeOk = (s.batching.type === 'static') || decoding.length < decodeSlots;
+    if (decodeOk) {
+      q.state = 'decode';
+      q.decodeStart = now;
+      if (s.prefetch && s.prefetch.type === 'on_demand') doPrefetchFor(q);
+      if (jsPrefetch) { try { jsPrefetch(); } catch(e) {} }
+      decoding.push(q);
+    } else {
+      q.state = 'decodeWait';
+      decodeWait.push(q);
+    }
+    dirty = true;
+  }
+
   // C5 修复(2026-08-18): best_effort 排队期拉取对"未准入"请求同样生效。
   // 原实现 _be 在 placeRequest(准入)才置位, 而排队期拉取循环只遍历 waitQueue/prefillQ 中
   // _be=true 的请求 → waitQueue 请求永远不被拉取, 准入即终止 → fetchTok≈0 → 全量重算
@@ -2684,6 +2737,13 @@ function runSimulation(strategy, overrides) {
   let effL3BW = p.ssdBW * 1e9 * 0.9;
   let l3PoolBytes = effL3BW * DT;   // 每步 L3 容量池(字节)
   let prevDecodeL3 = 0;             // 上一步 decode L3 读需求(字节/步), 从拉取预算中扣除(2ms 滞后)
+  // 波次组批模式(2026-08-18, pPrefillWave 开关): 对齐 sglang chunked-prefill ——
+  // token 预算(maxPrefillTok, 对应 max_prefill_tokens)组波 + 长请求按 chunkSize 切分跨波
+  // + 筹备波拉取与执行波计算重叠(overlap 事件循环语义)。仅 wait_complete+continuous 生效;
+  // race/best_effort 回退连续流体模型(其拉取与计算深度耦合, 波次化需 sglang 的 chunk Trim, 超范围)
+  let waveMode = !!p.prefillWave && s.prefetch.type === 'none' && s.batching.type !== 'static';
+  let curWave = null;   // 执行中的波 {members:[{q,chunk}], endT}
+  let prepWave = null;  // 筹备中的波 {members:[{q,chunk}]}(等待成员 L3 拉取完成)
 
   function refreshLocations() {
     decoding.forEach(q => {
@@ -2743,7 +2803,8 @@ function runSimulation(strategy, overrides) {
         if (!staticWaveOpen) break;
         let running = decoding.length + prefillQ.length + prefilling.length;
         if (running >= s.batching.max_batch_size) { staticWaveOpen = false; break; }
-      } else if (prefillQ.length + prefilling.length >= prefillSlots) break;
+      } else if (!waveMode && prefillQ.length + prefilling.length >= prefillSlots) break;
+      // 波次模式: 请求数槽位由 token 预算替代(组波时约束), 准入只受快层容量约束(sglang 无请求数上限)
       // 快层容量：按"在途请求 KV 总量"估算（含 decodeWait），而非 pools.used——
       // 淘汰会把块移出快层导致 pools.used 虚低，只有按在途请求数×平均KV才能真实反映
       // 快层占用（放不下 → 等解码释放，物理正确：资源不足则排队）
@@ -2767,7 +2828,7 @@ function runSimulation(strategy, overrides) {
     // 高估 1.6-2.2 倍）。修复：prefill 并发 = prefillSlots 个请求同时推进，算力按并发分时，
     // 但总利用率随并发提升（单请求启动/依赖开销大，并行 batch 把 GPU 填满）——
     // 总速率 = computeFlops × boost(n) / (2×actParams)，boost = min(n, PREFILL_UTIL_CAP/mfu)。
-    while (prefilling.length < prefillSlots && prefillQ.length) {
+    while (!waveMode && prefilling.length < prefillSlots && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
       // 传输过程计时起点: wc/race 自进入 prefilling(进入拉取队列)起; be 已于排队期置 _ft0=arrive
@@ -2790,6 +2851,51 @@ function runSimulation(strategy, overrides) {
       rq._pfDone = 0;
       prefilling.push(rq);
       dirty = true;
+    }
+    // ===== 波次组批(waveMode, sglang chunked-prefill 对齐, 2026-08-18) =====
+    if (waveMode) {
+      // 1) fetch-only 请求(命中100%/无剩余计算): 直接进 prefilling 等拉取, 不占波次 token 预算
+      for (let i = 0; i < prefillQ.length; i++) {
+        let rq = prefillQ[i];
+        if ((rq.prefillTokens ?? rq.inputLen) > 0) continue;
+        prefillQ.splice(i, 1); i--;
+        rq.state = 'prefill'; rq.prefillStart = now;
+        rq._pfTotal = 0; rq._pfDone = 0;
+        if ((rq.fetchTime || 0) > 0 && rq._ft0 === undefined) rq._ft0 = now;
+        prefilling.push(rq); dirty = true;
+      }
+      // 2) 组筹备波: 继续中的未完成成员优先(sglang 恢复 chunked_req), 再按 prefillQ 顺序纳入;
+      //    每成员本波推进 chunk = min(剩余, chunkSize, 剩余预算), 总预算 = maxPrefillTok。
+      //    与执行波重叠: 筹备波成员的 L3 拉取在执行波计算期间推进(overlap 事件循环)
+      if (!prepWave) {
+        let W = Math.max(p.chunkSize, p.maxPrefillTok || 16384);
+        let wv = { members: [] }, waveTok = 0;
+        // 继续中的成员(含执行波成员的下一段 chunk, 须扣除在飞 chunk 防重复计算——
+        // 否则连续波会在单请求间交替, 波永远装不满, 效率塌回 boost=1)
+        for (let q of prefilling) {
+          if (q._pfTotal <= 0) continue; // fetch-only 不占预算
+          let rem = q._pfTotal - q._pfDone - (q._wvInFlight || 0);
+          if (rem <= 0) continue;
+          let chunk = Math.min(rem, p.chunkSize, W - waveTok);
+          if (chunk <= 0) break; // 预算用完
+          wv.members.push({ q: q, chunk: chunk }); waveTok += chunk;
+          if (waveTok >= W) break;
+        }
+        while (prefillQ.length && waveTok < W) {
+          let rq = prefillQ[0];
+          let tot = rq.prefillTokens ?? rq.inputLen;
+          if (tot <= 0) break; // fetch-only 已在上面处理(顺序保持)
+          let chunk = Math.min(tot, p.chunkSize, W - waveTok);
+          prefillQ.shift();
+          rq.state = 'prefill'; rq.prefillStart = now;
+          rq._pfTotal = tot; rq._pfDone = 0;
+          if ((rq.fetchTime || 0) > 0 && rq._ft0 === undefined) rq._ft0 = now;
+          prefilling.push(rq);
+          wv.members.push({ q: rq, chunk: chunk }); waveTok += chunk;
+          dirty = true;
+        }
+        if (wv.members.length) prepWave = wv;
+      }
     }
     if (prefilling.length) {
       // 并行 prefill 利用率提升: 2026-08-10 实测校准(分散到达口径)——
@@ -2925,6 +3031,64 @@ function runSimulation(strategy, overrides) {
           if (q2._fetchDone >= j.bfte && q2._ft1 === undefined) q2._ft1 = now;
         }
       }
+      if (waveMode) {
+        // ===== 波次推进(sglang chunked-prefill 对齐, 2026-08-18) =====
+        // fetch-only 成员: 拉取完成即完成 prefill(不占算力不占波次预算)
+        for (let i = prefilling.length - 1; i >= 0; i--) {
+          let q = prefilling[i];
+          if (q._pfTotal > 0) continue;
+          if ((q.fetchTime || 0) > (q._fetchDone || 0)) { q._fetchWait += DT; continue; }
+          prefilling.splice(i, 1);
+          finishPrefill(q);
+        }
+        // 筹备波上岗: 等全员 L3 拉取完成(wait_complete 语义: 整波等拉齐, 对应 sglang scheduler
+        // 循环 continue 等 prefetch)。波耗时 = Σ 成员 chunk 位置感知成本(中点近似) ÷ 算力×boost×混合批折扣
+        if (prepWave && !curWave) {
+          let allReady = true;
+          for (let m of prepWave.members) {
+            if ((m.q.fetchTime || 0) > (m.q._fetchDone || 0)) { m.q._fetchWait += DT; allReady = false; }
+          }
+          if (allReady) {
+            curWave = prepWave; prepWave = null;
+            // 波次效率按波 token 量标定: a/b 校准于 chunkSize 大小的前向(权重读/TP 固定开销按
+            // chunk 分摊——见 estimatePrefillParams 的 wRead/tp 项), 更大的波摊薄这些固定项,
+            // 上限 PREFILL_UTIL_CAP/mfu(GPU 饱和); ≤chunkSize 的波保持校准基线 boost=1。
+            // (不能用成员请求数: 单请求 16k-token 波本身就是大批次, 物理上已接近满效率)
+            let waveTokTotal = 0;
+            for (let m of curWave.members) waveTokTotal += m.chunk;
+            let wBoost = Math.max(1, Math.min(waveTokTotal / Math.max(p.chunkSize, 1), PREFILL_UTIL_CAP / Math.max(p.mfu, 0.05)));
+            let wPfFactor = 1;
+            if (!p.pdSep) {
+              let decodeUtil = decoding.length / Math.max(1, s.batching.max_batch_size || 8);
+              wPfFactor = 1 - 0.3 * Math.min(1, decodeUtil);
+            }
+            let cost = 0;
+            for (let m of curWave.members) {
+              let posMid = (m.q._pfStartPos || 0) + m.q._pfDone + m.chunk / 2;
+              cost += m.chunk * 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * posMid);
+            }
+            curWave.endT = now + cost / (r.computeFlops * wBoost * wPfFactor);
+            for (let m of curWave.members) m.q._wvInFlight = m.chunk; // 在飞 chunk 登记(组波时扣除)
+          }
+        }
+        // 执行波结算: 整波成员同时完成各自 chunk(波次量化完成——与流体模式的核心分布差异);
+        // 未完成的成员留在 prefilling(解除在飞标记), 下一波优先继续(sglang stash/resume chunked_req)
+        if (curWave && now >= curWave.endT) {
+          let finished = curWave.members;
+          curWave = null;
+          for (let m of finished) {
+            let q = m.q;
+            q._wvInFlight = 0;
+            q._pfDone += m.chunk;
+            progressiveActivate(q);   // radix 渐进激活(波次粒度)
+            if (q._pfDone >= q._pfTotal) {
+              let idx = prefilling.indexOf(q);
+              if (idx >= 0) prefilling.splice(idx, 1);
+              finishPrefill(q);
+            }
+          }
+        }
+      } else {
       for (let i = prefilling.length - 1; i >= 0; i--) {
         let q = prefilling[i];
         // race: 前缀[0,H] 双向夹逼——GPU 从前往后计算(_pfDone) + L3 从后往前拉取(_raceTok),
@@ -2954,63 +3118,19 @@ function runSimulation(strategy, overrides) {
         }
         else if (q._pfTotal <= 0) { /* 命中 100%: 无剩余计算, 不推进, 交由下方 _done 判定完成 */ }
         else q._pfDone += perReqTok;
-        // 前缀树渐进激活（sglang RadixAttention）：founder prefill 每完成一段，已算好的前缀块
-        // 即刻对组内后续请求可用（部分命中）。vLLM 整段哈希（hash）则等 founder 全部完成才激活。
-        // 前缀预热组（首个块 prewarmed）跳过——预热块已驻留 SSD，不受 founder 建块流程覆盖；
-        // 非预热组保持渐进激活（blkIds 随 _pfDone 逐步更新，不能按长度判断——激活后非空）。
-        let _gid1 = q.groupId && prefixGroupMap[q.groupId];
-        let _pw1 = _gid1 && _gid1.blkIds.length && pools.ssd.blockIndex[_gid1.blkIds[0]]
-          && pools.ssd.blockIndex[_gid1.blkIds[0]].prewarmed;
-        // race 请求 GPU 从头重算（含命中段）, 不参与渐进激活（保持注入/组状态）
-        if (!q._race && p.prefixCache === 'radix' && q.groupId && q.groupBlkIds && _gid1 && !_pw1) {
-          let availN = Math.max(1, Math.min(q.groupBlkIds.length, Math.floor(q._pfDone / q._pfTotal * q.groupBlkIds.length)));
-          prefixGroupMap[q.groupId].blkIds = q.groupBlkIds.slice(0, availN);
-          prefixGroupMap[q.groupId].activated = true;
-        }
+        // 前缀树渐进激活(radix, 每步粒度); 预热组/race 跳过(见 helper 注释)
+        progressiveActivate(q);
         // best_effort(修正): 拉取已在准入时终止, 剩余全由 GPU 重算, 完成只需 _pfDone 达标
         // race: 需"已相遇(前缀完整) + 后缀算完"——相遇后 _pfTotal 才有效(否则命中100%时 _pfTotal=0 会误判完成)
         let _done = q._pfDone >= q._pfTotal
           && (!q._race || q._raceMeetTok >= 0);
         if (_done) {
           prefilling.splice(i, 1);
-          q.prefillEnd = now;
-          if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: be/race 拉取者 prefill 完成 ⇒ 组前缀完整(拉取+重算合并)
-          // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续
-          // 请求命中（此前到达的组内请求按全量 prefill 处理——实测 vLLM 行为一致：
-          // 组内请求同时到达时前缀完全未命中，TTFT 与 founder 相同）。
-          // hash 模式在此一次性激活全部；radix 模式渐进激活到 100% 后此处兜底补齐。
-          // 前缀预热组同样跳过，保留预热块。
-          let _gid2 = q.groupId && prefixGroupMap[q.groupId];
-          let _pw2 = _gid2 && _gid2.blkIds.length && pools.ssd.blockIndex[_gid2.blkIds[0]]
-            && pools.ssd.blockIndex[_gid2.blkIds[0]].prewarmed;
-          if (q.groupId && q.groupBlkIds && _gid2 && !_pw2) {
-            if (p.prefixCache === 'hash' && !prefixGroupMap[q.groupId].activated) {
-              prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
-              prefixGroupMap[q.groupId].activated = true;
-            } else if (p.prefixCache === 'radix') {
-              prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
-            }
-          }
-          // prefill 完成 → 转 decode。continuous 批下 decode 并发受 max_batch_size 约束：
-          // 槽位满时先入 decodeWait（不占 prefill 流水线），槽位释放后补入。
-          // （修复前：prefill 完成后若 decode 满则挂起等待，阻塞后续 prefill 准入，
-          //   使 TTFT 与 outputLen 强耦合——高并发长输出时 TTFT 虚高 1-2 个数量级）
-          let decodeSlots = s.batching.max_batch_size || 8;
-          let decodeOk = (s.batching.type === 'static') || decoding.length < decodeSlots;
-          if (decodeOk) {
-            q.state = 'decode';
-            q.decodeStart = now;
-            if (s.prefetch && s.prefetch.type === 'on_demand') doPrefetchFor(q);
-            if (jsPrefetch) { try { jsPrefetch(); } catch(e) {} }
-            decoding.push(q);
-          } else {
-            q.state = 'decodeWait';
-            decodeWait.push(q);
-          }
-          dirty = true;
+          finishPrefill(q); // 单飞组状态 + 前缀激活 + 转 decode/decodeWait(统一出口)
         }
       }
-    }
+      } // end else(连续流体模式)
+    } // end if (prefilling.length)
     // decode 槽位释放 → 从 decodeWait 补入（static 波次语义不变）
     while (decodeWait.length && (s.batching.type === 'static' || decoding.length < (s.batching.max_batch_size || 8))) {
       let q = decodeWait.shift();
