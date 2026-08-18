@@ -3388,7 +3388,7 @@ function drawStrategyTierDemand(){
     '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
-    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=L3 拉取若不重叠的单独耗时(fetchTime)，<code>Prefill 计算(独立)</code>=实际 prefill 计算；重叠收益 = 独立 − 实际等待（wait_complete 无重叠两者相等; race/best_effort 实际等待≈0，独立耗时即被计算吸收的部分）。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时<br>'+
+    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=L3 拉取若<b>独占全部有效带宽(0.9×BW)</b>的理论耗时(fetchTime)，<code>Prefill 计算(独立)</code>=实际 prefill 计算，<code>Prefill 传输等待(实际)</code>=墙钟等待。三者关系: wait_complete 独占带宽时 实际≈独立；<b>多请求并发拉取共享带宽(FCFS 排队)时 实际&gt;独立</b>，比值≈平均并发拉取数；race/best_effort 与计算重叠，实际≈0（独立−实际=重叠收益）。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
