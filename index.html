@@ -530,6 +530,10 @@ function mulberry32(seed){
 }
 
 function getParams(){
+  // Web Worker 敏感性扫描(2026-08-18): Worker 内无 DOM, 主线程 postMessage 注入参数快照到此全局。
+  // 必须每次深克隆——runSimulation 会把 overrides(ssdBW/prefixHit/qps 等)直接写进返回的对象,
+  // 共享快照会被上一任务的 overrides 污染, 导致扫描档位串扰。
+  if (globalThis.__PARAMS_OVERRIDE) return JSON.parse(JSON.stringify(globalThis.__PARAMS_OVERRIDE));
   return {
     attn: $('pAttnType').value,
     layers: gi('pLayers'), kvHeads: gi('pKvHeads'), headDim: gi('pHeadDim'),
@@ -2783,6 +2787,35 @@ function runSimulation(strategy, overrides) {
   for (let step = 0; step < maxSteps; step++) {
     now = step * DT;
 
+    // 事件跳跃(2026-08-18): 系统全空闲(无在途请求, 拉取/波次自然也不存在)时直接快进至
+    // 下一事件时刻——下一到达 或 在途传输完成(inFlight), 跳过中间空转步。低 qps/短输出
+    // 场景省 50%+ 墙钟且结果逐点一致: 空闲期池状态/队列/rng 序列均不变, 唯二影响口径的
+    // 是 ①时间加权均值类采样(利用率/DRAM/SSD 占用)按跳过步数加权补齐 ②时间序列图表
+    // (concSamples/l2/l3Series)在跳跃终点补一个平坦段样本。busyUntil 链路是纯时间戳无需
+    // 步进结算; 跳过 maxSteps 触顶由循环末尾的延长/截断逻辑照常处理。
+    if (pending.length && !waitQueue.length && !prefillQ.length && !prefilling.length && !decodeWait.length && !decoding.length) {
+      let nextEv = pending[0].arrive;
+      for (let ei = 0; ei < inFlight.length; ei++) nextEv = Math.min(nextEv, inFlight[ei].arriveAt);
+      if (nextEv > now) {
+        let skip = Math.ceil((nextEv - now) / DT);   // 落到首个 now >= nextEv 的步
+        let idleSteps = skip - 1;                    // 被完全跳过的空转步(本步末尾照常采样 1 次)
+        if (idleSteps > 0) {
+          let u0 = pools.hbm.used / Math.max(caps.hbm, 1);
+          stats.memUtilSum += u0 * idleSteps; stats.memUtilSamples += idleSteps;
+          stats.dramUsedSum += pools.dram.used * idleSteps;
+          stats.ssdUsedSum += pools.ssd.used * idleSteps;
+          stats._prevL2 = stats.transferL2Bytes;
+          stats._prevL3 = stats.transferL3Bytes;
+          let landT = (step + skip) * DT;
+          stats.concSamples.push([+landT.toFixed(2), 0, 0, 0]);
+          stats.l2Series.push([+landT.toFixed(2), +(pools.dram.used / 1e9).toFixed(2)]);
+          stats.l3Series.push([+landT.toFixed(2), +(pools.ssd.used / 1e9).toFixed(2)]);
+          step += skip;
+          now = step * DT;
+        }
+      }
+    }
+
     while (pending.length && pending[0].arrive <= now) waitQueue.push(pending.shift());
 
     // 准入：prefill 槽位与 decode 槽位解耦（连续批）
@@ -3843,72 +3876,164 @@ function runSensitivity() {
   if (hasPf) results = compareParam ? compareVals.map(() => prefetchList.map(() => new Array(values.length))) : prefetchList.map(() => new Array(values.length));
   else results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
   let totalRuns = (compareParam ? compareVals.length : 1) * (hasPf ? prefetchList.length : 1) * values.length;
-  chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... 0/'+totalRuns+'</div>';
   formulaEl.innerHTML = '';
 
-  let ci = 0, pi = 0, idx = 0; // ci=对比档位索引, pi=预取策略索引, idx=扫描档位索引
-  function runNext() {
-    let done = compareParam ? ci >= compareVals.length : (hasPf ? pi >= prefetchList.length : idx >= values.length);
-    if (done) {
-      sensCache[cacheKey] = results; // 全指标记录入缓存（后续切纵轴/重跑直接复用）
-      let keys = Object.keys(sensCache);
-      if (keys.length >= 20) delete sensCache[keys[0]]; // FIFO 淘汰最旧
-      paint(results);
-      return;
-    }
-    let v = values[idx];
-    let cv = compareParam ? compareVals[ci] : null;
-    let pf = hasPf ? prefetchList[pi] : null;
-    setTimeout(() => {
-      // 点级缓存：单个参数组合(扫描值×对比值×预取策略×种子)跨批次复用——改档位范围时重叠点直接命中
-      let pointKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name, param, v, compareParam, cv, pf, gi('pSeed')]);
-      let rec = sensPointCache[pointKey];
-      if (rec === undefined) {
-        rec = null;
-        try {
-          let s = JSON.parse(JSON.stringify(baseStrategy));
-          let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
-          if (param === 'hbm_threshold') s.admission.hbm_threshold = v / 100;
-          if (param === 'evict_threshold') s.eviction.hbm_evict_threshold = v / 100;
-          if (param === 'prefetch_threshold') s.prefetch.prefetch_threshold = v / 100;
-          if (param === 'max_batch_size') s.batching.max_batch_size = v;
-          if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
-          if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
-          if (param === 'input_len') overrides.inputLen = v; // 负载参数：平均输入长度
-          if (param === 'qps') overrides.qps = v;            // 负载参数：到达率
-          // 对比参数（颜色维度）注入：与扫描参数同样的映射
-          if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
-          if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
-          if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
-          if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
-          if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
-          if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
-          if (compareParam === 'input_len') overrides.inputLen = cv;
-          if (compareParam === 'qps') overrides.qps = cv;
-          // 预取策略（形状维度）注入：wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
-          if (hasPf) s.prefetch.type = PF_TYPE[pf];
-          rec = extractSensMetrics(runSimulation(s, overrides));
-        } catch(e) { rec = null; }
-        if (rec) {
-          sensPointCache[pointKey] = rec;
-          let pkeys = Object.keys(sensPointCache);
-          if (pkeys.length >= 1000) delete sensPointCache[pkeys[0]]; // 点级 FIFO 淘汰（上限1000点）
+  // ===== 任务列表(与旧 setTimeout 循环同顺序 ci→pi→idx): 点级缓存命中直接填充, 未命中进 jobs =====
+  let jobs = [], filled = 0, cancelled = false;
+  for (let _ci = 0; _ci < (compareParam ? compareVals.length : 1); _ci++) {
+    for (let _pi = 0; _pi < (hasPf ? prefetchList.length : 1); _pi++) {
+      for (let _idx = 0; _idx < values.length; _idx++) {
+        let v = values[_idx];
+        let cv = compareParam ? compareVals[_ci] : null;
+        let pf = hasPf ? prefetchList[_pi] : null;
+        // 点级缓存：单个参数组合(扫描值×对比值×预取策略×种子)跨批次复用——改档位范围时重叠点直接命中
+        let pointKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name, param, v, compareParam, cv, pf, gi('pSeed')]);
+        let hit = sensPointCache[pointKey];
+        if (hit !== undefined) {
+          if (hasPf) { if (compareParam) results[_ci][_pi][_idx] = hit; else results[_pi][_idx] = hit; }
+          else if (compareParam) results[_ci][_idx] = hit; else results[_idx] = hit;
+          filled++;
+          continue;
         }
+        let s = JSON.parse(JSON.stringify(baseStrategy));
+        let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
+        if (param === 'hbm_threshold') s.admission.hbm_threshold = v / 100;
+        if (param === 'evict_threshold') s.eviction.hbm_evict_threshold = v / 100;
+        if (param === 'prefetch_threshold') s.prefetch.prefetch_threshold = v / 100;
+        if (param === 'max_batch_size') s.batching.max_batch_size = v;
+        if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
+        if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
+        if (param === 'input_len') overrides.inputLen = v; // 负载参数：平均输入长度
+        if (param === 'qps') overrides.qps = v;            // 负载参数：到达率
+        if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
+        if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
+        if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
+        if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
+        if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
+        if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
+        if (compareParam === 'input_len') overrides.inputLen = cv;
+        if (compareParam === 'qps') overrides.qps = cv;
+        if (hasPf) s.prefetch.type = PF_TYPE[pf]; // wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
+        jobs.push({ key: pointKey, ci: _ci, pi: _pi, idx: _idx, s: s, overrides: overrides });
       }
-      if (hasPf) { if (compareParam) results[ci][pi][idx] = rec; else results[pi][idx] = rec; }
-      else if (compareParam) results[ci][idx] = rec; else results[idx] = rec;
-      let prog = (compareParam ? ci * (hasPf ? prefetchList.length : 1) * values.length : 0) + (hasPf ? pi * values.length : 0) + idx + 1;
-      chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中... '+prog+'/'+totalRuns+'</div>';
-      idx++;
-      if (idx >= values.length) {
-        idx = 0;
-        if (hasPf) { pi++; if (pi >= prefetchList.length) { pi = 0; ci++; } }
-        else { ci++; }
-      }
-      runNext();
-    }, 0);
+    }
   }
-  runNext();
+
+  function storePoint(job, rec) {
+    if (rec) {
+      sensPointCache[job.key] = rec;
+      let pkeys = Object.keys(sensPointCache);
+      if (pkeys.length >= 1000) delete sensPointCache[pkeys[0]]; // 点级 FIFO 淘汰（上限1000点）
+    }
+    if (hasPf) { if (compareParam) results[job.ci][job.pi][job.idx] = rec; else results[job.pi][job.idx] = rec; }
+    else if (compareParam) results[job.ci][job.idx] = rec; else results[job.idx] = rec;
+  }
+  function finish() {
+    sensCache[cacheKey] = results; // 全指标记录入缓存（后续切纵轴/重跑直接复用）
+    let keys = Object.keys(sensCache);
+    if (keys.length >= 20) delete sensCache[keys[0]]; // FIFO 淘汰最旧
+    paint(results);
+  }
+  let worker = null, blobUrl = null, doneJobs = 0;
+  function restoreBtn() { if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; } }
+  function killWorker() { if (worker) { try { worker.terminate(); } catch(e) {} worker = null; } if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch(e) {} blobUrl = null; } }
+  function showProg() {
+    chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中' + (worker ? '(后台 Worker, 页面可操作)' : '') + '... ' + filled + '/' + totalRuns
+      + ' <span style="cursor:pointer;color:var(--accent4);text-decoration:underline" id="sensCancelBtn">✕ 取消</span></div>';
+    let cb = document.getElementById('sensCancelBtn');
+    if (cb) cb.onclick = function() {
+      cancelled = true;
+      killWorker();
+      chartEl.innerHTML = '<div class="progress-note">⚠ 已取消（完成 ' + filled + '/' + totalRuns + '，已完成的点已入点级缓存，重新运行可续用）</div>';
+      restoreBtn();
+    };
+  }
+
+  if (!jobs.length) { finish(); return; } // 全部点级缓存命中: 零仿真
+
+  // 主线程兜底路径(Worker 不可用/JS 策略钩子不可克隆/Worker 运行时报错): setTimeout 逐点让出主线程
+  function runInline(fromJob) {
+    let i = fromJob;
+    function stepFn() {
+      if (cancelled) return;
+      if (i >= jobs.length) { finish(); return; }
+      let job = jobs[i];
+      let rec = null;
+      try { rec = extractSensMetrics(runSimulation(job.s, job.overrides)); } catch(e) { rec = null; }
+      storePoint(job, rec);
+      doneJobs = ++i; filled++;
+      showProg();
+      setTimeout(stepFn, 0);
+    }
+    setTimeout(stepFn, 0);
+  }
+
+  // JS 策略含函数钩子(不可结构化克隆, 且 Worker 内 strategyMode 恒为 dsl 会静默丢钩子) → 回退主线程
+  let canWorker = (typeof Worker !== 'undefined') && (typeof Blob !== 'undefined') && (typeof URL !== 'undefined' && URL.createObjectURL)
+    && strategyMode !== 'js';
+  if (canWorker) {
+    try {
+      // Worker 源码 = DOM 桩(与 node harness 同款) + 页面全部内联 <script>(同引擎) + 消息处理器;
+      // 参数经 __PARAMS_OVERRIDE 快照注入(getParams 钩子深克隆返回), 数值与主线程逐点一致
+      blobUrl = URL.createObjectURL(new Blob([buildSensWorkerSource()], { type: 'text/javascript' }));
+      worker = new Worker(blobUrl);
+    } catch(e) { canWorker = false; killWorker(); }
+  }
+  showProg();
+  if (!canWorker) { runInline(0); return; }
+  worker.onmessage = function(ev) {
+    let m = ev.data;
+    if (!m) return;
+    if (m.type === 'point') {
+      if (cancelled) return;
+      storePoint(m, m.rec);
+      doneJobs++; filled++;
+      showProg();
+    } else if (m.type === 'done') {
+      killWorker();
+      if (!cancelled) finish();
+    }
+  };
+  worker.onerror = function(e) {
+    // Worker 运行期失败 → 已回传点保留, 剩余任务回退主线程完成
+    killWorker();
+    if (!cancelled) runInline(doneJobs);
+  };
+  worker.postMessage({ type: 'scan', params: paramsFp, jobs: jobs });
+}
+
+// Worker 源码组装(2026-08-18): DOM 桩 + 页面全部内联 <script> + 扫描消息处理器。
+// 桩与 node harness(_verify_*.js)同款, 保证 Worker/主线程/harness 三处引擎逐点一致。
+function buildSensWorkerSource() {
+  let scripts = [];
+  document.querySelectorAll('script').forEach(function(sc) { if (!sc.src && sc.textContent.trim()) scripts.push(sc.textContent); });
+  let stub = [
+    'function makeEl(v){ return { value: v!==undefined?String(v):"0", textContent:"", innerHTML:"", placeholder:"", checked:false,',
+    '  style:{}, classList:{add(){},remove(){},contains(){return false;}}, dataset:{},',
+    '  appendChild(){}, remove(){}, querySelectorAll(){return [];}, addEventListener(){}, focus(){} }; }',
+    'var __elements = {};',
+    'var document = {',
+    '  getElementById: function(id){ if(!__elements[id]) __elements[id]=makeEl(); return __elements[id]; },',
+    '  querySelectorAll: function(){ return []; }, querySelector: function(){ return null; },',
+    '  createElement: function(){ return makeEl(); }, addEventListener: function(){}, body: makeEl() };',
+    'var window = { addEventListener: function(){} };',
+    'var echarts = { init: function(){ return { setOption:function(){}, resize:function(){}, dispose:function(){} }; }, getInstanceByDom: function(){ return null; } };',
+    'var localStorage = { getItem: function(){ return null; }, setItem: function(){}, removeItem: function(){} };',
+  ].join('\n');
+  let handler = [
+    'self.onmessage = function(ev) {',
+    '  var msg = ev.data;',
+    '  if (!msg || msg.type !== "scan") return;',
+    '  globalThis.__PARAMS_OVERRIDE = msg.params;',
+    '  for (var i = 0; i < msg.jobs.length; i++) {',
+    '    var job = msg.jobs[i], rec = null;',
+    '    try { rec = extractSensMetrics(runSimulation(job.s, job.overrides)); } catch (e) { rec = null; }',
+    '    self.postMessage({ type: "point", key: job.key, ci: job.ci, pi: job.pi, idx: job.idx, rec: rec });',
+    '  }',
+    '  self.postMessage({ type: "done" });',
+    '};',
+  ].join('\n');
+  return stub + '\n' + scripts.join('\n') + '\n' + handler;
 }
 
 // ======================== STRATEGY TAB INIT ========================
