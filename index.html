@@ -159,6 +159,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>词表大小</label><input type="number" id="pVocab" value="128000" min="1" step="1000"></div>
+          <div><label>Q头数(0=自动)</label><input type="number" id="pQHeads" value="0" min="0" step="1" oninput="applyEstimatedParams()" title="attention 的 query head 数, 用于推导 prefill 位置斜率 b 的计算量(2026-08-19 Roofline 改造新增)。&#10;0=自动: GQA 按 hidden/headDim 推导(等价于 4×layers×hidden, 与是否填写无关); MLA 按 hidden/headDim 近似。&#10;MLA 必须显式填写: DeepSeek-V3 有 128 个 head, 而 hidden/headDim = 7168/128 = 56, 自动推导会低估 attention 计算量 2.3×。DS-V3/V2 = 128, V2-Lite = 16。"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>KV精度</label><select id="pDtype">
@@ -224,7 +225,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
             <option value="poisson" selected>泊松(有突发)</option>
             <option value="uniform">均匀(等间隔)</option>
           </select></div>
-          <div><label>MFU(%)</label><input type="number" id="pMfu" value="50" min="1" max="100"></div>
+          <div><label>MFU(%)</label><input type="number" id="pMfu" value="50" min="0" max="100" placeholder="留空=自动判瓶颈" oninput="applyEstimatedParams()" title="算子时间合成口径(2026-08-19 改为 Roofline, 不再计算+访存求和):&#10;• 填值(如50): 计算瓶颈假设——prefill 时间 = FLOPs ÷ (峰值算力×MFU), 完全忽略访存(访存被计算 overlap)。attention 的 KV 读也不计时。&#10;• 留空: 自动逐项 Roofline 判定——计算侧按峰值算力, 访存侧按 HBM 带宽(KV 读按 chunk 摊薄, flash-attention 语义), 每项取较慢者(max), 不求和。&#10;两种模式下 TP 通信固定延迟都单独相加(无法 overlap)。decode 始终走 max(访存, 算力) 的 Roofline, MFU 只影响其中的算力项。"></div>
           <div><label>长度分布</label><select id="pLenDist">
             <option value="uniform" selected>均匀 (0.5~1.5×)</option>
             <option value="lognormal">对数正态 (长尾)</option>
@@ -499,14 +500,17 @@ let models = {
   'Qwen2.5-7B':    {attn:'gqa', layers:28, kvHeads:4, headDim:128, hidden:3584, vocab:151936, paramsB:0, actB:0},
   'Qwen3-32B':     {attn:'gqa', layers:64, kvHeads:8, headDim:128, hidden:5120, vocab:151936, paramsB:32, actB:32},
   'Qwen3-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:151936, paramsB:30.5, actB:3.3},
-  'DeepSeek-V2-Lite': {attn:'mla', layers:27, kvLora:512, ropeDim:64, hidden:2048, vocab:128256, paramsB:15.7, actB:2.4},
+  // qHeads: attention query head 数（Roofline 推导 prefill 位置斜率 b 用）。
+  // GQA 省略即可（hidden/headDim 自动推导等价）；MLA 必须显式——DS-V3 有 128 head 而
+  // hidden/headDim=56，自动推导低估 attention 计算量 2.3×。V2-Lite 恰好 16=2048/128，可省。
+  'DeepSeek-V2-Lite': {attn:'mla', layers:27, kvLora:512, ropeDim:64, hidden:2048, vocab:128256, paramsB:15.7, actB:2.4, qHeads:16},
   // 腾讯混元 Hy3 (2026-07-06 GA, Apache 2.0): MoE 192专家/top-8, 80层主网络(+1层MTP),
   // GQA 64头/8KV头/headDim128, hidden 4096, interm 13312, vocab 120832, 256K 上下文, BF16/FP8
   // KV/tok(BF16) = 2×80×8×128×2 = 320KB → 256K 上下文单请求 KV 达 85.9GB(长上下文 KV 压力大)
   'Hunyuan-Hy3':    {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:4096, vocab:120832, paramsB:295, actB:21},
   // 混元翻译旗舰 Hy-MT2-30B-A3B: MoE 30B/3B 激活（架构细节未完整公开，层数/hidden 按同级 MoE 估计）
   'Hunyuan-MT2-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:120832, paramsB:30, actB:3},
-  'DeepSeek-V3':   {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256, paramsB:671, actB:37,
+  'DeepSeek-V3':   {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256, paramsB:671, actB:37, qHeads:128,
     // 实测校准(2026-08-10, 8×H20 分散到达口径): 单请求 2048 tok prefill=444ms → a≈216μs/tok
     // (8/6 同时发送口径曾拟合 79.5, 分散到达实测修正; b=kvPerTok/aggHbmBW=1.1e-3 物理确定)
     calibA: 216, calibB: 0.0011},
@@ -548,13 +552,24 @@ function getParams(){
     layers: gi('pLayers'), kvHeads: gi('pKvHeads'), headDim: gi('pHeadDim'),
     kvLora: gi('pKvLora'), ropeDim: gi('pRopeDim'),
     hidden: gi('pHidden'), dtypeBytes: gv('pDtype'), weightDtype: gv('pWeightDtype'), vocab: gi('pVocab'),
+    // Q head 数(2026-08-19): 用于推导 prefill 位置斜率 b 的 attention 计算量。
+    // 0 = 自动(GQA 按 hidden/headDim 等价推导; MLA 会低估, 建议显式填 —— DS-V3 = 128)
+    qHeads: gi('pQHeads'),
     paramsB: gv('pParamsB'), actB: gv('pActB'),
     gpus: gi('pGpuCount'), hbmPerGpu: gv('pHbm'), hbmBW: gv('pHbmBW'),
     tflops: gv('pTflops'), tpSize: gi('pTpSize'), nvlinkBW: gv('pNvlinkBW'),
     pcieBW: gv('pPcieBW'), tierQuant: gv('pTierQuant'),
     dram: gv('pDram'), dramBW: gv('pDramBW'), ssd: gv('pSsd'), ssdBW: gv('pSsdBW'),
     concurrency: gi('pConcurrency'), inputLen: gi('pInputLen'),
-    outputLen: gi('pOutputLen'), qps: gv('pQps'), mfu: gv('pMfu')/100,
+    outputLen: gi('pOutputLen'), qps: gv('pQps'),
+    // MFU 语义(2026-08-19 Roofline 改造): 填值 = 用户断言"计算瓶颈", prefill 直接用
+    // 峰值算力×MFU 算计算时间并作为最终时间(访存全被 overlap); 留空/0 = mfuAuto,
+    // 由引擎逐项 Roofline 自动判定计算 vs 访存瓶颈并取 max(见 estimatePrefillParams)。
+    // mfu 数值本身在 auto 模式下回退 1.0(峰值算力), 供 decode 算力项与 boost 上限使用。
+    mfuAuto: (function(){ var el = document.getElementById('pMfu'); if (!el) return false;
+      var raw = (el.value === undefined || el.value === null) ? '' : String(el.value).trim();
+      if (raw === '') return true; var v = parseFloat(raw); return !isFinite(v) || v <= 0; })(),
+    mfu: (function(){ var v = gv('pMfu')/100; return v > 0 ? v : 1.0; })(),
     maxBatch: gi('pMaxBatch'), blockSize: gi('pBlockSize'),
     simMaxTime: gi('pSimMaxTime') || 1200,  // 仿真窗口上限(秒)：窗口 = min(排水估计, 此值)
     prefixHit: gi('pPrefixHit')/100,
@@ -652,30 +667,88 @@ function calcKvPerToken(p){
   return 2 * p.layers * p.kvHeads * p.headDim * p.dtypeBytes;
 }
 
-// ======================== prefill 参数估算（纯推导，不依赖实测） ========================
-// 目标: 换模型/硬件时可预测未测配置——a/b 全部由模型架构+硬件规格+执行配置推导
-//  b(位置斜率, μs/tok²): attention 第 i 位置多读 1 个 KV → b = kvPerToken / HBM聚合带宽（物理确定）
-//  a(固定项, μs/tok): chunked-prefill 下 = 权重读/chunk(每 chunk 读一次权重, 被波大小分摊)
-//      + 非attention算力(2×actParams/tok ÷ 有效算力) + TP通信固定延迟(2L×5μs 分摊) + KV写(小项)
-//  τ_pf(每块固定开销, μs): NVMe 单请求延迟(≈100μs) + RPC/软件每页开销(≈110μs)。2026-08-12 简化后默认置 0(传输延迟=大小/带宽), 保留推导供手动恢复
+// ======================== prefill 参数估算（Roofline 口径，2026-08-19 重构） ========================
+// 【关键修正】旧实现把"计算时间 + 访存时间"直接相加（a = 权重读 + 算力 + TP + KV写；
+//   b = kvPerToken/HBM带宽 纯访存），这忽略了真实算子内部计算与访存的 overlap：
+//   GPU kernel 在算当前 tile 的同时预取下一 tile 的数据，实际耗时 ≈ max(计算, 访存)，不是和。
+//   尤其 prefill attention（flash-attention）在 chunked-prefill 下，一个 chunk 的 C 个 query
+//   共享一次 KV 读，算术强度 = 2·hidden·C/(kvHeads·headDim·dtype) 量级(Llama70B/C=2048 ≈ 1.6e4
+//   FLOP/byte)，远高于 H20 的 ridge point(148/4 = 37) → 彻底的计算瓶颈，访存全被 overlap。
+//   旧 b 用纯访存口径高估了 attention 的位置成本约 2 倍。
+//
+// 新口径（两种模式，由 MFU 输入框是否填值决定）:
+//  ① 填了 MFU（用户断言"计算瓶颈"）: 有效算力 = 峰值 × MFU，时间 = FLOPs / 有效算力，
+//     完全不考虑访存（权重读/KV读/KV写全部视为被计算 overlap）。
+//  ② MFU 留空（mfuAuto）: 逐项 Roofline 自动判瓶颈——计算侧按峰值算力、访存侧按 HBM 聚合带宽，
+//     每一项独立取 max(计算时间, 访存时间)，不求和。
+//  两种模式下 TP AllReduce 的固定延迟项(2L×5μs) 都单独相加——它是网络往返延迟，无法被计算 overlap。
+//
+// 分项物理（位置感知模型 τ(i) = a + b·i μs/tok）:
+//  a = 与位置无关的每 token 成本 = 非 attention GEMM（权重投影 + MLP）+ KV 写 + TP 延迟
+//      · 计算: 2 × actParams FLOP/tok
+//      · 访存: actParams × weightDtype / chunk B/tok（chunk 内 C 个 token 共享一次权重读）
+//  b = 位置斜率 = attention 对第 i 个历史 token 的边际成本
+//      · 计算: 4 × layers × d_eff FLOP/tok/pos（QK^T 2×d + PV 2×d）
+//      · 访存: kvPerToken / chunk B/tok/pos（flash-attention: C 个 query 共享一次 KV 读）
+//  τ_pf(每块固定开销, μs): NVMe 单请求延迟(≈100μs) + RPC/软件每页开销(≈110μs)。
+//     2026-08-12 简化后默认置 0(传输延迟=大小/带宽), 保留推导供手动恢复
 function estimatePrefillParams(p){
   let aggHbmBW = Math.max(p.hbmBW * 1e12 * p.gpus, 1);       // B/s 聚合 HBM 带宽
   let kvPerTok = calcKvPerToken(p);                          // B/tok
   // 激活参数量：覆盖值优先，否则按 dense 公式自动推导（与 calcAll 同口径）
   let totalP = p.paramsB > 0 ? p.paramsB * 1e9 : calcDenseParams(p);
   let act = Math.max(p.actB > 0 ? p.actB * 1e9 : totalP, 1e6);
-  let flops = Math.max(p.tflops * 1e12 * p.gpus * p.mfu, 1); // 有效算力（含 MFU）
-  let chunk = Math.max(p.chunkSize || 2048, 16);             // chunked-prefill 波大小
-  let b = kvPerTok / aggHbmBW * 1e6;                         // μs/tok²  带宽主项
-  let wRead = act * p.weightDtype / (aggHbmBW * chunk) * 1e6;// μs/tok 权重读（chunk 分摊）
-  let cmp = 2 * act / flops * 1e6;                           // μs/tok 非attention算力
-  let tp = 2 * p.layers * 5 / chunk;                         // μs/tok TP AllReduce 固定延迟分摊
-  let kvW = kvPerTok / aggHbmBW * 1e6;                       // μs/tok KV 写入
-  let a = wRead + cmp + tp + kvW;
+  let peakFlops = Math.max(p.tflops * 1e12 * p.gpus, 1);     // B/s 峰值算力（不含 MFU）
+  let effFlops = Math.max(peakFlops * p.mfu, 1);             // 有效算力（MFU 模式用）
+  let chunk = Math.max(p.chunkSize || 2048, 16);             // chunked-prefill 波大小 = C
+
+  // ---- attention 每 token 每位置的计算量 ----
+  // GQA: 每层 QK^T(2×hidden) + PV(2×hidden)，q 侧总维度 = qHeads×headDim ≈ hidden
+  //   → 4 × layers × hidden
+  // MLA(吸收式, sglang/vLLM 默认): q 先被 W_UK 吸收投影进压缩 KV 空间，每个 head 直接与
+  //   c_kv(kvLora 维) + k_rope(ropeDim 维) 做内积；PV 也在压缩空间(kvLora 维)。
+  //   → 2 × layers × nHeads × [(kvLora+ropeDim) + kvLora]
+  //   注意 MLA 的 head 数不能用 hidden/headDim 推（DS-V3: 128 head 而 7168/128=56，差 2.3×），
+  //   须显式取值；无覆盖时按 DS-V3 系列惯例 = hidden/headDim × 2.3 的保守下界 hidden/headDim。
+  let attnFlop;
+  if (p.attn === 'mla') {
+    let nHeads = p.qHeads > 0 ? p.qHeads : Math.round(p.hidden / Math.max(p.headDim || 128, 1));
+    attnFlop = 2 * p.layers * nHeads * ((p.kvLora + p.ropeDim) + p.kvLora);
+  } else {
+    attnFlop = 4 * p.layers * p.hidden;
+  }
+
+  // ---- 分项计算量 / 访存量 ----
+  let gemmFlop  = 2 * act;                                   // FLOP/tok  非 attention GEMM
+  let gemmBytes = act * p.weightDtype / chunk;               // B/tok     权重读（chunk 分摊）
+  let attnBytes = kvPerTok / chunk;                          // B/tok/pos     KV 读（chunk 内共享）
+  let kvWBytes  = kvPerTok;                                  // B/tok     KV 写（纯访存，无计算）
+  let tp = 2 * p.layers * 5 / chunk;                         // μs/tok    TP AllReduce 固定延迟（始终相加）
+
+  let a, b, aBound, bBound;
+  if (p.mfuAuto) {
+    // ② 自动判瓶颈: 每项独立 max(计算时间, 访存时间)，计算侧用峰值算力
+    let gCmp = gemmFlop / peakFlops * 1e6, gMem = gemmBytes / aggHbmBW * 1e6;
+    let aCmp = attnFlop / peakFlops * 1e6, aMem = attnBytes / aggHbmBW * 1e6;
+    let kvW = kvWBytes / aggHbmBW * 1e6;                     // KV 写无计算可 overlap → 计入
+    a = Math.max(gCmp, gMem) + kvW + tp;
+    b = Math.max(aCmp, aMem);
+    aBound = gCmp >= gMem ? '计算' : '访存';
+    bBound = aCmp >= aMem ? '计算' : '访存';
+  } else {
+    // ① MFU 模式: 只算计算时间，访存（权重读/KV读/KV写）全部视为被计算 overlap
+    a = gemmFlop / effFlops * 1e6 + tp;
+    b = attnFlop / effFlops * 1e6;
+    aBound = bBound = '计算(MFU)';
+  }
   let tauPf = 100 + 110;                                     // μs: NVMe IO(100) + RPC/软件(110)
-  return {a, b, tauPf};
+  return {a, b, tauPf, aBound, bBound, mfuAuto: !!p.mfuAuto,
+    // 诊断: 算术强度与 ridge point（供 UI 解释瓶颈判定）
+    gemmIntensity: gemmFlop / Math.max(gemmBytes, 1e-9),
+    attnIntensity: attnFlop / Math.max(attnBytes, 1e-9),
+    ridgePoint: peakFlops / aggHbmBW};
 }
-// 把推导值填入输入框（换模型/硬件预设时自动调用；用户可在同配置下手动覆盖）
+// 把推导值填入输入框（换模型/硬件预设/改 MFU 时自动调用；用户可在同配置下手动覆盖）
 function applyEstimatedParams(){
   let p = getParams();
   let e = estimatePrefillParams(p);
@@ -683,7 +756,14 @@ function applyEstimatedParams(){
   $('pPrefillB').value = e.b.toFixed(6);
   $('pFetchFixedUs').value = 0;   // 简化传输模型(2026-08-12): 传输延迟=大小/带宽, 每块固定开销 τ_pf 不再自动填入
   let n = $('estParamsNote');
-  if (n) n.textContent = '推导: a='+e.a.toFixed(1)+' · b='+(e.b*1e3).toFixed(2)+'e-3 · 传输=大小/带宽(τ_pf=0)';
+  if (n) {
+    let mode = e.mfuAuto
+      ? 'Roofline自动(峰值算力 vs HBM带宽, ridge='+e.ridgePoint.toFixed(1)+' FLOP/B)'
+      : 'MFU模式 '+(p.mfu*100).toFixed(0)+'%(只计算, 访存被overlap)';
+    n.textContent = mode + ' → a=' + e.a.toFixed(1) + '(' + e.aBound + ') · b='
+      + (e.b * 1e3).toFixed(2) + 'e-3(' + e.bBound + ') · GEMM强度='
+      + e.gemmIntensity.toFixed(0) + ' / Attn强度=' + e.attnIntensity.toFixed(0) + ' FLOP/B';
+  }
   recalcAll();
 }
 
@@ -761,13 +841,20 @@ function calcAll(p){
   // 22.5ms@1 → 46.6ms@8：6.5ms×n^0.75×actParams缩放），保证"快速结果"与仿真 TPOT 一致
   // MoE decode 权重读取：每 token 只读激活参数对应权重（dense 全读 + 激活专家）——
   // 按总权重带宽会高估 MoE 访存（DS-V3 671B 只激活 37B → 高估 ~18×，实测 TPOT 10ms vs 仿真 34ms）
+  // Decode 时间合成口径(2026-08-19 确认): 始终 Roofline 取 max(访存, 算力) + 通信 —— 不求和。
+  // decode 的算术强度只有 ~2·batchN FLOP/byte(每 token 读全部激活权重却只做 2·act FLOP),
+  // 远低于 ridge point(H20 = 37) → 结构性访存瓶颈, max 自然落在访存项上。
+  // 注: MFU 输入框的"只算计算时间"语义**只作用于 prefill**(计算瓶颈阶段)。decode 若也忽略访存,
+  // TPOT 会从 ~50ms 塌到 ~2ms(25×失真), 且 perReqMs 等实测校准全部失效 —— 故此处不套用。
   let decodeWeightRatio = (p.actB > 0 && p.paramsB > 0) ? Math.max(p.actB / p.paramsB, 0.02) : 1;
   let batchN = Math.max(1, Math.min(p.maxBatch, p.concurrency));
+  // 访存项含每请求实测开销 perReqMs(attention kernel/采样/调度), 它是无法被 overlap 的串行开销
   let passMemTime = (modelWeightBytes * decodeWeightRatio + batchN * avgLifetimeKv) / aggHbmBW
     + perReqMs(batchN, activatedParams, p.gpus) / 1000;
   let passCmpTime = 2 * activatedParams * batchN / computeFlops;
   let commOverhead = commTime(batchN);
   let passTime = Math.max(passMemTime, passCmpTime) + commOverhead;
+  let decodeBound = passCmpTime >= passMemTime ? '算力' : '访存';
   let decodeTpsPerReq = 1 / passTime;                 // 每请求 tok/s（同批次各请求一致）
   let decodeTpsTotal = batchN / passTime;
 
@@ -786,7 +873,8 @@ function calcAll(p){
   return {kvPerToken, blockBytes, blocksPerReq, perRequestKv, avgLifetimeKv, fragPct,
     prefixSavedPerReq, effPerReqKv, effLifetimeKv,
     totalHbm, availHbm, modelWeightBytes, modelWeightGB, overhead, decodeWeightRatio,
-    maxHbmRequests, computeFlops, aggHbmBW, prefillTps, passTime, commOverhead, commTime, tpSize, decodeTpsPerReq, decodeTpsTotal,
+    maxHbmRequests, computeFlops, aggHbmBW, prefillTps, passTime, passMemTime, passCmpTime, decodeBound,
+    commOverhead, commTime, tpSize, decodeTpsPerReq, decodeTpsTotal,
     kvGenSpeed, dramTotal, ssdTotal, totalKvDemand, totalParams, activatedParams,
     estLatency, littleConcurrency, ttftEst, tpotEst};
 }
@@ -925,6 +1013,7 @@ function applyModel(name,el){
   $('pHidden').value=m.hidden;
   if (m.vocab) $('pVocab').value=m.vocab;
   $('pParamsB').value=m.paramsB||0; $('pActB').value=m.actB||0;
+  $('pQHeads').value=m.qHeads||0;   // MLA 必须显式(DS-V3=128); GQA 留 0 自动推导
   toggleMlaFields();
   // 模型有实测校准值(calibA/calibB)时优先使用(如 DS-V3 8/10 校准), 否则自动推导
   if (m.calibA != null && m.calibB != null) {
@@ -966,8 +1055,13 @@ function updateQuickResults(){
       : '<code>2×L×kvHeads×headDim×dt = '+formatBytes(r.kvPerToken)+'</code>')+'<br>'+
     '• 单请求KV含碎片: <code>⌈S/blockSize⌉×blockSize×kv/tok = '+r.blocksPerReq+'块×'+formatBytes(r.blockBytes)+' = '+formatBytes(r.perRequestKv)+'</code>（碎片 '+r.fragPct.toFixed(1)+'%）<br>'+
     '• 前缀抵扣: <code>'+(p.prefixHit*100).toFixed(0)+'% × S<sub>in</sub> × kv/tok = '+formatBytes(r.prefixSavedPerReq)+'/请求</code> → 有效占用 '+formatBytes(r.effPerReqKv)+'（命中率=可复用前缀token占总输入的比例；前缀组结构[12/22/35/48]%决定分布，单请求覆盖量 = 命中率×组比例×S<sub>in</sub>，期望总量 = 命中率×总输入）<br>'+
-    '• Prefill(位置感知): <code>τ(i)=a+b·i = '+p.prefillA+'+'+p.prefillB+'·i μs/tok</code> → T<sub>prefill</sub> = a·L + b·L²/2 = '+(r.ttftEst*1000).toFixed(0)+'ms（含 TP通信；a/b 来自实测拟合）<br>'+
-    '• Decode(带宽瓶颈): <code>passTime = max[(权重+批次KV)/HBM带宽, 2×激活参数×B/算力] + TP通信 = '+(r.passTime*1000).toFixed(2)+' ms</code> → 每请求 '+r.decodeTpsPerReq.toFixed(0)+' tok/s（KV 读取量随输出增长）<br>'+
+    '• Prefill(位置感知): <code>τ(i)=a+b·i = '+p.prefillA+'+'+p.prefillB+'·i μs/tok</code> → T<sub>prefill</sub> = a·L + b·L²/2 = '+(r.ttftEst*1000).toFixed(0)+'ms（含 TP通信）<br>'+
+    '&nbsp;&nbsp;<b>时间合成口径</b>：'+(p.mfuAuto
+      ? '<b style="color:var(--accent2)">Roofline 自动判瓶颈</b>（MFU 留空）—— 每项独立取 <code>max(计算时间, 访存时间)</code>，<b>不求和</b>；计算侧用峰值算力 '+formatNum(p.tflops*1e12*p.gpus)+' FLOPS，访存侧用 HBM '+(p.hbmBW*p.gpus).toFixed(1)+'TB/s，ridge point = '+(p.tflops*1e12*p.gpus/(p.hbmBW*1e12*p.gpus)).toFixed(1)+' FLOP/B'
+      : '<b style="color:var(--accent2)">MFU 计算瓶颈模式</b>（MFU='+(p.mfu*100).toFixed(0)+'%）—— 时间 = <code>FLOPs ÷ (峰值算力×MFU)</code>，<b>完全忽略访存</b>（权重读/KV读/KV写全部视为被计算 overlap）')+'<br>'+
+    '&nbsp;&nbsp;物理依据：chunked-prefill 下 flash-attention 的 C='+p.chunkSize+' 个 query 共享一次 KV 读 → attention 算术强度达 10⁴ FLOP/B 量级 ≫ ridge point，prefill 是彻底的<b>计算瓶颈</b>，访存被 overlap。（旧版把计算+访存时间相加，高估 attention 位置成本约 2.3×）<br>'+
+    '• Decode(<b>结构性访存瓶颈</b>，始终 Roofline 取 max): <code>passTime = max[(权重+批次KV)/HBM带宽 + 每请求开销, 2×激活参数×B/算力] + TP通信 = '+(r.passTime*1000).toFixed(2)+' ms</code>（访存项 '+(r.passMemTime*1000).toFixed(2)+'ms vs 算力项 '+(r.passCmpTime*1000).toFixed(2)+'ms → 瓶颈在<b>'+r.decodeBound+'</b>）<br>'+
+    '&nbsp;&nbsp;注：decode 每 token 读全部激活权重却只做 2×P<sub>act</sub> FLOP，算术强度仅 ~'+(2*r.activatedParams/Math.max(r.modelWeightBytes*r.decodeWeightRatio/Math.max(1,Math.min(p.maxBatch,p.concurrency)),1)).toFixed(1)+' FLOP/B ≪ ridge point → MFU 的"只算计算时间"规则<b>不适用于 decode</b>（否则 TPOT 失真 ~25×）<br>'+
     '• TP通信(AllReduce): <code>2×L×(2(TP−1)/TP × B×hidden×2B)/NVLink + 2×L×5μs = '+(r.commOverhead*1000).toFixed(2)+' ms/步</code>（TP='+r.tpSize+'，占 passTime '+(r.commOverhead/r.passTime*100).toFixed(0)+'%）<br>'+
     '• Little定律: <code>稳态并发 = QPS × 估计延迟('+r.estLatency.toFixed(2)+'s) = '+r.littleConcurrency.toFixed(0)+'</code>'+(littleOk?' ✓ 与请求数基本一致':' ⚠ 稳态并发与请求数('+p.concurrency+')偏差较大，仿真中请求将排队或空转')
   );
@@ -1303,7 +1397,7 @@ function drawGantt(){
     '<b>📐 计算方式 — 仿真引擎真实事件（两级排队）</b><br>'+
     '• <b>Queue(灰)</b> = 到达 → 准入：等 batch 槽位(≤max_batch_size) + 显存可放置(含淘汰/传输耗时)<br>'+
     '• <b>Wait(黄)</b> = 准入 → prefill开始：等算力——prefill 串行，同一时刻只有一个请求在做 prefill，排在前面的 prefill 全部完成才轮到<br>'+
-    '• <b>Prefill(橙)</b> = 并行计算：<code>per-token τ(i)=a+b·i μs</code>（位置感知，attention 累计项；sharer 跳过已缓存前缀；默认 a='+p.prefillA+', b='+p.prefillB+'）<br>'+
+    '• <b>Prefill(橙)</b> = 并行计算：<code>per-token τ(i)=a+b·i μs</code>（位置感知；a/b 即引擎的速度权威来源，'+(p.mfuAuto?'Roofline 自动判瓶颈':'MFU='+(p.mfu*100).toFixed(0)+'% 计算瓶颈口径')+'；sharer 跳过已缓存前缀；当前 a='+p.prefillA+', b='+p.prefillB+'）<br>'+
     '• <b>Decode(紫)</b> = 批次前向：<code>passTime = max[(权重+批次KV)/HBM带宽, Σ下层KV/链路带宽, 算力下限]</code>，KV在下层时批次整体变慢<br>'+
     '• "Queue短+黄段长" = 槽位/显存充裕但 prefill 是瓶颈的典型形态 · 策略 <code>'+(s.name||'当前策略')+'</code> · 完成 <code>'+r.completed+'/'+r.totalReqs+'</code> · 平均排队 <code>'+r.avgQueue.toFixed(2)+'s</code><br>'+
     '• 共 <code>'+timeline.length+'</code> 行（完成 '+r.completed+' + 未完成 '+(r.incomplete||[]).length+'，按到达排序；浅色段=仿真结束时仍滞留在该阶段 ⏸）<br>'+
@@ -1322,7 +1416,9 @@ function drawBatching(){
     let passCmp = 2*r.activatedParams*b/r.computeFlops;
     let passT = Math.max(passMem, passCmp) + r.commTime(b);
     let tp = b/passT;                                  // 批次总吞吐 tok/s
-    let lat = (p.inputLen/r.prefillTps + p.outputLen*passT)*1000;  // ms
+    // prefill 用位置感知积分(与 TTFT/引擎同源), 旧实现用 prefillTps 线性口径与 a/b 不一致
+    let pfT = (p.prefillA * p.inputLen + 0.5 * p.prefillB * p.inputLen * p.inputLen) * 1e-6;
+    let lat = (pfT + p.outputLen*passT)*1000;  // ms
     return {b:b, lat:lat, tp:tp, bound:passCmp>passMem?'算力':'带宽'};
   });
   let ch=initChart('chartBatching');
@@ -2958,7 +3054,10 @@ function runSimulation(strategy, overrides) {
       // conc1(2请求并行 boost≈2, TTFT 367ms) / conc8(16请求 boost≈3, TTFT 478ms) 均需接近
       // 线性提升; 旧公式 1+(n-1)/gpus 在 8 卡下几乎无提升(1.125), 与实测矛盾(仿真高估 1.7-7×)。
       // 上限 PREFILL_UTIL_CAP/mfu 仍约束 GPU 饱和(prefill 吞吐物理上限 ~3× 单请求)。
-      let boost = Math.min(prefilling.length, PREFILL_UTIL_CAP / Math.max(p.mfu, 0.05));
+      // mfuAuto(2026-08-19): a/b 已按峰值算力/HBM 带宽的 Roofline 推导 = 硬件物理极限,
+      // 再叠加并行 boost 会超越峰值(不物理) → 自动模式 boost 恒为 1。
+      let boost = p.mfuAuto ? 1
+        : Math.max(1, Math.min(prefilling.length, PREFILL_UTIL_CAP / Math.max(p.mfu, 0.05)));
       // 混合批耦合(sglang 非 PD 分离): decode 活跃时 prefill 与 decode 共享 GPU, prefill 速率打折。
       // 校准: 0.85(2026-08-06 同时发送口径) → 0.3(2026-08-10 分散到达口径)。
       // 旧口径 aligned_bench 把所有请求同时发出 → decode 长输出占满 GPU 造成假耦合(7330ms)；
@@ -2969,12 +3068,20 @@ function runSimulation(strategy, overrides) {
         let decodeUtil = decoding.length / Math.max(1, s.batching.max_batch_size || 8);
         pfFactor = 1 - 0.3 * Math.min(1, decodeUtil); // decode 满时 prefill 保留 70% 速率
       }
-      // P0-2: 位置感知 prefill —— per-token 成本 τ(i) = a + b·i μs（实测拟合），
-      // 而非恒定速率。物理: 第 i 个 token 的 attention 需读 i 个 KV → 成本随位置线性增长。
-      // GPU 总算力按各活跃请求当前位置成本加权分摊，每个请求每步推进相同 token 数。
+      // P0-2: 位置感知 prefill —— per-token 成本 τ(i) = a + b·i μs（Roofline 推导或实测拟合），
+      // 而非恒定速率。物理: 第 i 个 token 的 attention 需处理 i 个历史 KV → 成本随位置线性增长。
+      // GPU 时间按各活跃请求当前位置成本加权分摊，每个请求每步推进相同 token 数。
       // 拉取中的请求(fetch)不占算力（wait_complete 语义，只耗墙钟）。
-      let totalFlops = r.computeFlops * boost * pfFactor;
-      let sumCost = 0;
+      //
+      // 【2026-08-19 修正】旧实现把成本写成 2·actParams·(1 + (b/a)·pos) 再除以 computeFlops,
+      // 只用到 a、b 的**比值**, 绝对速度另由 2·act/computeFlops 决定 —— 等价于强行假设
+      // a == 2·act/computeFlops。后果: 用户手填的 a 或模型实测校准 calibA(如 DS-V3 的 216)
+      // 被静默忽略, 且 Roofline 自动模式下 a 含访存项时口径彻底错位。
+      // 现改为直接用 τ(i) = (a + b·i)·1e-6 秒作为每 token 的独占 GPU 时间 —— a/b 成为
+      // prefill 速度的唯一权威来源, 与"快速结果"的 prefillTimeL 位置积分完全同源。
+      let pfA = Math.max(p.prefillA, 1e-9), pfB = Math.max(p.prefillB, 0);
+      let gpuTime = DT * boost * pfFactor;   // 本步可用的等效独占 GPU 秒数
+      let sumCost = 0;                        // Σ 各活跃请求推进 1 token 所需 GPU 秒数
       for (let qi = 0; qi < prefilling.length; qi++) {
         let qq = prefilling[qi];
         if (qq._race) {
@@ -2983,7 +3090,7 @@ function runSimulation(strategy, overrides) {
           let H = qq._pfStartPos || 0;
           let pos = qq._raceMeetTok < 0 ? qq._pfDone
             : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
-          sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
+          sumCost += (pfA + pfB * pos) * 1e-6;
           continue;
         }
         // best_effort(修正): 重算未拉前缀(位置0→cap) + 后缀(位置H→L), 全程占算力;
@@ -2999,9 +3106,9 @@ function runSimulation(strategy, overrides) {
           // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
           pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         }
-        sumCost += 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * pos);
+        sumCost += (pfA + pfB * pos) * 1e-6;
       }
-      let perReqTok = sumCost > 0 ? totalFlops * DT / sumCost : 0; // 每请求每步推进 token 数
+      let perReqTok = sumCost > 0 ? gpuTime / sumCost : 0; // 每请求每步推进 token 数
       // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
       // prefill fetch / race 拉取 / be 排队期拉取 与 decode 的 L3 读共享同一条 NVMe 总线
       // (effL3BW)——替代原独立 l3FetchBudget 预算池(与 decode 读互不排队, decode L3 重读
@@ -3125,18 +3232,23 @@ function runSimulation(strategy, overrides) {
             // (不能用成员请求数: 单请求 16k-token 波本身就是大批次, 物理上已接近满效率)
             let waveTokTotal = 0;
             for (let m of curWave.members) waveTokTotal += m.chunk;
-            let wBoost = Math.max(1, Math.min(waveTokTotal / Math.max(p.chunkSize, 1), PREFILL_UTIL_CAP / Math.max(p.mfu, 0.05)));
+            // mfuAuto: a/b 即硬件 Roofline 极限, 不再叠加 boost(同流体模式口径)
+            let wBoost = p.mfuAuto ? 1
+              : Math.max(1, Math.min(waveTokTotal / Math.max(p.chunkSize, 1), PREFILL_UTIL_CAP / Math.max(p.mfu, 0.05)));
             let wPfFactor = 1;
             if (!p.pdSep) {
               let decodeUtil = decoding.length / Math.max(1, s.batching.max_batch_size || 8);
               wPfFactor = 1 - 0.3 * Math.min(1, decodeUtil);
             }
+            // 波耗时 = Σ 成员 chunk 的 τ(i) 位置积分(中点近似, 秒) ÷ (boost × 混合批折扣)
+            // 2026-08-19: 与流体模式统一为 τ 口径(旧实现按 2·act·(1+b/a·pos)/computeFlops,
+            // 量纲上等价于强制 a=2·act/computeFlops, 手填/实测 a 被忽略)
             let cost = 0;
             for (let m of curWave.members) {
               let posMid = (m.q._pfStartPos || 0) + m.q._pfDone + m.chunk / 2;
-              cost += m.chunk * 2 * r.activatedParams * (1 + (p.prefillB / Math.max(p.prefillA, 1e-9)) * posMid);
+              cost += m.chunk * (Math.max(p.prefillA, 1e-9) + Math.max(p.prefillB, 0) * posMid) * 1e-6;
             }
-            curWave.endT = now + cost / (r.computeFlops * wBoost * wPfFactor);
+            curWave.endT = now + cost / Math.max(wBoost * wPfFactor, 1e-9);
             for (let m of curWave.members) m.q._wvInFlight = m.chunk; // 在飞 chunk 登记(组波时扣除)
           }
         }

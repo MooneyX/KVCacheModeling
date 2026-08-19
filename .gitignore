@@ -33,6 +33,21 @@ s2o.txt
 
 # 本地调试临时文件
 _cache_test*.js
+_dbg_*.js
+_verify_*.js
+_probe_*.js
+_sweep_*.js
+_diag_*.js
+_reg_*.js
+_cmp.js
+_gen_report.js
+_baseline.html
+_probe_*.json
+_sweep_*.json
+dbg*.js
+dbg*.log
+.workbuddy/backup/
+.git.broken-*/
 doctor_out*.txt
 d3.txt
 s1.txt
