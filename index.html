@@ -202,7 +202,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div><label>DRAM容量(GB)</label><input type="number" id="pDram" value="1024" min="1"></div>
           <div><label>DRAM带宽(GB/s)</label><input type="number" id="pDramBW" value="400" min="1" title="DRAM 介质自身读写带宽。GPU 读 L2 中 KV 受 PCIe/C2C 与 DRAM 介质带宽较小者限制（有效=min）；默认介质≫链路故由 PCIe 决定，仅当介质带宽<链路时才成为瓶颈"></div>
           <div><label>SSD容量(TB)</label><input type="number" id="pSsd" value="20" min="1"></div>
-          <div><label>SSD带宽(GB/s)</label><input type="number" id="pSsdBW" value="10" min="0.1" title="L3/SSD 有效带宽(含拉取调度开销): sglang mooncake page1≈1.05, page64≈27"></div>
+          <div><label>SSD带宽(GB/s)</label><input type="number" id="pSsdBW" value="50" min="0.1" title="L3/SSD 有效带宽(含拉取调度开销): sglang mooncake page1≈1.05, page64≈27"></div>
         </div>
       </div>
     </div>
@@ -505,10 +505,10 @@ let models = {
 };
 
 let hwPresets = {
-  'h20x8':  {hbm:96, hbmBW:4,   tflops:148, tp:8, nvlink:900,  pcie:64,  dram:1024, dramBW:400, ssd:20, ssdBW:10, gpus:8},
-  'h100x8': {hbm:80, hbmBW:3.35,tflops:989, tp:8, nvlink:900,  pcie:64,  dram:1024, dramBW:400, ssd:20, ssdBW:14, gpus:8},
-  'a100x8': {hbm:80, hbmBW:2,   tflops:312, tp:8, nvlink:600,  pcie:32,  dram:512,  dramBW:300, ssd:10, ssdBW:7,  gpus:8},
-  'b200x8': {hbm:192,hbmBW:8,   tflops:2250,tp:8, nvlink:1800, pcie:128, dram:2048, dramBW:500, ssd:40, ssdBW:14, gpus:8}
+  'h20x8':  {hbm:96, hbmBW:4,   tflops:148, tp:8, nvlink:900,  pcie:64,  dram:1024, dramBW:400, ssd:20, ssdBW:50, gpus:8},
+  'h100x8': {hbm:80, hbmBW:3.35,tflops:989, tp:8, nvlink:900,  pcie:64,  dram:1024, dramBW:400, ssd:20, ssdBW:50, gpus:8},
+  'a100x8': {hbm:80, hbmBW:2,   tflops:312, tp:8, nvlink:600,  pcie:32,  dram:512,  dramBW:300, ssd:10, ssdBW:50, gpus:8},
+  'b200x8': {hbm:192,hbmBW:8,   tflops:2250,tp:8, nvlink:1800, pcie:128, dram:2048, dramBW:500, ssd:40, ssdBW:50, gpus:8}
 };
 
 let currentModel = 'Llama-3-70B';
