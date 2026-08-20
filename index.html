@@ -2497,7 +2497,12 @@ function runSimulation(strategy, overrides) {
     ptHbm: 0, ptL2: 0, ptL3: 0, ptCmp: 0, ptComm: 0, ptSamples: 0,  // passTime 名义分量累计
     bnHbm: 0, bnL2: 0, bnL3: 0, bnCmp: 0, bnComm: 0,          // 每步瓶颈（时间主要花在哪层）计数
     l2Series: [], l3Series: [],                               // 各层驻留时间序列 [time, GB]
-    prefixHits: 0, prefixSavedBytes: 0, sessionHits: 0, concSamples: [] };
+    prefixHits: 0, prefixSavedBytes: 0, sessionHits: 0, concSamples: [],
+    // 实测分层命中(2026-08-20, token 加权): 输入 pPrefixHit 是**逻辑**命中率(每请求 inputLen×h),
+    // 这里统计前缀块**物理**落在哪一层的实际命中量。注意 stats.prefixHits 是"命中过的请求次数",
+    // 不是命中率——不能当命中率用(命中 1% 与 99% 的请求会被等价计数)。
+    // 守恒: hitTokL1 + hitTokL2 + hitTokL3 + missTok == reqTokTotal
+    hitTokL1: 0, hitTokL2: 0, hitTokL3: 0, missTok: 0, reqTokTotal: 0 };
 
   function sizeInTier(blk, tier) { return blk.size * tierRatio[tier]; }
 
@@ -2787,12 +2792,18 @@ function runSimulation(strategy, overrides) {
     let attachIds = req.retainIds ? req.retainIds
       : (req.groupId && prefixGroupMap[req.groupId] ? prefixGroupMap[req.groupId].blkIds : []);
     let ssdCoveredTok = 0;
+    // 分层命中记账(2026-08-20): findBlock 本就返回 tier, 此前只把 ssd 单独记账(供 fetchTime),
+    // hbm/dram 被合并进"非 SSD"无从区分。这里补记 L1/L2 原始命中量, 用于输出**实测**分层命中率
+    // ——与输入 pPrefixHit(逻辑命中率 h)对比可量化 clamp/容量淘汰对命中的侵蚀。
+    let hbmCoveredTok = 0, dramCoveredTok = 0;
     attachIds.forEach(id => {
       let loc = findBlock(id);
       if (loc) { req.prefixBlkIds.push(id);
         if (!loc.blk.prewarmed) loc.blk.refcount++;   // 预热块 L3 常驻, 不参与引用计数(防 founder 完成归零误删)
         coveredTok += loc.blk.tokens;
-        if (loc.tier === 'ssd') ssdCoveredTok += loc.blk.tokens; }
+        if (loc.tier === 'ssd') ssdCoveredTok += loc.blk.tokens;
+        else if (loc.tier === 'dram') dramCoveredTok += loc.blk.tokens;
+        else hbmCoveredTok += loc.blk.tokens; }
     });
     // 命中量不超过自身前缀长度: 组前缀 P 覆盖到最长请求, 短请求 attach 全部 P 块但
     // clamp 到自己的 inputLen×h——保证"不同长度请求命中固定比例 h"的语义
@@ -2800,6 +2811,18 @@ function runSimulation(strategy, overrides) {
       coveredTok = req.prefixTokLen;
       ssdCoveredTok = Math.min(ssdCoveredTok, req.prefixTokLen);
     }
+    // clamp 后的分层归因(2026-08-20): ssd 口径必须与 fetchTime 所用的 ssdCoveredTok 完全一致
+    // (不可改, 否则动到传输时间), 故先固定 ssd, 余量按 hbm/dram 原始比例分摊——保证
+    // hitL1+hitL2+hitL3 == coveredTok 恒等(守恒), 分母用 inputLen ⇒ 三层+miss = 100%。
+    let _statL3 = ssdCoveredTok;
+    let _rest = Math.max(0, coveredTok - _statL3);
+    let _rawFast = hbmCoveredTok + dramCoveredTok;
+    let _statL1 = _rawFast > 0 ? _rest * (hbmCoveredTok / _rawFast) : 0;
+    let _statL2 = _rest - _statL1;
+    stats.hitTokL1 += _statL1; stats.hitTokL2 += _statL2; stats.hitTokL3 += _statL3;
+    // miss = 需 GPU 重算的 token(与下方 req.prefillTokens 同口径); 分母 = 请求输入长度
+    stats.missTok += Math.max(0, req.inputLen - coveredTok);
+    stats.reqTokTotal += req.inputLen;
     // L3(SSD) 命中：前缀 KV 需从 L3 拉回 GPU。简化传输模型(2026-08-12):
     // 传输延迟 = 传输大小/有效带宽 = ssdCoveredTok×kvPerTok / (ssdBW×0.9)。
     // p.fetchFixedUs 默认 0（纯带宽）；填 >0 恢复"每块固定开销 + 带宽"双项模型
@@ -3934,6 +3957,19 @@ function runSimulation(strategy, overrides) {
     l2Series: stats.l2Series, l3Series: stats.l3Series,
     prefixHits: stats.prefixHits || 0, prefixSavedMB: (stats.prefixSavedBytes || 0) / 1e6,
     sessionHits: stats.sessionHits || 0,
+    // 实测分层命中率(2026-08-20, token 加权 %): 分母 = 全部请求输入 token 总量。
+    // hitL1+hitL2+hitL3+miss == 100(守恒)。hitTotal 与输入 p.prefixHit×100 的差值 =
+    // clamp(组前缀按最长请求, 短请求被截) + 容量淘汰/丢弃 造成的命中侵蚀。
+    hitRate: stats.reqTokTotal > 0 ? {
+      l1: stats.hitTokL1 / stats.reqTokTotal * 100,
+      l2: stats.hitTokL2 / stats.reqTokTotal * 100,
+      l3: stats.hitTokL3 / stats.reqTokTotal * 100,
+      miss: stats.missTok / stats.reqTokTotal * 100,
+      total: (stats.hitTokL1 + stats.hitTokL2 + stats.hitTokL3) / stats.reqTokTotal * 100,
+      input: p.prefixHit * 100
+    } : null,
+    hitTok: { l1: stats.hitTokL1, l2: stats.hitTokL2, l3: stats.hitTokL3,
+      miss: stats.missTok, total: stats.reqTokTotal },
     prefixGroups: Object.keys(prefixGroupMap).length,
     fragPct: r.fragPct,
     completed: stats.completed, totalReqs: N + followUpCount,
@@ -4023,6 +4059,13 @@ function drawStrategyMetrics() {
       ['容量需求(L3峰值)', sr.l3PeakGB.toFixed(1)+' GB', sr.l3PeakGB > gv('pSsd')*1000 ? 'red' : 'orange'],
       ['瓶颈归因', bottleneckLabel(sr), 'accent'],
       ['前缀命中请求', sr.prefixHits+' 次', 'green'],
+      // 实测分层命中率(2026-08-20, token 加权): 与输入命中率对比 —— 低于输入即说明
+      // clamp(短请求被截) 或 容量淘汰/丢弃 侵蚀了命中。L1/L2 近似免费, L3 需付拉取时间。
+      ['命中率(实测/输入)', sr.hitRate ? sr.hitRate.total.toFixed(1)+'% / '+sr.hitRate.input.toFixed(0)+'%' : '—',
+        sr.hitRate ? (sr.hitRate.total < sr.hitRate.input - 1 ? 'orange' : 'green') : 'accent'],
+      ['命中分层(L1/L2/L3)', sr.hitRate ? sr.hitRate.l1.toFixed(1)+' / '+sr.hitRate.l2.toFixed(1)+' / '+sr.hitRate.l3.toFixed(1)+'%' : '—',
+        sr.hitRate && sr.hitRate.l3 > sr.hitRate.l1 + sr.hitRate.l2 ? 'orange' : 'accent'],
+      ['未命中(需重算)', sr.hitRate ? sr.hitRate.miss.toFixed(1)+'%' : '—', sr.hitRate && sr.hitRate.miss > 50 ? 'orange' : 'green'],
       ['前缀节省显存', sr.prefixSavedMB.toFixed(0)+' MB', 'green'],
       ['会话复用', sr.sessionHits+' 次', 'green'],
       ['公平性(CV)', sr.fairnessCV.toFixed(0)+'%', 'accent'],
