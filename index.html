@@ -307,8 +307,13 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <!-- 多实例 + Router(S2, 2026-08-20): 实例数 >1 时从 GPU 总数切分, 与 PD 真分离互斥 -->
         <div class="form-row" style="margin-top:6px">
           <div><label>实例数</label><input type="number" id="pInstances" value="1" min="1" onchange="togglePdPanel()" title="部署几个独立推理实例(每个实例 = 一台机器: 独立算力/HBM/KV池/队列/PCIe/NVMe)。&#10;资源从 GPU 总数切分: 8 卡 + 实例数 2 ⇒ 每实例 4 卡; DRAM/SSD/PCIe/NVMe 带宽按实例数均分(总量守恒)。&#10;1 = 单实例(默认, 与历史口径完全一致)。&#10;⚠️ 实例数 >1 时 PD 真分离自动降级为混合批(两者都切分 GPU, 叠加语义歧义大)。"></div>
-          <div><label>路由策略</label><select id="pRoutePolicy" title="请求到达时如何选择实例。当前仅实现轮询(round_robin); 最短队列/缓存亲和等待 S3。">
+          <div><label>路由策略</label><select id="pRoutePolicy" title="请求到达时如何选实例(仅实例数>1 时生效)。决策只用当前可观测量, 不读未来。&#10;轮询: 严格均分请求数, 最简单。&#10;最短队列: 选在途请求最少的实例, 均衡最好但完全无视缓存亲和。&#10;最低KV压力: 按 HBM 水位选, 适合长上下文(KV 稀缺)场景。&#10;随机两选优: 随机抽2个取较空者——只需2个采样即可把最大负载从 O(log n) 降到 O(log log n), 开销远低于全局扫描, 生产 router 常用。&#10;前缀哈希: 同前缀恒定落同实例, 缓存亲和最优但热前缀会造成负载倾斜。&#10;随机: 最差缓存亲和的对照基线。&#10;注: DSL 里写 ROUTE: xxx 会覆盖此处选择。">
             <option value="round_robin" selected>轮询(round robin)</option>
+            <option value="least_queue">最短队列(least queue)</option>
+            <option value="least_kv">最低KV压力(least kv)</option>
+            <option value="power_of_two">随机两选优(power of two)</option>
+            <option value="hash_prefix">前缀哈希(缓存亲和)</option>
+            <option value="random">随机(对照基线)</option>
           </select></div>
         </div>
       </div>
@@ -2383,7 +2388,10 @@ function parseDSL(text) {
     eviction: { type: 'lru', hbm_evict_threshold: 0.9 },
     prefetch: { type: 'none' },
     placement: { type: 'hbm_first' },
-    batching: { type: 'continuous', max_batch_size: 8 }
+    batching: { type: 'continuous', max_batch_size: 8 },
+    // 路由(S3, 2026-08-20): null = DSL 未写 ROUTE 行 ⇒ 回退 UI 下拉(向后兼容,
+    // 既有全部预设 DSL 都没有 ROUTE 行, 行为不变)
+    routing: null
   };
   let lines = text.split('\n').filter(l => l.trim());
   for (let line of lines) {
@@ -2432,6 +2440,13 @@ function parseDSL(text) {
       if (body === 'hbm_first') s.placement = {type:'hbm_first'};
       else if (body === 'tiered') s.placement = {type:'tiered'};
       else if (body.startsWith('adaptive(')) { let m = body.match(/adaptive\(hbm=(\d+\.?\d*)\)/); s.placement = {type:'adaptive', adaptive_threshold: m ? parseFloat(m[1]) : 0.7}; }
+    }
+    // 路由策略(S3, 2026-08-20): 多实例下请求到达时如何选实例。第 6 个策略维度。
+    // 语法: ROUTE: round_robin | least_queue | least_kv | power_of_two | hash_prefix | random
+    else if (l.startsWith('ROUTE:')) {
+      let body = l.substring(6).trim();
+      const OK = ['round_robin','least_queue','least_kv','power_of_two','hash_prefix','random'];
+      if (OK.indexOf(body) >= 0) s.routing = { type: body };
     }
   }
   return s;
@@ -2625,6 +2640,7 @@ function runSimulation(strategy, overrides) {
       groupPull: {},
       // 每实例统计(S2 导出): 完成数 + 峰值队列/显存, 供负载均衡度评估
       nCompleted: 0, nRouted: 0, peakQueue: 0, peakHbm: 0, qLenSum: 0, qLenSamples: 0,
+      qBusySum: 0, qBusySamples: 0,   // 仅"系统有负载"窗内的队列采样(均衡度用, 见主循环注释)
     };
   }
 
@@ -2863,7 +2879,7 @@ function runSimulation(strategy, overrides) {
   }
 
   // ---------- JS 策略编译 ----------
-  let jsAdmit = null, jsEvict = null, jsPrefetch = null, jsPlace = null;
+  let jsAdmit = null, jsEvict = null, jsPrefetch = null, jsPlace = null, jsRoute = null;
   if (strategyMode === 'js' && strategy.dsl && strategy.dsl.trim()) {
     try {
       let helpers = {
@@ -2893,6 +2909,7 @@ function runSimulation(strategy, overrides) {
       if (userFns.evict) jsEvict = userFns.evict;
       if (userFns.shouldPrefetch) jsPrefetch = userFns.shouldPrefetch;
       if (userFns.place) jsPlace = userFns.place;
+      if (userFns.route) jsRoute = userFns.route;   // S3: 路由钩子 route(req, instances) → 下标或实例对象
     } catch(e) { console.warn('JS strategy compile error:', e.message); }
   }
 
@@ -2901,12 +2918,74 @@ function runSimulation(strategy, overrides) {
   // 契约: 输入请求, 返回目标实例对象。只允许读**当前**可观测量(队列长度/KV 占用),
   // 不得读未来状态(否则成了"先知路由", 结论无参考价值)。
   let _rrCursor = 0;
+  // 生效的路由策略: DSL 的 ROUTE 行优先, 未写则回退 UI 下拉(向后兼容)
+  let routePolicy = (s.routing && s.routing.type) ? s.routing.type : (p.routePolicy || 'round_robin');
+  // 实例在途负载(请求数): 路由决策的主要可观测量。
+  // 用"在途请求数"而非仅 waitQueue —— 排队中 + 正在算 + 正在传 + 正在解码都占该实例资源。
+  function instLoad(x) {
+    return x.waitQueue.length + x.prefillQ.length + x.prefilling.length
+      + x.kvXfer.length + x.decodeWait.length + x.decoding.length;
+  }
+  // 实例 KV 压力(0~1): HBM 已用 / 可用容量。容量为 0(权重装不下)时视为满载。
+  function instKvPressure(x) {
+    return x.caps.hbm > 0 ? x.pools.hbm.used / x.caps.hbm : 1;
+  }
+  // 字符串 → 32bit 哈希(FNV-1a): 用于 hash_prefix 的一致性映射。
+  // 必须是**确定性**的(不依赖 rng), 否则同一 prefixKey 在不同时刻会落到不同实例, 亲和性失效。
+  function hashKey(str) {
+    let h = 0x811c9dc5;
+    let t = String(str);
+    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    return h >>> 0;
+  }
+  // 请求的前缀键: 复用已有的 groupId(pfx_A/B/C/D) —— 它天然就是"同前缀请求"的标识,
+  // 无需新造。无组请求(不共享前缀)按自身 id 散列, 等价于随机分布。
+  function prefixKeyOf(req) {
+    return req.groupId ? req.groupId : ('r' + req.id);
+  }
   function routeRequest(req) {
     if (instances.length === 1) return instances[0];
-    switch (p.routePolicy) {
+    // JS 策略钩子优先(与 admit/evict/prefetch/place 同构): 返回实例下标或实例对象
+    if (jsRoute) {
+      try {
+        let v = jsRoute(req, instances);
+        if (typeof v === 'number' && instances[v]) return instances[v];
+        if (v && typeof v === 'object' && v.pools) return v;
+      } catch(e) {}
+    }
+    let n = instances.length;
+    switch (routePolicy) {
+      // 最短在途队列: 经典 least-connection。均衡最好, 但完全无视缓存亲和
+      case 'least_queue': {
+        let best = instances[0], bl = instLoad(best);
+        for (let i = 1; i < n; i++) { let l = instLoad(instances[i]); if (l < bl) { best = instances[i]; bl = l; } }
+        return best;
+      }
+      // 最低 KV 压力: 按显存水位选, 适合长上下文(KV 是稀缺资源)场景
+      case 'least_kv': {
+        let best = instances[0], bp = instKvPressure(best);
+        for (let i = 1; i < n; i++) { let q = instKvPressure(instances[i]); if (q < bp) { best = instances[i]; bp = q; } }
+        return best;
+      }
+      // 随机两选优(power of two choices): 随机抽 2 个取较空者。
+      // 经典结论——只需 2 个采样即可把最大负载从 O(log n) 降到 O(log log n),
+      // 开销远低于全局扫描(生产 router 常用), 均衡度接近 least_queue。
+      case 'power_of_two': {
+        let i = Math.floor(rng() * n) % n;
+        let j = Math.floor(rng() * n) % n;
+        if (i === j) j = (j + 1) % n;
+        return instLoad(instances[i]) <= instLoad(instances[j]) ? instances[i] : instances[j];
+      }
+      // 前缀一致性哈希: 同前缀恒定落同实例 ⇒ 缓存亲和最优, 但负载可能倾斜
+      // (热前缀会把流量压到一台)。这正是 router 设计的核心 tradeoff。
+      case 'hash_prefix':
+        return instances[hashKey(prefixKeyOf(req)) % n];
+      // 纯随机: 作为"最差缓存亲和"的对照基线
+      case 'random':
+        return instances[Math.floor(rng() * n) % n];
       case 'round_robin':
       default:
-        return instances[_rrCursor++ % instances.length];
+        return instances[_rrCursor++ % n];
     }
   }
   let completedReqs = [];
@@ -3545,6 +3624,15 @@ function runSimulation(strategy, overrides) {
       tgt.waitQueue.push(req0);
     }
 
+    // 均衡度采样窗: 本步系统整体是否仍有在途负载(或还有未到达请求)。
+    // 排空后的长尾不计入 —— 否则先完成的实例被 0 值拉低, CV 失真(见下方采样处注释)。
+    let _busyPhase = pending.length > 0;
+    for (let ii = 0; !_busyPhase && ii < instances.length; ii++) {
+      let xi = instances[ii];
+      if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
+        || xi.kvXfer.length || xi.decodeWait.length || xi.decoding.length) _busyPhase = true;
+    }
+
     // ======== 逐实例推进(S2): 每个实例独立完成准入→prefill→传输→decode ========
     // 单实例时循环体只执行一次, 且 useInstance 重绑的就是原来那套容器 ⇒ 行为逐位不变。
     for (let _ii = 0; _ii < instances.length; _ii++) {
@@ -4122,12 +4210,17 @@ function runSimulation(strategy, overrides) {
       }
     }
 
-      // 每实例队列/显存画像(S2): 供负载均衡度(CV)评估
+      // 每实例队列/显存画像(S2/S3): 供负载均衡度(CV)评估
       let _qh = inst.waitQueue.length + inst.prefillQ.length + inst.prefilling.length
         + inst.kvXfer.length + inst.decodeWait.length + inst.decoding.length;
       if (_qh > inst.peakQueue) inst.peakQueue = _qh;
       if (inst.pools.hbm.used > inst.peakHbm) inst.peakHbm = inst.pools.hbm.used;
       inst.qLenSum += _qh; inst.qLenSamples++;
+      // ⚠️ 均衡度专用采样(S3 修正): avgQueue 按**全仿真时长**平均会被"排空后的长尾 0 值"
+      // 严重污染 —— 各实例完成时刻不同, 先排空的实例被大量 0 拉低均值, 使 least_queue 的
+      // CV 反而比 round_robin 更差(实测 74.7% vs 49.0%), 与物理直觉矛盾。
+      // 正确口径: 只在**系统整体仍有在途负载**的时间窗内采样(此时路由决策才有意义)。
+      if (_busyPhase) { inst.qBusySum += _qh; inst.qBusySamples++; }
     } // ======== end 逐实例推进 ========
 
     // 显存利用率采样（峰值 + 时间加权平均）+ 并发度采样
@@ -4256,15 +4349,32 @@ function runSimulation(strategy, overrides) {
     // 多实例指标(S2, 2026-08-20): 仅 instances>1 时有效
     multi: instances.length > 1 ? {
       count: instances.length,
-      routePolicy: p.routePolicy,
+      routePolicy: routePolicy,          // 实际生效的策略(DSL ROUTE 行 > UI 下拉)
+      routeFromDsl: !!(s.routing && s.routing.type),
+      routeHook: !!jsRoute,              // 是否被 JS route() 钩子接管
       gpusPerInst: instances.map(x => x.gpus),
       // 每实例明细: 路由到的请求数 / 完成数 / 平均与峰值在途队列 / HBM 峰值占用(GB)
       perInst: instances.map(x => ({
         id: x.id, gpus: x.gpus, routed: x.nRouted, completed: x.nCompleted,
         avgQueue: x.qLenSamples > 0 ? x.qLenSum / x.qLenSamples : 0,
+        // busyQueue: 只在系统有负载时统计的平均在途 —— 衡量路由均衡度应看这个
+        busyQueue: x.qBusySamples > 0 ? x.qBusySum / x.qBusySamples : 0,
         peakQueue: x.peakQueue, peakHbmGB: x.peakHbm / 1e9,
         hbmCapGB: x.caps.hbm / 1e9
       })),
+      // 队列均衡度 CV(%): 基于 busyQueue —— 这是评价路由策略的主指标
+      // (完成数 CV 受请求长度分布干扰: 长度倾斜下"请求数均分"未必等于"负载均分")
+      queueCV: (function(){
+        let arr = instances.map(x => x.qBusySamples > 0 ? x.qBusySum / x.qBusySamples : 0);
+        let n = arr.length; if (!n) return 0;
+        let m = arr.reduce((a, b) => a + b, 0) / n;
+        if (m <= 0) return 0;
+        let v = arr.reduce((a, b) => a + (b - m) * (b - m), 0) / n;
+        return Math.sqrt(v) / m * 100;
+      })(),
+      // 峰值队列极差: 最直观的失衡度量(最忙实例 vs 最闲实例的峰值差)
+      peakSpread: Math.max.apply(null, instances.map(x => x.peakQueue))
+        - Math.min.apply(null, instances.map(x => x.peakQueue)),
       // 负载均衡度: 完成数的变异系数(CV=std/mean)。轮询应接近 0, 越大越不均衡
       loadCV: (function(){
         let arr = instances.map(x => x.nCompleted);
@@ -4402,11 +4512,15 @@ function drawStrategyMetrics() {
       ['PD 卡数(P/D)', sr.pd ? sr.pd.prefillGpus+' / '+sr.pd.decodeGpus+' 卡' : '—', 'accent'],
       // 多实例(S2, 2026-08-20)
       ['实例数(卡/实例)', sr.multi ? sr.multi.count+' × '+sr.multi.gpusPerInst.join('/')+' 卡' : '—', 'accent'],
-      ['路由策略', sr.multi ? sr.multi.routePolicy : '—', 'accent'],
-      ['负载均衡度(完成数CV)', sr.multi ? sr.multi.loadCV.toFixed(1)+'%' : '—',
-        sr.multi && sr.multi.loadCV > 20 ? 'red' : (sr.multi && sr.multi.loadCV > 8 ? 'orange' : 'green')],
+      ['路由策略', sr.multi ? sr.multi.routePolicy + (sr.multi.routeHook ? '(JS钩子)' : (sr.multi.routeFromDsl ? '(DSL)' : '')) : '—', 'accent'],
+      // 均衡度主指标: queueCV(仅系统有负载窗内采样) —— 不用 avgQueue 的 CV(会被排空长尾污染)
+      ['负载均衡度(队列CV)', sr.multi ? sr.multi.queueCV.toFixed(1)+'%' : '—',
+        sr.multi && sr.multi.queueCV > 50 ? 'red' : (sr.multi && sr.multi.queueCV > 25 ? 'orange' : 'green')],
+      ['峰值队列极差', sr.multi ? String(sr.multi.peakSpread) : '—',
+        sr.multi && sr.multi.peakSpread > 20 ? 'red' : (sr.multi && sr.multi.peakSpread > 5 ? 'orange' : 'green')],
       ['各实例完成数', sr.multi ? sr.multi.perInst.map(x => x.completed).join(' / ') : '—', 'accent'],
-      ['各实例平均在途', sr.multi ? sr.multi.perInst.map(x => x.avgQueue.toFixed(1)).join(' / ') : '—', 'orange'],
+      ['各实例在途(busy窗)', sr.multi ? sr.multi.perInst.map(x => x.busyQueue.toFixed(1)).join(' / ') : '—', 'orange'],
+      ['各实例峰值队列', sr.multi ? sr.multi.perInst.map(x => x.peakQueue).join(' / ') : '—', 'orange'],
       ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
       ['Decode 计算/pass(独立)', sr.passMs ? (sr.passMs.hbm+sr.passMs.cmp+sr.passMs.comm).toFixed(2)+' ms' : '—', 'accent'],
       ['吞吐', formatNum(sr.throughput)+' tok/s', 'green'],
