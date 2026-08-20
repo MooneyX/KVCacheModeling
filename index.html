@@ -284,13 +284,24 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
             <option value="hash">整段哈希(vLLM 兼容)</option>
             <option value="radix" selected>前缀树·渐进(sglang)</option>
           </select></div>
-          <div><label>PD分离</label><select id="pPdSep">
+          <div><label>PD分离</label><select id="pPdSep" onchange="togglePdPanel()" title="关(混合批): sglang 默认, prefill 与 decode 在同一批共享 GPU, 互相竞争算力。&#10;近似(同卡免竞争): 仅取消混合批算力竞争折扣, 仍是一套资源/一套 KV 池——2026-08-20 前的'开'档, 保留以兼容历史结论。&#10;真分离(双资源池): 从现有 GPU 总数中划出 P 节点, P/D 各自独立算力+独立 KV 池, prefill 完成后 KV 经互联网络传到 D 节点才能 decode(传输计入 TTFT)。">
             <option value="0" selected>关(混合批)</option>
-            <option value="1">开(prefill独立)</option>
+            <option value="1">近似(同卡免竞争)</option>
+            <option value="2">真分离(双资源池)</option>
           </select></div>
           <div><label>分层KV缓存</label><select id="pTieredKv">
             <option value="1" selected>开(DRAM/SSD)</option>
             <option value="0">关(仅HBM)</option>
+          </select></div>
+        </div>
+        <!-- 真分离(pPdSep=2)专属参数: 默认隐藏, 选中真分离时显示 -->
+        <div class="form-row" id="pdPanel" style="margin-top:6px;display:none">
+          <div><label>P节点GPU数</label><input type="number" id="pPdPrefillGpus" value="2" min="1" title="从 GPU 总数中划给 prefill 节点的卡数, 余下的归 decode 节点(P:D 配比)。&#10;例: 总数 8 + 此处 2 ⇒ P=2卡 / D=6卡。&#10;注意: P 节点的 prefill a/b 会按 P 的卡数自动重算(不复用输入框按总卡数拟合的值)。"></div>
+          <div><label>PD互联带宽(GB/s)</label><input type="number" id="pPdLinkBW" value="400" min="1" title="P→D 传输 KV 的网络带宽(RDMA/IB), 与 NVLink/PCIe 解耦。默认 400GB/s。"></div>
+          <div><label>互联利用率</label><input type="number" id="pPdLinkUtil" value="0.7" min="0.05" max="1" step="0.05" title="互联带宽的有效利用率(协议开销/拥塞后的实际可用比例), 默认 0.7。"></div>
+          <div><label>KV传输量口径</label><select id="pPdKvComp">
+            <option value="1" selected>按attention类型(MLA压缩)</option>
+            <option value="0">全量kvPerToken</option>
           </select></div>
         </div>
       </div>
@@ -632,8 +643,27 @@ function getParams(){
     arrivalDist: $('pArrivalDist') ? $('pArrivalDist').value : 'poisson',
     framework: 'sglang',   // 2026-08-12 起固定 sglang（移除推理引擎区分）
     prefixCache: $('pPrefixCache') ? $('pPrefixCache').value : 'hash',
-    pdSep: gi('pPdSep') === 1, tieredKv: gi('pTieredKv') === 1
+    // PD 分离三档(2026-08-20): 0=关(混合批) / 1=近似(同卡免竞争, 即旧"开") / 2=真分离(双资源池)。
+    // pdSep 保持布尔语义**向后兼容**——近似与真分离都取消混合批算力竞争(三处旧逻辑不用改判据);
+    // pdMode 区分档位, 仅真分离(2)额外启用双资源视图 + P→D KV 传输。
+    pdMode: gi('pPdSep') || 0,
+    pdSep: (gi('pPdSep') || 0) >= 1,
+    // 真分离专属: P 节点卡数(从 gpus 总数划出, 余下归 D)、互联带宽/利用率、KV 传输量口径
+    pdPrefillGpus: Math.max(1, gi('pPdPrefillGpus') || 2),
+    pdLinkBW: Math.max(1, gv('pPdLinkBW') || 400),
+    pdLinkUtil: (function(){ var v = gv('pPdLinkUtil'); return v > 0 && v <= 1 ? v : 0.7; })(),
+    pdKvComp: (function(){ var el = document.getElementById('pPdKvComp'); return el ? gi('pPdKvComp') === 1 : true; })(),
+    tieredKv: gi('pTieredKv') === 1
   };
+}
+
+// PD 分离面板显隐(2026-08-20): 仅"真分离"档需要 P/D 划分与互联参数
+function togglePdPanel(){
+  var el = document.getElementById('pdPanel');
+  if (!el) return;
+  var mode = parseInt((document.getElementById('pPdSep') || {}).value || '0', 10) || 0;
+  el.style.display = mode === 2 ? '' : 'none';
+  if (typeof applyEstimatedParams === 'function') applyEstimatedParams();
 }
 
 function formatBytes(b){
@@ -2463,6 +2493,30 @@ function runSimulation(strategy, overrides) {
   let p = getParams();
   for (let k in overrides) { if (k !== 'seed' && k !== 'nreq') p[k] = overrides[k]; }
   let r = calcAll(p);
+  // ---------- PD 真分离: 双资源视图(2026-08-20) ----------
+  // calcAll(p) 是纯函数, 资源全部由 p.gpus/tflops/hbmBW/hbmPerGpu 推导 ⇒ 直接换 gpus 即可
+  // 得到 P/D 各自的算力/HBM/带宽视图, 无需重写资源模型。
+  // 划分语义: 从现有 GPU 总数中划出 pdPrefillGpus 给 P, 余下归 D(P:D 配比), 总量守恒。
+  // ⚠️ a/b 必须按 P 的卡数**重算**: estimatePrefillParams 内 peakFlops = tflops×gpus、
+  //    aggHbmBW = hbmBW×gpus —— 输入框里的 a/b 是按**总卡数**拟合的, 直接拿给 4 卡的 P 用
+  //    会让 prefill 速度错一整个倍数(见 MEMORY: a/b 是 prefill 速度的唯一权威)。
+  let pdReal = p.pdMode === 2;
+  let rP = r, rD = r, pP = p;
+  let pdPrefillGpus = p.gpus, pdDecodeGpus = p.gpus;   // 非真分离: 两阶段都用全部卡(口径不变)
+  if (pdReal) {
+    let gP = Math.max(1, Math.min(p.pdPrefillGpus, Math.max(1, p.gpus - 1)));  // 至少给 D 留 1 卡
+    let gD = Math.max(1, p.gpus - gP);
+    pdPrefillGpus = gP; pdDecodeGpus = gD;
+    // P 视图: 只改卡数(TP 规模随之收缩), 其余硬件参数共用
+    pP = Object.assign({}, p, { gpus: gP, tpSize: Math.min(p.tpSize || gP, gP) });
+    let pD = Object.assign({}, p, { gpus: gD, tpSize: Math.min(p.tpSize || gD, gD) });
+    rP = calcAll(pP); rD = calcAll(pD);
+    // P 节点 a/b 重算: mfuAuto 下走 Roofline, 否则按 MFU —— 与 estimatePrefillParams 同口径
+    let eP = estimatePrefillParams(pP);
+    pP.prefillA = eP.a; pP.prefillB = eP.b; pP.prefillBIdx = eP.bIdx;
+  }
+  // prefill 段消费 rP/pP(算力与 a/b), decode 段消费 rD(HBM 带宽/算力/权重读)。
+  // 非真分离档下 rP===rD===r、pP===p —— 行为与改动前**逐位一致**(零回归)。
   let rng = mulberry32((overrides.seed != null ? overrides.seed : p.seed) >>> 0);
 
   let kvPerTok = r.kvPerToken;
@@ -2486,6 +2540,8 @@ function runSimulation(strategy, overrides) {
     // TTFT/延迟分解累计（秒）：TTFT = 到达排队 + prefill排队 + L3拉取fetch + prefill计算；
     // 延迟 = TTFT + decode槽位等待 + decode执行（L3 读占比的落点）
     ttftQ: 0, ttftP: 0, ttftF: 0, ttftC: 0, latDw: 0, latDt: 0,
+    // PD 真分离(2026-08-20): ttftX = P→D KV 传输段(TTFT 第5分量); pdXfer* = 传输量与耗时统计
+    ttftX: 0, pdXferBytes: 0, pdXferSpanSum: 0, pdXferSoloSum: 0, pdXferCount: 0,
     fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
     fetchSpanSum: 0,                                        // prefill 传输过程实际耗时累计(_ft1-_ft0, 含带宽排队/不含计算)
     fetchBytesPulled: 0,                                    // prefill 拉取字节总量(统一共享池口径, 单飞去重效果可由此观察)
@@ -2734,6 +2790,27 @@ function runSimulation(strategy, overrides) {
   let s = strategy;
   let waitQueue = [], prefillQ = [], decoding = [], decodeWait = [], completedReqs = [];
   let prefilling = [], staticWaveOpen = true;
+  // PD 真分离(2026-08-20): prefill 完成后等待 KV 从 P 传到 D 的队列(仅 pdReal 时非空)
+  let kvXfer = [];
+  // P→D 互联有效带宽(B/s) = 标称 × 利用率
+  let pdLinkEffBW = Math.max(p.pdLinkBW * 1e9 * p.pdLinkUtil, 1);
+  // 每请求需跨节点搬运的 KV 字节数。
+  // 关键事实(2026-08-20 核实): 引擎的 calcKvPerToken 对 MLA **已是压缩 latent 口径**
+  //   MLA:     layers × (kvLora + ropeDim) × dtypeBytes     ← 压缩表示, 正是跨节点要传的量
+  //   GQA/MHA: 2 × layers × kvHeads × headDim × dtypeBytes   ← 全秩
+  // 所以"按 attention 类型自适应"= 直接用 kvPerTok 即可, MLA 的传输优势自动体现
+  // (与平台B kv_transfer_cost 同口径, 可交叉验证)。
+  // pdKvComp=false(全量档) 提供对照: 强制按**全秩** GQA 口径计费, 用于回答
+  // "如果没有 MLA 压缩, PD 分离的传输代价会高多少" —— MLA 场景下两档差异显著。
+  // 传输量按请求实际持有的 KV token 数(输入全长, 含命中前缀——KV 无论来自命中还是重算,
+  // 都在 P 的 HBM 里, 都要搬到 D)。
+  function pdKvXferBytes(q) {
+    let tok = Math.max(0, q.inputLen || 0);
+    if (p.pdKvComp) return tok * kvPerTok;   // 自适应: MLA 自动走压缩, GQA/MHA 走全秩
+    // 全量对照档: 按全秩 KV 计费(MLA 也按 2×kvHeads×headDim 展开)
+    let full = 2 * p.layers * Math.max(p.kvHeads || 0, 1) * Math.max(p.headDim || 0, 1) * p.dtypeBytes;
+    return tok * Math.max(full, kvPerTok);
+  }
 
   function admitTier(req) {
     if (jsAdmit) { try { let r0 = jsAdmit(req); if (r0) return r0; } catch(e) {} }
@@ -3021,10 +3098,31 @@ function runSimulation(strategy, overrides) {
         prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
       }
     }
-    // prefill 完成 → 转 decode。continuous 批下 decode 并发受 max_batch_size 约束：
-    // 槽位满时先入 decodeWait（不占 prefill 流水线），槽位释放后补入。
     // 单批模式(2026-08-19): prefill 完成即整个仿真终点——直接完成请求, 不进 decode/decodeWait
     if (p.singleBatch) { completeRequest(q); dirty = true; return; }
+    // ---- PD 真分离(2026-08-20): prefill 在 P 节点算完, KV 必须经互联网络搬到 D 节点才能 decode ----
+    // 物理: P/D 是两台机器, KV 不在同一片 HBM 里。传输耗时进入 TTFT(首 token 必须等 KV 到位)。
+    // 单批模式已在上面返回(它不进 decode, 无需传输)。
+    if (pdReal && !q._kvXferDone) {
+      q._kvXferBytes = pdKvXferBytes(q);
+      q._kvXferTotal = q._kvXferBytes / pdLinkEffBW;   // 秒(独立耗时, 实际可能因并发排队更久)
+      q._kvXferSent = 0;
+      // 传输起点 = 本步**初**(now 已是本步末)。若记 now, 则本步循环里立刻推进一份 quota,
+      // 等于凭空多算 1 个 DT 的进度 ⇒ 实际墙钟恒比独立耗时少 DT(实测 28.09 vs 30.09ms),
+      // 违反"共享链路只会更慢"的物理约束。
+      q._kvX0 = now - DT;
+      q.state = 'kvXfer';
+      kvXfer.push(q);
+      dirty = true;
+      return;
+    }
+    finishKvXfer(q);
+  }
+
+  // KV 传输完成 → 原有的转 decode/decodeWait 逻辑(与非 PD 路径完全一致)
+  function finishKvXfer(q) {
+    // prefill 完成 → 转 decode。continuous 批下 decode 并发受 max_batch_size 约束：
+    // 槽位满时先入 decodeWait（不占 prefill 流水线），槽位释放后补入。
     let decodeSlots = s.batching.max_batch_size || 8;
     let decodeOk = (s.batching.type === 'static') || decoding.length < decodeSlots;
     if (decodeOk) {
@@ -3092,8 +3190,13 @@ function runSimulation(strategy, overrides) {
   function completeRequest(req) {
     req.state = 'done'; req.completeTime = now;
     stats.latencies.push((now - req.arrive) * 1000);
-    stats.ttfts.push((req.prefillEnd - req.arrive) * 1000);
-    stats.tpots.push((now - (req.decodeStart || req.prefillEnd)) / Math.max(1, req.outputLen) * 1000); // ms/token（剔除 decodeWait 排队）
+    // TTFT 口径(2026-08-20 PD 真分离): 首 token 产出时刻。
+    // 非 PD / 近似档: = prefillEnd(prefill 算完即可出首 token)。
+    // 真分离: KV 必须先从 P 传到 D, 首 token 只能在传输完成后产出 ⇒ TTFT 含传输段。
+    // _kvXferEnd 由传输完成时写入(= prefillEnd + 实际传输墙钟)。
+    let _ttftAt = (req._kvXferEnd != null) ? req._kvXferEnd : req.prefillEnd;
+    stats.ttfts.push((_ttftAt - req.arrive) * 1000);
+    stats.tpots.push((now - (req.decodeStart || _ttftAt)) / Math.max(1, req.outputLen) * 1000); // ms/token（剔除 decodeWait 排队）
     stats.queueWaits.push(req.admitTime - req.arrive);
     // TTFT/延迟分解（秒）：qW=到达→准入, pW=准入→prefill开始, fW=L3拉取等待(fetchTime),
     // cW=实际prefill计算, dW=decode槽位等待, dT=decode执行。校验: qW+pW+fW+cW+dW+dT = 延迟。
@@ -3113,13 +3216,20 @@ function runSimulation(strategy, overrides) {
       _fW = Math.max(0, req.prefillEnd - req.prefillStart);
     }
     stats.ttftQ += _qW; stats.ttftP += _pW; stats.ttftF += _fW; stats.ttftC += _cW;
+    // PD 真分离: P→D KV 传输段(prefillEnd → KV 到位), 是 TTFT 的第 5 个分量。
+    // 非真分离档恒为 0 ⇒ 分解口径与改动前一致。
+    let _xW = (req._kvXferEnd != null) ? Math.max(0, req._kvXferEnd - req.prefillEnd) : 0;
+    stats.ttftX += _xW;
     stats.fetchSoloSum += (req.fetchTime || 0); // prefill 传输独立用时(不重叠时 L3 拉取单独耗时): race/be 与计算重叠后实际等待≈0, 但独立用时仍在
     // 仿真过程中的实际传输耗时(含 L3 带宽排队, 不含计算): wc=prefillStart→拉完;
     // race=prefillStart→相遇点(被计算覆盖的拉取过程); be=到达→拉完或准入终止
     if ((req.fetchTime || 0) > 0 && req._ft0 !== undefined && req._ft1 !== undefined)
       stats.fetchSpanSum += Math.max(0, req._ft1 - req._ft0);
-    let _dW = Math.max(0, (req.decodeStart || req.prefillEnd) - req.prefillEnd);
-    let _dT = Math.max(0, req.completeTime - (req.decodeStart || req.prefillEnd));
+    // decode 槽位等待: 从"KV 可用时刻"起算(真分离下 = 传输完成; 否则 = prefillEnd),
+    // 避免把 P→D 传输时间重复计入 decodeWait(它已单列为 _xW)
+    let _kvReady = (req._kvXferEnd != null) ? req._kvXferEnd : req.prefillEnd;
+    let _dW = Math.max(0, (req.decodeStart || _kvReady) - _kvReady);
+    let _dT = Math.max(0, req.completeTime - (req.decodeStart || _kvReady));
     stats.latDw += _dW; stats.latDt += _dT;
     stats.completed++; stats.outTokens += req.outputLen;
     if (timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
@@ -3200,7 +3310,7 @@ function runSimulation(strategy, overrides) {
   // 剩余排水估计：基于当前未完成请求（排队/在飞/decode），供窗口自动延长使用。
   // 与 drainEst 同口径（位置感知 prefill + 分波 decode），保证延长量覆盖剩余工作
   function estimateRemainingDrain() {
-    let all = pending.concat(waitQueue, prefillQ, prefilling, decodeWait, decoding);
+    let all = pending.concat(waitQueue, prefillQ, prefilling, kvXfer, decodeWait, decoding);
     let pf = 0, remTok = 0;
     for (let q of all) {
       let L = Math.max(0, (q._pfTotal || q.inputLen || 0) - (q._pfDone || 0));
@@ -3451,7 +3561,7 @@ function runSimulation(strategy, overrides) {
           let H = qq._pfStartPos || 0;
           let pos = qq._raceMeetTok < 0 ? qq._pfDone
             : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
-          sumCost += prefillTau(p, pos);
+          sumCost += prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b(卡数不同)
           continue;
         }
         // best_effort(修正): 重算未拉前缀(位置0→cap) + 后缀(位置H→L), 全程占算力;
@@ -3467,7 +3577,7 @@ function runSimulation(strategy, overrides) {
           // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
           pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         }
-        sumCost += prefillTau(p, pos);
+        sumCost += prefillTau(pP, pos);     // PD 真分离: prefill 走 P 节点 a/b
       }
       let perReqTok = sumCost > 0 ? gpuTime / sumCost : 0; // 每请求每步推进 token 数
       // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
@@ -3607,7 +3717,7 @@ function runSimulation(strategy, overrides) {
             let cost = 0;
             for (let m of curWave.members) {
               let posMid = (m.q._pfStartPos || 0) + m.q._pfDone + m.chunk / 2;
-              cost += m.chunk * prefillTau(p, posMid);
+              cost += m.chunk * prefillTau(pP, posMid);   // PD 真分离: 波次同样走 P 节点 a/b
             }
             curWave.endT = now + cost / Math.max(wBoost * wPfFactor, 1e-9);
             for (let m of curWave.members) m.q._wvInFlight = m.chunk; // 在飞 chunk 登记(组波时扣除)
@@ -3673,6 +3783,37 @@ function runSimulation(strategy, overrides) {
       }
       } // end else(连续流体模式)
     } // end if (prefilling.length)
+    // ---- PD 真分离: P→D KV 传输推进(2026-08-20) ----
+    // 互联带宽在同时传输的请求间**平分**(共享一条链路), 与 L3 拉取的共享池同思路:
+    // 并发传输越多, 每个请求越慢 —— 这是 PD 分离在高负载下的真实代价(传输成为新瓶颈)。
+    if (kvXfer.length) {
+      let share = pdLinkEffBW / kvXfer.length;      // 每请求本步可用带宽
+      let quota = share * DT;                       // 每请求本步可传字节
+      for (let i = kvXfer.length - 1; i >= 0; i--) {
+        let q = kvXfer[i];
+        let need = Math.max(0, q._kvXferBytes - q._kvXferSent);   // 剩余待传
+        let moved = Math.min(quota, need);
+        q._kvXferSent += moved;
+        stats.pdXferBytes += moved;
+        if (q._kvXferSent >= q._kvXferBytes - 1e-9) {
+          q._kvXferDone = true;
+          // 完成时刻按**亚步长**精确结算: 本步只需 moved 字节(< quota)时, 传输在步内
+          // now-DT + moved/share 时刻就结束, 而非拖到步末 now。
+          // 不修正会把最后一步整个 DT 记进耗时 ⇒ 少量并发下实际墙钟可能被算得比
+          // 独立耗时(_kvXferTotal)还短(实测 7.46ms < 8.46ms), 违反"共享链路只会更慢"的物理。
+          let finishAt = Math.min(now, (now - DT) + (share > 0 ? moved / share : 0));
+          q._kvXferEnd = Math.max(finishAt, q._kvX0);   // KV 到达 D 的时刻(TTFT 截止点)
+          q._kvXferSpan = q._kvXferEnd - q._kvX0;       // 实际墙钟(含并发排队), >= 独立耗时
+          stats.pdXferSpanSum += q._kvXferSpan;
+          stats.pdXferSoloSum += q._kvXferTotal;    // 独立耗时(无竞争基准)
+          stats.pdXferCount++;
+          kvXfer.splice(i, 1);
+          // KV 已到 D 节点 ⇒ 走原转 decode 逻辑。注意 prefillEnd 不变(prefill 确实那时算完),
+          // 传输时间通过 _kvXferEnd 体现, 并单列进 TTFT 分解的 xfer 分量。
+          finishKvXfer(q);
+        }
+      }
+    }
     // decode 槽位释放 → 从 decodeWait 补入（static 波次语义不变）
     while (decodeWait.length && (s.batching.type === 'static' || decoding.length < (s.batching.max_batch_size || 8))) {
       let q = decodeWait.shift();
@@ -3733,14 +3874,16 @@ function runSimulation(strategy, overrides) {
       //      与预取/淘汰/换入换出先到先服务共享带宽; 排队等待 + 传输时间并入 passTime;
       //      无竞争(链路空闲)时排队等待=0 → 退化为旧线性模型(完全一致);
       //      有竞争(预取占带宽)时 decode 读被拖慢——物理正确。
-      let passTime = (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
-        + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000;
-      let cmpFloor = 2 * r.activatedParams * decoding.length / r.computeFlops;
+      // PD 真分离(2026-08-20): decode 只用 D 节点资源(rD = calcAll 换卡数视图);
+      // 非真分离档 rD===r 且 dGpus===p.gpus ⇒ 与改动前逐位一致。
+      let passTime = (rD.modelWeightBytes * rD.decodeWeightRatio + sumH) / rD.aggHbmBW
+        + perReqMs(decoding.length, rD.activatedParams, pdDecodeGpus) / 1000;
+      let cmpFloor = 2 * rD.activatedParams * decoding.length / rD.computeFlops;
       // chunked-prefill 竞争：混合批下并行 prefill 与 decode 共享算力，只放大算力项（带宽/I-O 项不受 prefill 影响）。
       // 旧实现 passTime×2 把 I-O 读盘时间也翻倍——decode 受限(SSD 慢)场景被严重拖慢，属过度惩罚。
       // PD 分离（sglang）时 prefill/decode 各用独立资源，无算力竞争。
       if (!p.pdSep && prefilling.length) cmpFloor *= (1 + 0.5 * prefilling.length);
-      passTime = Math.max(passTime, cmpFloor, 1e-6) + r.commTime(decoding.length);
+      passTime = Math.max(passTime, cmpFloor, 1e-6) + rD.commTime(decoding.length);
       // ---- L2 读链路排队(busyUntil) + L3 读统一共享池(2026-08-18, 问题②修复) ----
       // L2(dram>hbm): 维持 busyUntil 排队模型(decode 读与预取/淘汰共享带宽)。
       // L3(ssd>dram): decode 按需读优先于 prefill 拉取(见拉取段注释)——decode 始终按全速
@@ -3765,8 +3908,8 @@ function runSimulation(strategy, overrides) {
         // passTime = 基础项 + 排队读时间(累加, 与旧模型 sumD/bw+sumS/bw 语义一致)
         let newPt = (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
           + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000
-          + readPerPass + r.commTime(decoding.length);
-        newPt = Math.max(newPt, cmpFloor + r.commTime(decoding.length), 1e-6);
+          + readPerPass + rD.commTime(decoding.length);
+        newPt = Math.max(newPt, cmpFloor + rD.commTime(decoding.length), 1e-6);
         if (Math.abs(newPt - passTime) < 1e-12) break;
         passTime = newPt;
       }
@@ -3799,13 +3942,13 @@ function runSimulation(strategy, overrides) {
       let tL2 = Math.max(0, l2Fin - now) / Math.max(passes, 1e-9);
       let tL3 = l3ReadPerPass; // L3 共享池口径: 每 pass 读时间 = ΣKV_ssd/可用速率(含拉取挤占)
       stats.ptHbm += tHbm; stats.ptL2 += tL2; stats.ptL3 += tL3;
-      stats.ptCmp += cmpFloor; stats.ptComm += r.commTime(decoding.length);
+      stats.ptCmp += cmpFloor; stats.ptComm += rD.commTime(decoding.length);
       stats.ptSamples++;
       let bn = tHbm; let bnk = 'bnHbm';
       if (tL2 > bn) { bn = tL2; bnk = 'bnL2'; }
       if (tL3 > bn) { bn = tL3; bnk = 'bnL3'; }
       if (cmpFloor > bn) { bn = cmpFloor; bnk = 'bnCmp'; }
-      if (r.commTime(decoding.length) > bn) bnk = 'bnComm';
+      if (rD.commTime(decoding.length) > bn) bnk = 'bnComm';
       stats[bnk]++;
       let tok = DT / passTime;
       for (let i = decoding.length - 1; i >= 0; i--) {
@@ -3851,7 +3994,7 @@ function runSimulation(strategy, overrides) {
       stats.l3Series.push([+now.toFixed(2), +(pools.ssd.used / 1e9).toFixed(2)]);
     }
 
-    if (!pending.length && !waitQueue.length && !prefillQ.length && !prefilling.length && !decodeWait.length && !decoding.length) { drained = true; break; }
+    if (!pending.length && !waitQueue.length && !prefillQ.length && !prefilling.length && !kvXfer.length && !decodeWait.length && !decoding.length) { drained = true; break; }
     // 触顶未排空 → 按剩余负载自动延长（覆盖排水估计低估，保证"设大上限即可跑完"）；
     // 延长后超过用户上限 simCap ⇒ 截断退出（truncated=true，结果警示并给出建议上限值）。
     if (step + 1 >= maxSteps) {
@@ -3887,6 +4030,7 @@ function runSimulation(strategy, overrides) {
   let incomplete = [];
   waitQueue.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: null, prefillStart: null, prefillEnd: null, completeTime: null, state: 'queued' }));
   prefillQ.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: null, prefillEnd: null, completeTime: null, state: 'prefillQ' }));
+  kvXfer.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'kvXfer' }));
   decodeWait.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decodeWait' }));
   prefilling.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: null, completeTime: null, state: 'prefilling' }));
   decoding.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decoding' }));
@@ -3932,7 +4076,22 @@ function runSimulation(strategy, overrides) {
       fetchSolo: stats.fetchSoloSum / stats.completed * 1000,
       // prefill 传输过程实际耗时（ms, 仿真中传输的真实时长）: 含 L3 并发带宽排队、不含计算——
       // 为避免被计算延迟覆盖而单列为"独立"展示; wc 下 ≈fetch(实际等待), race/be 下为被计算重叠隐藏的拉取过程时长
-      fetchReal: stats.fetchSpanSum / stats.completed * 1000
+      fetchReal: stats.fetchSpanSum / stats.completed * 1000,
+      // PD 真分离: P→D KV 传输段(ms) —— TTFT 第5分量。
+      // TTFT = queue + prefillQ + fetch + compute + xfer(真分离时非0)
+      xfer: stats.ttftX / stats.completed * 1000
+    } : null,
+    // PD 真分离指标(2026-08-20): 仅 pdMode=2 时有效
+    pd: p.pdMode === 2 ? {
+      prefillGpus: pdPrefillGpus, decodeGpus: pdDecodeGpus,
+      linkBW: p.pdLinkBW, linkUtil: p.pdLinkUtil, linkEffBW: pdLinkEffBW,
+      kvComp: p.pdKvComp,
+      xferGB: stats.pdXferBytes / 1e9,
+      // 每请求传输量(MB)与耗时: solo=独立(无竞争)基准, span=实际墙钟(含并发平分带宽的排队)
+      xferPerReqMB: stats.pdXferCount > 0 ? stats.pdXferBytes / stats.pdXferCount / 1e6 : 0,
+      xferSoloMs: stats.pdXferCount > 0 ? stats.pdXferSoloSum / stats.pdXferCount * 1000 : 0,
+      xferSpanMs: stats.pdXferCount > 0 ? stats.pdXferSpanSum / stats.pdXferCount * 1000 : 0,
+      xferCount: stats.pdXferCount
     } : null,
     // decode 每 pass 名义分量的绝对用时（ms/pass, 未 max 取大前的单独耗时）：
     // 传输 = l2+l3（跨层 KV 读含链路排队）; 计算侧 = hbm(权重+KV读+每请求开销) + cmp(算力下限) + comm(TP通信)
@@ -4037,6 +4196,13 @@ function drawStrategyMetrics() {
       // 为防被计算延迟覆盖而单列; wc 下≈传输等待(实际), race/be 下为被计算重叠隐藏的拉取过程时长
       ['Prefill 传输(独立)', sr.ttftBreakdown ? (sr.ttftBreakdown.fetchReal||0).toFixed(0)+' ms' : '—', 'orange'],
       ['Prefill 计算(独立)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
+      // PD 真分离(2026-08-20): P→D KV 传输是 TTFT 的新增分量, 只在真分离档非 0
+      ['PD KV传输(TTFT内)', sr.pd ? (sr.ttftBreakdown ? sr.ttftBreakdown.xfer.toFixed(0)+' ms' : '—') : '—',
+        sr.pd && sr.ttftBreakdown && sr.ttftBreakdown.xfer > sr.ttftBreakdown.compute ? 'red' : 'orange'],
+      ['PD 传输量/请求', sr.pd ? sr.pd.xferPerReqMB.toFixed(0)+' MB' : '—', 'orange'],
+      ['PD 传输(独立/实际)', sr.pd ? sr.pd.xferSoloMs.toFixed(0)+' / '+sr.pd.xferSpanMs.toFixed(0)+' ms' : '—',
+        sr.pd && sr.pd.xferSpanMs > sr.pd.xferSoloMs * 1.5 ? 'red' : 'orange'],
+      ['PD 卡数(P/D)', sr.pd ? sr.pd.prefillGpus+' / '+sr.pd.decodeGpus+' 卡' : '—', 'accent'],
       ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
       ['Decode 计算/pass(独立)', sr.passMs ? (sr.passMs.hbm+sr.passMs.cmp+sr.passMs.comm).toFixed(2)+' ms' : '—', 'accent'],
       ['吞吐', formatNum(sr.throughput)+' tok/s', 'green'],
