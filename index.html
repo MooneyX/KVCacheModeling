@@ -223,7 +223,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
     <div class="row2">
       <div>
         <div class="form-row">
-          <div><label>请求数</label><input type="number" id="pConcurrency" value="32" min="1" title="仿真请求总数(1:1 直接对应)。峰值并发由 QPS×延迟(Little 定律)自然形成; 需求推导的 KV 容量/批大小按'请求数=峰值并发'保守估算"></div>
+          <div><label id="lblConcurrency">请求数</label><input type="number" id="pConcurrency" value="32" min="1" title="仿真请求总数(1:1 直接对应)。峰值并发由 QPS×延迟(Little 定律)自然形成; 需求推导的 KV 容量/批大小按'请求数=峰值并发'保守估算。&#10;单批Prefill基准模式下: 此值 = 单批 batch 规模(全部请求 t=0 同时进 prefill), 是该模式下唯一决定 batch 的旋钮"></div>
           <div><label>平均输入长度(tok)</label><input type="number" id="pInputLen" value="4096" min="1"></div>
           <div><label>平均输出长度(tok)</label><input type="number" id="pOutputLen" value="1024" min="1"></div>
         </div>
@@ -244,7 +244,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       </div>
       <div>
         <div class="form-row">
-          <div><label>Max Batch Size</label><input type="number" id="pMaxBatch" value="8" min="1" onchange="syncMaxBatchFromInput()" title="与 DSL 的 BATCH: max(N) 双向同步(2026-08-14): 改这里自动更新 DSL 的 BATCH 行(仿真唯一生效来源); 改 DSL 也会回填这里"></div>
+          <div><label id="lblMaxBatch">Max Batch Size</label><input type="number" id="pMaxBatch" value="8" min="1" onchange="syncMaxBatchFromInput()" title="与 DSL 的 BATCH: max(N) 双向同步(2026-08-14): 改这里自动更新 DSL 的 BATCH 行(仿真唯一生效来源); 改 DSL 也会回填这里"></div>
           <div><label>Block Size (PageAttn)</label><input type="number" id="pBlockSize" value="16" min="1"></div>
           <div><label>仿真窗口上限(秒)</label><input type="number" id="pSimMaxTime" value="1200" min="60" step="60" title="仿真窗口 = min(排水估计, 此上限)。排水估计已含 KV 下沉减速(与引擎同口径)。重负载(长输入/高并发)下窗口触顶会截断, 完成请求数<总请求数, TTFT/P99 基于不完整样本——截断时结果会显示警示与实际排水建议值, 调大此值即可跑完全部请求"></div>
           <div><label>多轮复用比例(%)</label><input type="number" id="pMultiTurn" value="0" min="0" max="100"></div>
@@ -255,14 +255,14 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选=decode 重复拉取: 已拉取的前缀 KV 在 decode 阶段每 pass 都重新从 L3 拉取(按 SSD 读计费)——模拟用户回复间隔较长、请求 KV cache 已被逐出 HBM/DRAM 的场景。不勾选(默认): prefill 只拉取一次, 之后驻留 HBM, decode 读 HBM(与 wait_complete'拉齐再算'语义一致)。勾选后 decode 的 L3 重读与 prefill 拉取共享同一 NVMe 总线且按需读优先: 低带宽下重读饱和会挤占后续请求的拉取, TTFT 显著上升——这正是'KV 被驱逐+带宽不足'系统不可用的信号"><input type="checkbox" id="pDecodeL3Read" style="width:auto"><label style="margin:0;font-size:.75rem" for="pDecodeL3Read">Decode 重复拉取 L3(KV 被驱逐)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选(默认)=prefill 重复拉取: 每个请求独立从 L3 重新拉取完整前缀——模拟前缀在两个请求之间被逐出快层(如用户回复间隔长、热前缀集合超过快层容量)的场景。不勾选: 同组前缀的 L3 拉取只发生一次, 后续请求等待并共享该次拉取(HiCache 单飞/去重语义——前缀拉取后驻留快层, 后续请求直接命中)"><input type="checkbox" id="pFetchRepull" checked style="width:auto"><label style="margin:0;font-size:.75rem" for="pFetchRepull">Prefill 每请求重复拉取(KV 被驱逐)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选后 prefill 按 token 预算组波次执行(对齐 sglang chunked-prefill): 每波总 token ≤ Prefill token预算, 长请求按 Prefill Chunk 切分跨波, 整波算完才组下一波, 筹备波的 L3 拉取与执行波计算重叠(overlap 事件循环); 准入不再有请求数槽位上限。仅 wait_complete 策略生效, race/best_effort 回退连续流体模型。不勾(默认): 连续流体模型(prefill 并发=min(max_batch, Prefill并发上限) 个请求连续分摊算力)"><input type="checkbox" id="pPrefillWave" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefillWave">波次组批(sglang chunked)</label></div>
-          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="单批 prefill 微基准(2026-08-19): 隔离观察 batchsize 对 prefill 计算/传输时间占比的影响——①全部请求 t=0 同时到达(忽略 qps/到达分布) ②跳过准入容量与槽位门控, 所有请求立即进入 prefill(并发=请求数, 即单批 batch) ③prefill 完成即结束, 不进 decode(TPOT/延迟口径无意义, 多轮失效)。用法: 并发请求数=batch 规模; 敏感性面板选「并发请求数」扫描 × L3聚合带宽对比 × L3拉取时间占比指标, 即可得到 batch-占比曲线(queue≈0 受控)"><input type="checkbox" id="pSingleBatch" style="width:auto"><label style="margin:0;font-size:.75rem" for="pSingleBatch">单批Prefill基准(无排队/无decode)</label></div>
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="单批 prefill 微基准(2026-08-19): 隔离观察 batchsize 对 prefill 计算/传输时间占比的影响——①全部请求 t=0 同时到达(忽略 qps/到达分布) ②跳过准入容量与槽位门控, 所有请求立即进入 prefill(并发=请求数, 即单批 batch) ③prefill 完成即结束, 不进 decode(TPOT/延迟口径无意义, 多轮失效)。&#10;⚠️ batch 规模由「并发请求数」决定, 不是 Max Batch Size ——后者只作用于 decode, 而单批模式不跑 decode(勾选后会置灰提示)。&#10;用法: 并发请求数=batch 规模; 敏感性面板选「并发请求数」扫描 × L3聚合带宽对比 × L3拉取时间占比指标, 即可得到 batch-占比曲线(queue≈0 受控)"><input type="checkbox" id="pSingleBatch" style="width:auto" onchange="toggleSingleBatchHints()"><label style="margin:0;font-size:.75rem" for="pSingleBatch">单批Prefill基准(无排队/无decode)</label></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>Prefill位置成本a(μs/tok)</label><input type="number" id="pPrefillA" value="79.5" min="0" step="0.1" title="位置感知 prefill: τ_rec(i)=a+b·i。a=固定项。推导值见右侧按钮: 权重读/chunk + 算力/mfu + TP通信"></div>
           <div><label>Prefill斜率b(μs/tok²)</label><input type="number" id="pPrefillB" value="0.00533" min="0" step="0.0001" title="attention 累计项斜率。推导公式: b = kv/token ÷ HBM聚合带宽 (物理确定, 无需实测)"></div>
           <div><label>L3拉取固定延迟(μs)</label><input type="number" id="pFetchFixedUs" value="0" min="0" step="1" title="简化传输模型: 传输延迟 = 传输大小/带宽 (τ_pf 每块固定开销默认置 0, 2026-08-12)。如需模拟 NVMe 每请求延迟(RPC/软件开销)可手动调大, 原推导 = NVMe单请求(100) + RPC/软件(110)"></div>
           <div><label>Prefill Chunk(tok)</label><input type="number" id="pChunkSize" value="2048" min="16" step="16" title="chunked-prefill 波大小(框架配置, 默认 2048=sglang 默认)。用于推导 a 的权重读分摊项"></div>
-          <div><label>Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)。仅连续流体模式(默认)生效; 波次组批开启后由 token 预算替代"></div>
+          <div><label id="lblPrefillSlots">Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)。仅连续流体模式(默认)生效; 波次组批开启后由 token 预算替代; 单批Prefill基准模式下槽位门控被跳过, 此值无效"></div>
           <div><label>Prefill token预算</label><input type="number" id="pMaxPrefillTok" value="16384" min="256" step="1024" title="sglang max_prefill_tokens(默认 16384): 每个 prefill 波次的总 token 预算; 长请求按 Prefill Chunk 切分跨波执行。仅勾选「波次组批」时生效"></div>
         </div>
         <!-- 稀疏注意力(2026-08-20): DS-V3.2 Indexer / V4 NSA -->
@@ -892,6 +892,33 @@ function toggleSparseFields(){
     let el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none';
   });
 }
+// 单批Prefill基准模式的 UI 护栏(2026-08-20): 该模式故意跳过槽位/容量准入门控(见 runSimulation
+// L3259/L3265/L3288), batch 规模改由「请求数」pConcurrency 决定(N=min(concurrency,256));
+// max_batch 只作用于 decode, 而单批模式 prefill 完成即结束、不进 decode ⇒ 完全无效。
+// 实测: 单批开时 pMaxBatch 4→256 / pPrefillSlots 1→64 的 TTFT/拉取/计算逐点不变;
+// 只有 pConcurrency 4→64 会让 TTFT 747→10160ms。此前无提示, 极易误调 max_batch 后以为引擎有 bug。
+function toggleSingleBatchHints(){
+  let on = !!(document.getElementById('pSingleBatch') && document.getElementById('pSingleBatch').checked);
+  // 置灰失效项 + 标注原因
+  [['pMaxBatch','lblMaxBatch','Max Batch Size','单批下无效(仅decode)'],
+   ['pPrefillSlots','lblPrefillSlots','Prefill并发上限','单批下无效(门控跳过)']
+  ].forEach(function(t){
+    let inp = document.getElementById(t[0]), lab = document.getElementById(t[1]);
+    if (inp) { inp.disabled = on; inp.style.opacity = on ? '0.45' : ''; }
+    if (lab) {
+      lab.innerHTML = on ? t[2] + ' <span style="color:#fbbf24">⚠ ' + t[3] + '</span>' : t[2];
+      lab.style.opacity = on ? '0.6' : '';
+    }
+  });
+  // 高亮真正生效的旋钮
+  let cl = document.getElementById('lblConcurrency');
+  if (cl) cl.innerHTML = on
+    ? '请求数 <span style="color:var(--accent2)">← 单批 batch 规模</span>'
+    : '请求数';
+  let ci = document.getElementById('pConcurrency');
+  if (ci) ci.style.borderColor = on ? 'var(--accent2)' : '';
+}
+
 function toggleDerivationPanel(){
   let el = $('derivPanel'); if (!el) return;
   let show = el.style.display === 'none';
@@ -1132,6 +1159,7 @@ function initParamsTab(){
   $('pAttnType').onchange=()=>{toggleMlaFields(); recalcAll();};
   toggleMlaFields();
   toggleSparseFields();   // 稀疏注意力字段初始可见性(2026-08-20)
+  toggleSingleBatchHints(); // 单批模式护栏初始状态(2026-08-20)
 }
 
 function toggleMlaFields(){
@@ -1202,6 +1230,11 @@ function importParamsFromBox() {
   }
   // 命中率滑块填充色同步(导入可能改了 pPrefixHit 值)
   if (typeof updatePrefixHitFill === 'function') { try { updatePrefixHitFill(); } catch(e) {} }
+  // 条件显隐/置灰同步(导入可能改了 pAttnType / pSparseAttn / pSingleBatch)——
+  // 尤其 pMaxBatch/pPrefillSlots 的 disabled 状态必须按导入后的单批开关重算, 否则会残留上一次的置灰
+  if (typeof toggleMlaFields === 'function') { try { toggleMlaFields(); } catch(e) {} }
+  if (typeof toggleSparseFields === 'function') { try { toggleSparseFields(); } catch(e) {} }
+  if (typeof toggleSingleBatchHints === 'function') { try { toggleSingleBatchHints(); } catch(e) {} }
   recalcAll();
   if (note) note.textContent = '✓ 已应用 ' + applied + ' 个参数并重算' + (wroteDsl ? '（含调度策略 DSL）' : '');
 }
