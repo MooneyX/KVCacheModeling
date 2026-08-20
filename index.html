@@ -169,6 +169,16 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div><label>词表大小</label><input type="number" id="pVocab" value="128000" min="1" step="1000"></div>
           <div><label>Q头数(0=自动)</label><input type="number" id="pQHeads" value="0" min="0" step="1" oninput="applyEstimatedParams()" title="attention 的 query head 数, 用于推导 prefill 位置斜率 b 的计算量(2026-08-19 Roofline 改造新增)。&#10;0=自动: GQA 按 hidden/headDim 推导(等价于 4×layers×hidden, 与是否填写无关); MLA 按 hidden/headDim 近似。&#10;MLA 必须显式填写: DeepSeek-V3 有 128 个 head, 而 hidden/headDim = 7168/128 = 56, 自动推导会低估 attention 计算量 2.3×。DS-V3/V2 = 128, V2-Lite = 16。"></div>
         </div>
+        <!-- 稀疏注意力(2026-08-20 新增; 2026-08-20 从 prefill 参数区迁到此处):
+             DS-V3.2 Indexer / V4 NSA。这是**模型架构属性**(是否内置稀疏选择器), 不是
+             调度/框架配置 ⇒ 应随模型预设走, 故放在模型参数区并由 applyModel 自动勾选。 -->
+        <div class="form-row" style="margin-top:6px">
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="稀疏注意力(DeepSeek V3.2 Indexer / V4 NSA): 每个 query 只对 top-k 个最相关的历史 KV 做 attention, 而非全部历史。&#10;效果: 位置成本 b 在 pos>topk 后**不再增长**——长上下文 prefill 从 O(L²) 转为 O(L·topk)。&#10;但 Indexer(选择器)本身仍需扫描全部历史 KV 打分, 这部分仍随位置线性增长(斜率 b_idx, 自动推导)。&#10;⚠️ 若忽略 b_idx 会得出'长上下文成本恒定'的错误结论: 稀疏是把 O(L²)的大系数换成 O(L²)小系数 + O(L·topk)大系数, 不是消掉二次项。"><input type="checkbox" id="pSparseAttn" style="width:auto" onchange="toggleSparseFields();applyEstimatedParams()"><label style="margin:0;font-size:.75rem" for="pSparseAttn">稀疏注意力(V3.2 Indexer/V4 NSA)</label></div>
+          <div id="sparseF1" style="display:none"><label>top-k</label><input type="number" id="pSparseTopk" value="2048" min="1" step="128" oninput="applyEstimatedParams()" title="每个 query 实际参与 attention 的 KV 数量上限(DeepSeek V3.2-Exp index_topk = 2048)。&#10;pos ≤ topk 时与稠密同价; pos > topk 后每 token 的 attention 成本恒定 = b×topk。"></div>
+          <div id="sparseF2" style="display:none"><label>Indexer头数</label><input type="number" id="pIdxHeads" value="64" min="1" step="1" oninput="applyEstimatedParams()" title="Indexer 的打分头数 index_n_heads(V3.2 = 64)。用于推导 b_idx。"></div>
+          <div id="sparseF3" style="display:none"><label>Indexer头维度</label><input type="number" id="pIdxHeadDim" value="128" min="1" step="1" oninput="applyEstimatedParams()" title="Indexer 的头维度 index_head_dim(V3.2 = 128)。用于推导 b_idx。"></div>
+          <div id="sparseF4" style="display:none"><label>Indexer斜率b_idx(μs/tok²)</label><input type="number" id="pPrefillBIdx" value="0" min="0" step="0.000001" title="Indexer 扫描全历史打分的位置斜率(自动推导, 可手动覆盖)。&#10;τ(pos) = a + b×min(pos,topk) + b_idx×pos"></div>
+        </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>KV精度</label><select id="pDtype">
             <option value="2">BF16 / FP16 (2B)</option>
@@ -264,14 +274,6 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div><label>Prefill Chunk(tok)</label><input type="number" id="pChunkSize" value="2048" min="16" step="16" title="chunked-prefill 波大小(框架配置, 默认 2048=sglang 默认)。用于推导 a 的权重读分摊项"></div>
           <div><label id="lblPrefillSlots">Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)。仅连续流体模式(默认)生效; 波次组批开启后由 token 预算替代; 单批Prefill基准模式下槽位门控被跳过, 此值无效"></div>
           <div><label>Prefill token预算</label><input type="number" id="pMaxPrefillTok" value="16384" min="256" step="1024" title="sglang max_prefill_tokens(默认 16384): 每个 prefill 波次的总 token 预算; 长请求按 Prefill Chunk 切分跨波执行。仅勾选「波次组批」时生效"></div>
-        </div>
-        <!-- 稀疏注意力(2026-08-20): DS-V3.2 Indexer / V4 NSA -->
-        <div class="form-row" style="margin-top:6px">
-          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="稀疏注意力(DeepSeek V3.2 Indexer / V4 NSA): 每个 query 只对 top-k 个最相关的历史 KV 做 attention, 而非全部历史。&#10;效果: 位置成本 b 在 pos>topk 后**不再增长**——长上下文 prefill 从 O(L²) 转为 O(L·topk)。&#10;但 Indexer(选择器)本身仍需扫描全部历史 KV 打分, 这部分仍随位置线性增长(斜率 b_idx, 自动推导)。&#10;⚠️ 若忽略 b_idx 会得出'长上下文成本恒定'的错误结论: 稀疏是把 O(L²)的大系数换成 O(L²)小系数 + O(L·topk)大系数, 不是消掉二次项。"><input type="checkbox" id="pSparseAttn" style="width:auto" onchange="toggleSparseFields();applyEstimatedParams()"><label style="margin:0;font-size:.75rem" for="pSparseAttn">稀疏注意力(V3.2 Indexer/V4 NSA)</label></div>
-          <div id="sparseF1" style="display:none"><label>top-k</label><input type="number" id="pSparseTopk" value="2048" min="1" step="128" oninput="applyEstimatedParams()" title="每个 query 实际参与 attention 的 KV 数量上限(DeepSeek V3.2-Exp index_topk = 2048)。&#10;pos ≤ topk 时与稠密同价; pos > topk 后每 token 的 attention 成本恒定 = b×topk。"></div>
-          <div id="sparseF2" style="display:none"><label>Indexer头数</label><input type="number" id="pIdxHeads" value="64" min="1" step="1" oninput="applyEstimatedParams()" title="Indexer 的打分头数 index_n_heads(V3.2 = 64)。用于推导 b_idx。"></div>
-          <div id="sparseF3" style="display:none"><label>Indexer头维度</label><input type="number" id="pIdxHeadDim" value="128" min="1" step="1" oninput="applyEstimatedParams()" title="Indexer 的头维度 index_head_dim(V3.2 = 128)。用于推导 b_idx。"></div>
-          <div id="sparseF4" style="display:none"><label>Indexer斜率b_idx(μs/tok²)</label><input type="number" id="pPrefillBIdx" value="0" min="0" step="0.000001" title="Indexer 扫描全历史打分的位置斜率(自动推导, 可手动覆盖)。&#10;τ(pos) = a + b×min(pos,topk) + b_idx×pos"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b 的估计值并填入(无需实测)">🎯 自动估算 a/b</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
@@ -560,6 +562,16 @@ let models = {
     // (8/6 同时发送口径曾拟合 79.5, 分散到达实测修正; b=kvPerTok/aggHbmBW=1.1e-3 物理确定)
     // ⚠️ 2026-08-20: b 的口径已从吸收式改为解压式 MHA(降 3.4×), calibB 是更早期口径拟合值, 建议重新校准
     calibA: 216, calibB: 0.0011},
+  // DeepSeek-V3.2-Exp (2026-09 发布): 架构与 V3 相同(MLA/61层/671B-37B), 新增 DSA
+  // (DeepSeek Sparse Attention) —— lightning indexer 对全部历史 KV 打分后取 top-k,
+  // 每 query 只对 top-k 个 KV 做 attention。配置来自官方: index_n_heads=64,
+  // index_head_dim=128, index_topk=2048。
+  // ⚠️ 稀疏不是"消掉二次项": indexer 仍扫全历史 ⇒ b_idx 项积分后依然是二次, 只是系数
+  //    小得多(约完整 attention 的 20%)。收益随长度显现: 2K 约 1.0×, 32K 约 1.55×, 512K 约 4×。
+  // calibA/calibB 不继承 V3 的实测值 —— 那是稠密口径拟合的, 稀疏下由 Roofline 自动推导。
+  'DeepSeek-V3.2-Exp': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256,
+    paramsB:671, actB:37, qHeads:128, qkNope:128, vHeadDim:128,
+    sparse:true, sparseTopk:2048, idxHeads:64, idxHeadDim:128},
   'Custom':        {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:128000, paramsB:0, actB:0}
 };
 
@@ -1310,6 +1322,18 @@ function applyModel(name,el){
   // MLA 解压式 prefill 维度(2026-08-20): 0 = 回退用 headDim
   if ($('pQkNope')) $('pQkNope').value = m.qkNope||0;
   if ($('pVHeadDim')) $('pVHeadDim').value = m.vHeadDim||0;
+  // 稀疏注意力(2026-08-20): 是模型架构属性 ⇒ 随预设自动勾选/取消。
+  // ⚠️ 非稀疏模型必须**显式置 false**: 否则从 V3.2 切到 V3 后勾选残留, 会给稠密模型
+  //    套上稀疏口径(τ 的位置项被 clamp 到 topk), prefill 时间被严重低估且无任何提示。
+  if ($('pSparseAttn')) {
+    $('pSparseAttn').checked = !!m.sparse;
+    if (m.sparse) {
+      if (m.sparseTopk  != null && $('pSparseTopk'))  $('pSparseTopk').value  = m.sparseTopk;
+      if (m.idxHeads    != null && $('pIdxHeads'))    $('pIdxHeads').value    = m.idxHeads;
+      if (m.idxHeadDim  != null && $('pIdxHeadDim'))  $('pIdxHeadDim').value  = m.idxHeadDim;
+    }
+    toggleSparseFields();
+  }
   toggleMlaFields();
   // 模型有实测校准值(calibA/calibB)时优先使用(如 DS-V3 8/10 校准), 否则自动推导
   if (m.calibA != null && m.calibB != null) {
