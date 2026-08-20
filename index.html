@@ -315,6 +315,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
             <option value="hash_prefix">前缀哈希(缓存亲和)</option>
             <option value="random">随机(对照基线)</option>
           </select></div>
+          <div><label>前缀缓存亲和</label><label style="font-weight:400;font-size:.75rem;display:flex;align-items:center;gap:4px;margin-top:4px" title="仅实例数>1 时生效。&#10;关(默认): 前缀池全局一份——所有实例共享前缀缓存(相当于有全局共享 KV 存储), 前缀命中率是**保证值**, 与历史全部结论口径一致。&#10;开: 前缀池按实例隔离——命中要求'同前缀曾被路由到同一实例'。于是前缀命中率变成**理想上限**, 实际命中由路由质量决定: hash_prefix 能保住, 随机/轮询会塌陷到约 上限÷实例数。&#10;⚠️ 开启会改变命中率语义, 历史结论不可直接对比。"><input type="checkbox" id="pPrefixAffinity" onchange="recalcAll()"> 按实例隔离前缀池</label></div>
         </div>
       </div>
     </div>
@@ -668,8 +669,15 @@ function getParams(){
     // 多实例(S2, 2026-08-20): 实例数, 从 GPU 总数切分(总量守恒)。1=单实例(默认, 口径不变)。
     // 与 PD 真分离**互斥**(见 runSimulation 的 pdReal 判据): 两者都切分 GPU, 叠加语义歧义大。
     instances: Math.max(1, gi('pInstances') || 1),
-    // 路由策略(当前 S2 只实现 round_robin; least_queue/least_kv/hash 留待 S3)
+    // 路由策略(S3): round_robin/least_queue/least_kv/power_of_two/hash_prefix/random
     routePolicy: (function(){ var el = document.getElementById('pRoutePolicy'); return (el && el.value) ? el.value : 'round_robin'; })(),
+    // 前缀缓存亲和(S4, 2026-08-20): 默认**关**。
+    // 关: 前缀池全局一份 —— 所有实例共享前缀缓存(等价于有全局共享 KV 存储层),
+    //     pPrefixHit 是**保证命中率**, 与历史全部结论口径一致。
+    // 开: 前缀池按实例隔离 —— 命中要求"同前缀曾被路由到同一实例", 于是
+    //     pPrefixHit 变成**理想上限**, 实际命中由路由策略决定(随机路由会塌陷)。
+    //     这才能量化 router 的缓存亲和价值, 但会改变命中率语义 ⇒ 显式开关而非默认。
+    prefixAffinity: !!(document.getElementById('pPrefixAffinity') && document.getElementById('pPrefixAffinity').checked),
     tieredKv: gi('pTieredKv') === 1
   };
 }
@@ -2641,6 +2649,12 @@ function runSimulation(strategy, overrides) {
       // 每实例统计(S2 导出): 完成数 + 峰值队列/显存, 供负载均衡度评估
       nCompleted: 0, nRouted: 0, peakQueue: 0, peakHbm: 0, qLenSum: 0, qLenSamples: 0,
       qBusySum: 0, qBusySamples: 0,   // 仅"系统有负载"窗内的队列采样(均衡度用, 见主循环注释)
+      // S4 前缀亲和: 该实例自己的前缀缓存视图(gid → {prefixTokLen, blkIds, activated})。
+      // 亲和关闭时全部实例共用同一个对象引用(= 全局共享前缀池, 口径与历史一致);
+      // 亲和开启时每实例一份独立副本 ⇒ 命中要求"同前缀曾被路由到本实例"。
+      prefixMap: null,
+      // 每实例命中量(token 加权, S4): 用于输出各实例命中率
+      hitTok: 0, reqTok: 0,
     };
   }
 
@@ -2683,11 +2697,41 @@ function runSimulation(strategy, overrides) {
   // ⚠️ 但 curWave/prepWave/staticWaveOpen/prevDecodeL3 会被**重新赋值**, 必须写 inst.x
   //    (视图变量赋值只会改局部, 不会回写实例 —— 这是本次重构最易出错的点)。
   let inst = instances[0];
+  // 生效的路由策略: DSL 的 ROUTE 行优先, 未写则回退 UI 下拉(向后兼容)
+  // (声明位置须早于前缀预热段 —— 亲和预热要按路由策略决定各组归属哪台实例)
+  // 用 strategy 入参而非 s(后者声明在更后面) —— 两者是同一对象
+  let routePolicy = (strategy && strategy.routing && strategy.routing.type)
+    ? strategy.routing.type : (p.routePolicy || 'round_robin');
+  // 字符串 → 32bit 哈希(FNV-1a): 用于 hash_prefix 的一致性映射与亲和预热的归属判定。
+  // 必须是**确定性**的(不依赖 rng), 否则同一 prefixKey 在不同时刻会落到不同实例, 亲和性失效。
+  function hashKey(str) {
+    let h = 0x811c9dc5;
+    let t = String(str);
+    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    return h >>> 0;
+  }
+  // 请求的前缀键: 复用已有的 groupId(pfx_A/B/C/D) —— 它天然就是"同前缀请求"的标识,
+  // 无需新造。无组请求(不共享前缀)按自身 id 散列, 等价于随机分布。
+  function prefixKeyOf(req) {
+    return req.groupId ? req.groupId : ('r' + req.id);
+  }
+  // S4 前缀亲和(2026-08-20): 仅多实例时有意义 —— 单实例下"隔离"无对象可隔离。
+  let affinity = !!p.prefixAffinity && instances.length > 1;
+  // S4: 前缀池视图 —— 亲和关时全实例共享同一对象; 亲和开时指向当前实例的独立副本。
+  // 必须在此前置声明(useInstance 与前缀预热段都会用到)。
+  let prefixGroupMap = {};
   let pools = inst.pools, caps = inst.caps, links = inst.links;
   let waitQueue = inst.waitQueue, prefillQ = inst.prefillQ, prefilling = inst.prefilling;
   let kvXfer = inst.kvXfer, decodeWait = inst.decodeWait, decoding = inst.decoding;
   let groupPull = inst.groupPull;
   let effL3BW = inst.effL3BW, l3PoolBytes = inst.l3PoolBytes;
+  // 仅重绑**资源类**视图(池/容量/链路/前缀表)。供前缀预热阶段使用 —— 那时波次/队列
+  // 相关的视图变量(curWave/prepWave/prevDecodeL3)还未声明, 碰它们会 TDZ 报错。
+  function usePools(x) {
+    inst = x;
+    pools = x.pools; caps = x.caps; links = x.links;
+    if (x.prefixMap) prefixGroupMap = x.prefixMap;
+  }
   // 切换当前实例: 重绑全部视图变量(在主循环的实例遍历里调用)
   function useInstance(x) {
     inst = x;
@@ -2697,6 +2741,7 @@ function runSimulation(strategy, overrides) {
     groupPull = x.groupPull;
     effL3BW = x.effL3BW; l3PoolBytes = x.l3PoolBytes;
     curWave = x.curWave; prepWave = x.prepWave; prevDecodeL3 = x.prevDecodeL3;
+    if (x.prefixMap) prefixGroupMap = x.prefixMap;   // S4: 前缀池视图(亲和开时各实例独立)
     // 多实例下 prefill/decode 的资源视图 = 该实例自己的(单实例时 rP/rD 由 PD 逻辑决定)
     if (multiInst) { rP = x.r; rD = x.r; pP = x.p; }
   }
@@ -2783,7 +2828,6 @@ function runSimulation(strategy, overrides) {
   requests.sort((a, b) => a.arrive - b.arrive);
 
   // 前缀组分配（与旧版相同思想：4组差异化前缀，按命中率目标配比，seeded）
-  let prefixGroupMap = {};
   if (p.prefixHit > 0.001) {
     let totalInput = requests.reduce((s, r) => s + r.inputLen, 0);
     let h = Math.min(p.prefixHit, 1);                 // 命中率 h ∈ (0,1]
@@ -2840,6 +2884,20 @@ function runSimulation(strategy, overrides) {
     });
     requests.sort((a, b) => a.arrive - b.arrive);
 
+    // S4: 把前缀组表分发给各实例。
+    // 亲和关 → 全部实例共用**同一个对象引用**(全局共享前缀池, 与历史口径逐位一致);
+    // 亲和开 → 每实例一份**深拷贝**(blkIds 独立增长) ⇒ 命中要求同前缀落到同一实例。
+    instances.forEach(x => {
+      if (!affinity) { x.prefixMap = prefixGroupMap; return; }
+      let cp = {};
+      Object.keys(prefixGroupMap).forEach(gid => {
+        let g = prefixGroupMap[gid];
+        cp[gid] = { prefixTokLen: g.prefixTokLen, blkIds: [], refcount: 0, activated: false };
+      });
+      x.prefixMap = cp;
+    });
+    prefixGroupMap = instances[0].prefixMap;   // 当前视图指向实例0(useInstance 会按需重绑)
+
     // 单批 prefill 微基准(2026-08-19): 全部请求 t=0 同时到达(忽略 qps/到达分布),
     // 配合准入/槽位门控跳过 + prefill 完成即结束, 实现"单个 batch 的 prefill 操作"隔离测量
     if (p.singleBatch) requests.forEach(rq => { rq.arrive = 0; });
@@ -2852,29 +2910,76 @@ function runSimulation(strategy, overrides) {
     // 造成的假性 miss（这正是构造"L3 带宽显著影响 TTFT"场景的前提）。
     // 开关：radix + prefixHit>0 + 前缀预热勾选时生效；SSD 容量放不下该组前缀则跳过（保底 miss 路径）。
     if (p.prefixCache === 'radix' && p.prefixWarm && p.prefixHit > 0.001) {
-      Object.keys(prefixGroupMap).forEach(gid => {
-        let g = prefixGroupMap[gid];
-        let nTok = g.prefixTokLen;
-        if (nTok <= 0) return;
-        let needBytes = nTok * kvPerTok;
-        // C3 修复(2026-08-12): 注入容量口径与正常写入一致(evictThreshold=0.98),
-        // 不再按 100% 填满——避免注入即满触发后续强制淘汰(prewarmed 无淘汰保护时被误伤)
-        if (caps.ssd <= 0 || pools.ssd.used + needBytes * tierRatio.ssd > caps.ssd * evictThreshold('ssd')) return;
-        let nBlocksRaw = Math.ceil(nTok / p.blockSize);
-        let merge = Math.max(1, Math.ceil(nBlocksRaw / MAX_SIM_BLOCKS));
-        let nSimBlocks = Math.ceil(nBlocksRaw / merge);
-        let simBlockTokens = merge * p.blockSize;
-        let blkIds = [];
-        for (let b = 0; b < nSimBlocks; b++) {
-          let tokHere = Math.min(simBlockTokens, nTok - b * simBlockTokens);
-          if (tokHere <= 0) break;
-          let id = 'pw_' + gid + '_' + b;
-          poolAdd('ssd', { id: id, tokens: tokHere, size: tokHere * kvPerTok, refcount: 0,
-            available: true, arriveAt: 0, shared: true, groupId: gid, reqId: -1, lastTouch: 0, prewarmed: true });
-          blkIds.push(id);
-        }
-        if (blkIds.length) { g.blkIds = blkIds; g.activated = true; }
-      });
+      // 预热到指定实例(亲和关时只有 instances[0] 这一份全局池)
+      function warmInto(target, gmap) {
+        let prevInst = inst;
+        usePools(target);                    // 切到目标实例的池/容量视图(仅资源, 不碰波次状态)
+        Object.keys(gmap).forEach(gid => {
+          let g = gmap[gid];
+          let nTok = g.prefixTokLen;
+          if (nTok <= 0) return;
+          let needBytes = nTok * kvPerTok;
+          // C3 修复(2026-08-12): 注入容量口径与正常写入一致(evictThreshold=0.98),
+          // 不再按 100% 填满——避免注入即满触发后续强制淘汰(prewarmed 无淘汰保护时被误伤)
+          if (caps.ssd <= 0 || pools.ssd.used + needBytes * tierRatio.ssd > caps.ssd * evictThreshold('ssd')) return;
+          let nBlocksRaw = Math.ceil(nTok / p.blockSize);
+          let merge = Math.max(1, Math.ceil(nBlocksRaw / MAX_SIM_BLOCKS));
+          let nSimBlocks = Math.ceil(nBlocksRaw / merge);
+          let simBlockTokens = merge * p.blockSize;
+          let blkIds = [];
+          for (let b = 0; b < nSimBlocks; b++) {
+            let tokHere = Math.min(simBlockTokens, nTok - b * simBlockTokens);
+            if (tokHere <= 0) break;
+            // ⚠️ 块 id 必须带实例号: 亲和开启时同一组会在多个实例各热一份, id 若相同
+            // 则 findBlock 跨实例串味(它只查当前实例池, 但 id 冲突会让语义混乱)
+            // 多实例时 id 必须带实例号(共享语义下各实例也各存一份, id 不能冲突);
+            // 单实例保持原 id 格式 ⇒ 与历史逐位一致
+            let id = (instances.length > 1) ? ('pw_i' + target.id + '_' + gid + '_' + b) : ('pw_' + gid + '_' + b);
+            poolAdd('ssd', { id: id, tokens: tokHere, size: tokHere * kvPerTok, refcount: 0,
+              available: true, arriveAt: 0, shared: true, groupId: gid, reqId: -1, lastTouch: 0, prewarmed: true });
+            blkIds.push(id);
+          }
+          if (blkIds.length) { g.blkIds = blkIds; g.activated = true; }
+        });
+        usePools(prevInst);
+      }
+      if (!affinity) {
+        // 全局共享前缀缓存(默认): 语义是"所有实例都能看到同一份前缀 KV"(相当于有全局共享
+        // 存储层)。实现上 pools 仍按实例隔离(findBlock 只查当前实例池), 故必须给**每个实例**
+        // 都注入一份预热块 —— 否则只有实例 0 能命中, 其余实例 findBlock 返回 null,
+        // 命中率会随实例数虚假下降(h=80%/4实例 实测掉到 19.6%)。
+        // 块 id 带实例号避免跨实例串味; prefixMap 仍是共享对象, 故 blkIds 由最后一次写入
+        // 覆盖 —— 但各实例 findBlock 时只认自己池里的那些 id, 因此需要 id 与实例对应。
+        // ⇒ 亲和关时也按实例生成 id, 但 blkIds 存**每实例各自的** id 列表。
+        instances.forEach(x => {
+          if (instances.length === 1) { warmInto(x, prefixGroupMap); return; }
+          // 多实例 + 共享语义: 每实例独立一份 prefixMap 承载自己的 blkIds(内容相同、id 不同),
+          // 命中判定因此对所有实例都成立 ⇒ 等价于"全局共享前缀缓存"
+          let cp = {};
+          Object.keys(prefixGroupMap).forEach(gid => {
+            let g = prefixGroupMap[gid];
+            cp[gid] = { prefixTokLen: g.prefixTokLen, blkIds: [], refcount: 0, activated: false };
+          });
+          x.prefixMap = cp;
+          warmInto(x, cp);
+        });
+        prefixGroupMap = instances[0].prefixMap;
+      } else {
+        // 亲和开启: 预热块代表"历史同前缀流量在该实例留下的缓存"。
+        // 关键语义 —— 一个组的前缀只会热到它**按当前路由策略应当归属**的那台实例:
+        //  · hash_prefix: 归属确定(hash(gid) % n) ⇒ 该组请求必落到有缓存的那台 ⇒ 命中保住
+        //  · 其他策略: 归属不可预知, 用 hash 选一台作为"历史上恰好落在那里"的代表 ⇒
+        //    后续请求只有 1/n 概率落到有缓存的实例 ⇒ 命中率≈理想÷实例数(随机路由的塌陷)
+        // 这样 pPrefixHit 就从"保证值"变成"上限", 实际命中由路由质量决定 —— 正是 S4 的目的。
+        // (若给每台都热全部组, 等价于每台都有完整缓存, 任何策略都满命中, 无法体现路由差异)
+        instances.forEach(x => {
+          let own = {};
+          Object.keys(x.prefixMap).forEach(gid => {
+            if ((hashKey(gid) % instances.length) === x.id) own[gid] = x.prefixMap[gid];
+          });
+          warmInto(x, own);
+        });
+      }
     }
   }
 
@@ -2918,8 +3023,6 @@ function runSimulation(strategy, overrides) {
   // 契约: 输入请求, 返回目标实例对象。只允许读**当前**可观测量(队列长度/KV 占用),
   // 不得读未来状态(否则成了"先知路由", 结论无参考价值)。
   let _rrCursor = 0;
-  // 生效的路由策略: DSL 的 ROUTE 行优先, 未写则回退 UI 下拉(向后兼容)
-  let routePolicy = (s.routing && s.routing.type) ? s.routing.type : (p.routePolicy || 'round_robin');
   // 实例在途负载(请求数): 路由决策的主要可观测量。
   // 用"在途请求数"而非仅 waitQueue —— 排队中 + 正在算 + 正在传 + 正在解码都占该实例资源。
   function instLoad(x) {
@@ -2929,19 +3032,6 @@ function runSimulation(strategy, overrides) {
   // 实例 KV 压力(0~1): HBM 已用 / 可用容量。容量为 0(权重装不下)时视为满载。
   function instKvPressure(x) {
     return x.caps.hbm > 0 ? x.pools.hbm.used / x.caps.hbm : 1;
-  }
-  // 字符串 → 32bit 哈希(FNV-1a): 用于 hash_prefix 的一致性映射。
-  // 必须是**确定性**的(不依赖 rng), 否则同一 prefixKey 在不同时刻会落到不同实例, 亲和性失效。
-  function hashKey(str) {
-    let h = 0x811c9dc5;
-    let t = String(str);
-    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
-    return h >>> 0;
-  }
-  // 请求的前缀键: 复用已有的 groupId(pfx_A/B/C/D) —— 它天然就是"同前缀请求"的标识,
-  // 无需新造。无组请求(不共享前缀)按自身 id 散列, 等价于随机分布。
-  function prefixKeyOf(req) {
-    return req.groupId ? req.groupId : ('r' + req.id);
   }
   function routeRequest(req) {
     if (instances.length === 1) return instances[0];
@@ -3095,6 +3185,11 @@ function runSimulation(strategy, overrides) {
     let _statL1 = _rawFast > 0 ? _rest * (hbmCoveredTok / _rawFast) : 0;
     let _statL2 = _rest - _statL1;
     stats.hitTokL1 += _statL1; stats.hitTokL2 += _statL2; stats.hitTokL3 += _statL3;
+    // S4: 每实例命中量(token 加权) —— 用于输出各实例命中率与路由亲和效果
+    if (instances[req.instId || 0]) {
+      instances[req.instId || 0].hitTok += coveredTok;
+      instances[req.instId || 0].reqTok += req.inputLen;
+    }
     // miss = 需 GPU 重算的 token(与下方 req.prefillTokens 同口径); 分母 = 请求输入长度
     stats.missTok += Math.max(0, req.inputLen - coveredTok);
     stats.reqTokTotal += req.inputLen;
@@ -4350,7 +4445,7 @@ function runSimulation(strategy, overrides) {
     multi: instances.length > 1 ? {
       count: instances.length,
       routePolicy: routePolicy,          // 实际生效的策略(DSL ROUTE 行 > UI 下拉)
-      routeFromDsl: !!(s.routing && s.routing.type),
+      routeFromDsl: !!(strategy && strategy.routing && strategy.routing.type),
       routeHook: !!jsRoute,              // 是否被 JS route() 钩子接管
       gpusPerInst: instances.map(x => x.gpus),
       // 每实例明细: 路由到的请求数 / 完成数 / 平均与峰值在途队列 / HBM 峰值占用(GB)
@@ -4386,7 +4481,18 @@ function runSimulation(strategy, overrides) {
       })(),
       // 校验用: Σ每实例完成 应 == 全局 completed
       sumCompleted: instances.reduce((a, x) => a + x.nCompleted, 0),
-      sumRouted: instances.reduce((a, x) => a + x.nRouted, 0)
+      sumRouted: instances.reduce((a, x) => a + x.nRouted, 0),
+      // S4 前缀亲和(2026-08-20)
+      affinity: affinity,
+      // 各实例实测命中率(%, token 加权)
+      instHitRate: instances.map(x => x.reqTok > 0 ? x.hitTok / x.reqTok * 100 : 0),
+      // 命中率损失: 输入 h(理想上限) 与全局实测的差值(个百分点)。
+      // 亲和开启后这个差值 = 路由质量的直接代价 —— hash_prefix 接近 0, random 接近 h×(1-1/n)
+      hitIdeal: p.prefixHit * 100,
+      hitActual: stats.reqTokTotal > 0
+        ? (stats.hitTokL1 + stats.hitTokL2 + stats.hitTokL3) / stats.reqTokTotal * 100 : 0,
+      hitLossPct: stats.reqTokTotal > 0
+        ? p.prefixHit * 100 - (stats.hitTokL1 + stats.hitTokL2 + stats.hitTokL3) / stats.reqTokTotal * 100 : 0
     } : null,
     // PD 真分离指标(2026-08-20): 仅 pdMode=2 时有效
     pd: p.pdMode === 2 && instances.length === 1 ? {
@@ -4521,6 +4627,14 @@ function drawStrategyMetrics() {
       ['各实例完成数', sr.multi ? sr.multi.perInst.map(x => x.completed).join(' / ') : '—', 'accent'],
       ['各实例在途(busy窗)', sr.multi ? sr.multi.perInst.map(x => x.busyQueue.toFixed(1)).join(' / ') : '—', 'orange'],
       ['各实例峰值队列', sr.multi ? sr.multi.perInst.map(x => x.peakQueue).join(' / ') : '—', 'orange'],
+      // S4 前缀亲和(2026-08-20): 亲和开启后命中率从"保证值"变成"路由的输出"
+      ['前缀亲和', sr.multi ? (sr.multi.affinity ? '开(按实例隔离)' : '关(全局共享)') : '—',
+        sr.multi && sr.multi.affinity ? 'orange' : 'accent'],
+      ['命中率(实测/上限)', sr.multi ? sr.multi.hitActual.toFixed(1)+'% / '+sr.multi.hitIdeal.toFixed(0)+'%' : '—',
+        sr.multi && sr.multi.hitLossPct > 20 ? 'red' : (sr.multi && sr.multi.hitLossPct > 5 ? 'orange' : 'green')],
+      ['路由命中损失', sr.multi ? sr.multi.hitLossPct.toFixed(1)+' pp' : '—',
+        sr.multi && sr.multi.hitLossPct > 20 ? 'red' : (sr.multi && sr.multi.hitLossPct > 5 ? 'orange' : 'green')],
+      ['各实例命中率', sr.multi ? sr.multi.instHitRate.map(x => x.toFixed(0)+'%').join(' / ') : '—', 'accent'],
       ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
       ['Decode 计算/pass(独立)', sr.passMs ? (sr.passMs.hbm+sr.passMs.cmp+sr.passMs.comm).toFixed(2)+' ms' : '—', 'accent'],
       ['吞吐', formatNum(sr.throughput)+' tok/s', 'green'],
