@@ -451,7 +451,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         </div>
       </div>
       <div><label>④ 观察指标(纵轴)</label><select id="sSweepMetric">
-        <option value="hit_rate">HBM命中率(%)</option><option value="latency">平均延迟(ms)</option><option value="latency_p50">延迟P50(ms)</option><option value="p99_latency">延迟P99(ms)</option>
+        <option value="hit_rate">HBM命中率(%)</option><option value="prefix_hit_rate">前缀命中率实测(%)</option><option value="latency">平均延迟(ms)</option><option value="latency_p50">延迟P50(ms)</option><option value="p99_latency">延迟P99(ms)</option>
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
         <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
@@ -4390,7 +4390,11 @@ function runSimulation(strategy, overrides) {
 
   // ---------- 指标 ----------
   let totalAcc = stats.hbmAcc + stats.dramAcc + stats.ssdAcc;
-  let hitRate = totalAcc > 0 ? stats.hbmAcc / totalAcc * 100 : 0;
+  // ⚠️ 命名(2026-08-20 修 bug): 这是**HBM 访问命中率**(hbmAcc/总访问), 与下方的
+  // hitRate(分层**前缀**命中率对象) 是两回事。此前两者同名 ⇒ 返回对象字面量里
+  // 后定义的对象覆盖了前面的数字, UI 的 sr.hitRate.toFixed(1) 直接报
+  // 'toFixed is not a function'。故老字段改名 hbmHitRate。
+  let hbmHitRate = totalAcc > 0 ? stats.hbmAcc / totalAcc * 100 : 0;
   let sortedLats = stats.latencies.slice().sort((a, b) => a - b);
   let p50 = sortedLats.length ? sortedLats[Math.floor(sortedLats.length * 0.5)] : 0;
   let p99 = sortedLats.length ? sortedLats[Math.min(sortedLats.length - 1, Math.floor(sortedLats.length * 0.99))] : 0;
@@ -4421,7 +4425,7 @@ function runSimulation(strategy, overrides) {
 
   return {
     name: strategy.name || autoNameStrategy(strategy),
-    hitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
+    hbmHitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
     throughput: stats.outTokens / simEnd,
     memUtilAvg: stats.memUtilSamples ? stats.memUtilSum / stats.memUtilSamples * 100 : 0,
     memUtilPeak: stats.memUtilPeak * 100,
@@ -4571,7 +4575,7 @@ function runSimulation(strategy, overrides) {
     completed: stats.completed, totalReqs: N + followUpCount,
     truncated: truncated, simEnd: simEnd, drainEst: drainEst, // 截断标志 + 仿真结束时间 + 排水估计(截断时建议上限值)
     latencies: stats.latencies, timeline: timeline, concTimeline: stats.concSamples,
-    incomplete: incomplete, simEnd: simEnd,
+    incomplete: incomplete,   // (simEnd 已在上一行给出, 此处原有重复 key 已删 —— 2026-08-20)
     admission: strategy.admission.type, eviction: strategy.eviction.type, prefetch: strategy.prefetch.type,
   };
 }
@@ -4619,7 +4623,7 @@ function drawStrategyMetrics() {
   simResults.forEach(sr => {
     rows.push('<div style="grid-column:1/-1;font-size:.78rem;color:var(--accent);margin-bottom:2px;border-bottom:1px solid var(--border);padding-bottom:4px;margin-top:8px">📌 '+sr.name+'</div>');
     let items = [
-      ['HBM命中率', sr.hitRate.toFixed(1)+'%', 'green'],
+      ['HBM命中率', (sr.hbmHitRate != null ? sr.hbmHitRate : 0).toFixed(1)+'%', 'green'],
       ['TTFT(均值)', sr.avgTtft.toFixed(0)+' ms', 'accent'],
       ['TTFT(P50)', sr.p50Ttft.toFixed(0)+' ms', 'accent'],
       ['TTFT(P99)', sr.p99Ttft.toFixed(0)+' ms', 'orange'],
@@ -4808,7 +4812,7 @@ function drawStrategyComparisonGantt() {
       { type: 'value', name: '延迟(ms)', axisLabel: { color: '#9ca0b0' } }
     ],
     series: [
-      { name: 'HBM命中率(%)', type: 'bar', data: simResults.map(s => +s.hitRate.toFixed(1)), itemStyle: { color: '#34d399' } },
+      { name: 'HBM命中率(%)', type: 'bar', data: simResults.map(s => +(s.hbmHitRate || 0).toFixed(1)), itemStyle: { color: '#34d399' } },
       { name: '显存利用率峰值(%)', type: 'bar', data: simResults.map(s => +s.memUtilPeak.toFixed(1)), itemStyle: { color: '#fb923c' } },
       { name: 'P50延迟(ms)', type: 'line', yAxisIndex: 1, data: simResults.map(s => +s.p50.toFixed(0)), itemStyle: { color: '#6c63ff' }, lineStyle: { color: '#6c63ff', width: 2 } },
       { name: 'P99延迟(ms)', type: 'line', yAxisIndex: 1, data: simResults.map(s => +s.p99.toFixed(0)), itemStyle: { color: '#f87171' }, lineStyle: { color: '#f87171', width: 2 } },
@@ -4842,7 +4846,9 @@ function extractSensMetrics(r) {
   let tt = b ? (b.queue + b.prefillQ + b.fetch + b.compute) : 0;
   return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
     tpot_p50: r.p50Tpot, tpot_p99: r.p99Tpot, latency: r.avgLatency, latency_p50: r.p50,
-    throughput: r.throughput, hit_rate: r.hitRate, mem_util: r.memUtilPeak, p99_latency: r.p99,
+    // hit_rate 保持"HBM 访问命中率"语义(历史敏感性/导出口径); 前缀分层命中率见 prefix_hit_rate
+    throughput: r.throughput, hit_rate: r.hbmHitRate, mem_util: r.memUtilPeak, p99_latency: r.p99,
+    prefix_hit_rate: r.hitRate ? r.hitRate.total : 0,
     fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0 };  // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
 }
 
@@ -4918,7 +4924,7 @@ function runSensitivity() {
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)'}[metric];
+  let metricLabel = {hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)'}[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
   // ③ 预取策略（第三维=节点形状）：勾选的要对比的策略；prefetch.type 映射 wait_complete→none
