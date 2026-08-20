@@ -304,6 +304,13 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
             <option value="0">全量kvPerToken</option>
           </select></div>
         </div>
+        <!-- 多实例 + Router(S2, 2026-08-20): 实例数 >1 时从 GPU 总数切分, 与 PD 真分离互斥 -->
+        <div class="form-row" style="margin-top:6px">
+          <div><label>实例数</label><input type="number" id="pInstances" value="1" min="1" onchange="togglePdPanel()" title="部署几个独立推理实例(每个实例 = 一台机器: 独立算力/HBM/KV池/队列/PCIe/NVMe)。&#10;资源从 GPU 总数切分: 8 卡 + 实例数 2 ⇒ 每实例 4 卡; DRAM/SSD/PCIe/NVMe 带宽按实例数均分(总量守恒)。&#10;1 = 单实例(默认, 与历史口径完全一致)。&#10;⚠️ 实例数 >1 时 PD 真分离自动降级为混合批(两者都切分 GPU, 叠加语义歧义大)。"></div>
+          <div><label>路由策略</label><select id="pRoutePolicy" title="请求到达时如何选择实例。当前仅实现轮询(round_robin); 最短队列/缓存亲和等待 S3。">
+            <option value="round_robin" selected>轮询(round robin)</option>
+          </select></div>
+        </div>
       </div>
     </div>
     <button class="btn" onclick="recalcAll()" style="margin-top:12px">🔄 重新计算全部</button>
@@ -653,6 +660,11 @@ function getParams(){
     pdLinkBW: Math.max(1, gv('pPdLinkBW') || 400),
     pdLinkUtil: (function(){ var v = gv('pPdLinkUtil'); return v > 0 && v <= 1 ? v : 0.7; })(),
     pdKvComp: (function(){ var el = document.getElementById('pPdKvComp'); return el ? gi('pPdKvComp') === 1 : true; })(),
+    // 多实例(S2, 2026-08-20): 实例数, 从 GPU 总数切分(总量守恒)。1=单实例(默认, 口径不变)。
+    // 与 PD 真分离**互斥**(见 runSimulation 的 pdReal 判据): 两者都切分 GPU, 叠加语义歧义大。
+    instances: Math.max(1, gi('pInstances') || 1),
+    // 路由策略(当前 S2 只实现 round_robin; least_queue/least_kv/hash 留待 S3)
+    routePolicy: (function(){ var el = document.getElementById('pRoutePolicy'); return (el && el.value) ? el.value : 'round_robin'; })(),
     tieredKv: gi('pTieredKv') === 1
   };
 }
@@ -1307,6 +1319,34 @@ function renderFeasibility(p, r){
   let box = $('feasibilityBox'); if (!box) return;
   let errs = [], warns = [], infos = [];
   let totalHbm = r.totalHbm, wBytes = r.modelWeightBytes;
+
+  // ⓪ 多实例可行性(S2, 2026-08-20): 资源从 GPU 总数切分后, **每个实例**都必须能装下整份权重
+  //    (每实例是一台独立机器, 各自加载完整模型 —— 不是把权重切给不同实例)。
+  //    这是多实例最容易踩的坑: 8卡能跑 671B, 但拆成 4 实例×2卡后每实例只有 192GB, 权重装不下。
+  //    引擎在 availHbm=0 时不会崩, 会跑出"看似正常"的结果 ⇒ 必须显式报错。
+  let nInst = Math.max(1, Math.min(p.instances || 1, Math.max(1, p.gpus)));
+  if (nInst > 1) {
+    let gPer = Math.floor(p.gpus / nInst);
+    let hbmPer = gPer * p.hbmPerGpu * 1e9;
+    if (gPer < 1) {
+      errs.push('<b>实例数超过卡数</b>：'+nInst+' 个实例 > '+p.gpus+' 张卡，每实例至少需 1 张卡。');
+    } else if (wBytes >= hbmPer) {
+      errs.push('<b>多实例下权重装不下</b>：每实例 '+gPer+' 卡 = '+formatBytes(hbmPer)+
+        '，但权重 '+formatBytes(wBytes)+' ≥ 该容量。每个实例都要加载**完整模型**（实例间不共享权重）。'+
+        '当前配置最多可开 '+Math.max(1, Math.floor(p.gpus / Math.ceil(wBytes/(p.hbmPerGpu*1e9))))+
+        ' 个实例，或降低权重精度/换更小模型。');
+    } else {
+      let availPer = Math.max(0, hbmPer - wBytes - (gPer * 6e9 + wBytes * 0.02));
+      if (availPer <= 0) {
+        errs.push('<b>多实例下 KV 无空间</b>：每实例 '+gPer+' 卡（'+formatBytes(hbmPer)+
+          '）装完权重与固定开销后 KV 可用 = 0。减少实例数或增加卡数。');
+      } else {
+        infos.push('多实例：'+nInst+' 实例 × '+gPer+' 卡，每实例 KV 可用 '+formatBytes(availPer)+
+          '（DRAM/SSD/PCIe/NVMe 带宽按实例数均分）。'+
+          (p.pdMode === 2 ? ' ⚠️ PD 真分离已自动降级为混合批（与多实例互斥）。' : ''));
+      }
+    }
+  }
 
   // ① 权重本身是否装得下(最硬的约束)
   if (wBytes >= totalHbm) {
@@ -2500,7 +2540,14 @@ function runSimulation(strategy, overrides) {
   // ⚠️ a/b 必须按 P 的卡数**重算**: estimatePrefillParams 内 peakFlops = tflops×gpus、
   //    aggHbmBW = hbmBW×gpus —— 输入框里的 a/b 是按**总卡数**拟合的, 直接拿给 4 卡的 P 用
   //    会让 prefill 速度错一整个倍数(见 MEMORY: a/b 是 prefill 速度的唯一权威)。
-  let pdReal = p.pdMode === 2;
+  // ---------- 多实例(S2, 2026-08-20) 与 PD 真分离 互斥 ----------
+  // 两者都从 GPU 总数切分资源, 叠加会让状态维度乘开(N 实例 × 每个再 P/D 划分),
+  // 且"哪一层先分"的语义歧义大。故约定: 多实例优先, 开多实例时 PD 降级为混合批。
+  // instShare = 实例数, 用于把 DRAM/SSD/PCIe/NVMe 这些**整机资源**按实例数均分
+  // (HBM 已随卡数由 calcAll 自然缩放, 不在此处除)。
+  let instShare = Math.max(1, Math.min(p.instances || 1, Math.max(1, p.gpus)));
+  let multiInst = instShare > 1;
+  let pdReal = p.pdMode === 2 && !multiInst;
   let rP = r, rD = r, pP = p;
   let pdPrefillGpus = p.gpus, pdDecodeGpus = p.gpus;   // 非真分离: 两阶段都用全部卡(口径不变)
   if (pdReal) {
@@ -2522,9 +2569,6 @@ function runSimulation(strategy, overrides) {
   let kvPerTok = r.kvPerToken;
   let blockBytes = r.blockBytes;
   let tierRatio = { hbm: 1, dram: p.tierQuant, ssd: p.tierQuant };
-  let caps = { hbm: r.availHbm, dram: p.tieredKv ? r.dramTotal : 0, ssd: p.tieredKv ? r.ssdTotal : 0 };
-  let pools = {};
-  ['hbm','dram','ssd'].forEach(t => pools[t] = { blocks: [], blockIndex: {}, used: 0, cap: caps[t], accessOrder: [], freq: {} });
 
   const DT = 0.002;                 // 时间步长 2ms(原 20ms): fetchTime 亚步长分辨率——原 20ms 使 fetchTime<20ms 时
   // 被量化为 1 步, L3 带宽 >90GB/s 后 TTFT 假性饱和(带宽提升不再体现)。2ms 可分辨到 ~500GB/s。
@@ -2532,6 +2576,57 @@ function runSimulation(strategy, overrides) {
   const MAX_SIM_BLOCKS = 256;      // 单请求仿真块数上限（超出合并为超级块）
   const PREFILL_UTIL_CAP = 0.9;    // 并行 prefill 利用率上限：单请求利用率≈MFU，并行 batch 把 GPU 填满至该上限
   // decode 每请求开销见顶层 perReqMs()（校准: Qwen3-32B 单卡 6.4×n^0.75; DS-V3 8卡 5.2+3.7×n^0.75）
+
+  // ================= 实例状态容器(S1, 2026-08-20) =================
+  // 多实例 router 的基础: 把"一台推理实例"的全部私有状态收进一个对象。
+  // 单实例(instances.length===1)时行为与改造前**逐位一致** —— 这是零回归的保证。
+  //
+  // 设计要点:
+  //  · 资源(pools/caps/links/effL3BW) 与 队列(waitQueue..decoding) 与 波次(curWave/prepWave/
+  //    staticWaveOpen) 与 拉取单飞(groupPull) 都是实例私有 —— 两台实例的显存/队列互不可见
+  //  · now/DT/step/rng/pending/stats 保持**全局共享**: 共享时间轴是 router 能观测各实例
+  //    实时队列长度的前提(若各实例独立走时间轴, 最短队列/cache-aware 路由无法表达)
+  //  · 数组容器全程**原地修改**(push/splice), 故主循环可用局部视图变量绑定, 无需处处写 inst.;
+  //    但 curWave/prepWave/staticWaveOpen/prevDecodeL3 会被**重新赋值**, 必须走 inst.x
+  function makeInstance(instId, instGpus) {
+    // 该实例自己的资源视图: 从 GPU 总数切分(总量守恒), 沿用 PD 真分离的 calcAll 换卡数手法
+    let iP = instGpus === p.gpus ? p : Object.assign({}, p,
+      { gpus: instGpus, tpSize: Math.min(p.tpSize || instGpus, instGpus) });
+    let iR = instGpus === p.gpus ? r : calcAll(iP);
+    // 分层容量: HBM 随卡数缩放(calcAll 已算), DRAM/SSD 按实例数均分(一台机器的内存/盘由本实例独占)
+    let iCaps = { hbm: iR.availHbm,
+      dram: p.tieredKv ? iR.dramTotal / instShare : 0,
+      ssd:  p.tieredKv ? iR.ssdTotal / instShare : 0 };
+    let iPools = {};
+    ['hbm','dram','ssd'].forEach(t => iPools[t] = { blocks: [], blockIndex: {}, used: 0, cap: iCaps[t], accessOrder: [], freq: {} });
+    // 跨层链路：L2(PCIe/C2C) 与 L3(NVMe) 各为一条共享总线——
+    // 物理上 PCIe/NVMe 是双向共享带宽的，故 hbm↔dram 双向共用 busyUntil(L2)，
+    // dram↔ssd 双向共用 busyUntil(L3)。传输(预取/淘汰)与 decode 读(见 decode 段)
+    // 都在同一总线上串行排队——竞争带宽，先到先服务。
+    // 多实例: 每实例一条独立总线(各自的 PCIe/NVMe), 带宽按实例数均分
+    let iLinks = {
+      'hbm>dram': { bw: Math.min(p.pcieBW, p.dramBW) * 1e9 / instShare, busyUntil: 0 },
+      'dram>hbm': { bw: Math.min(p.pcieBW, p.dramBW) * 1e9 / instShare, busyUntil: 0 },
+      'dram>ssd': { bw: p.ssdBW * 1e9 / instShare, busyUntil: 0 },
+      'ssd>dram': { bw: p.ssdBW * 1e9 / instShare, busyUntil: 0 },
+    };
+    iLinks['hbm>dram'].shared = iLinks['dram>hbm'];
+    iLinks['dram>hbm'].shared = iLinks['hbm>dram'];
+    iLinks['dram>ssd'].shared = iLinks['ssd>dram'];
+    iLinks['ssd>dram'].shared = iLinks['dram>ssd'];
+    let iEffL3 = p.ssdBW * 1e9 * 0.9 / instShare;
+    // PD 真分离的 P/D 资源视图(与多实例互斥, 见 pdReal 计算): 单实例时沿用全局 rP/rD/pP
+    return {
+      id: instId, gpus: instGpus, p: iP, r: iR,
+      pools: iPools, caps: iCaps, links: iLinks,
+      effL3BW: iEffL3, l3PoolBytes: iEffL3 * DT, prevDecodeL3: 0,
+      waitQueue: [], prefillQ: [], prefilling: [], kvXfer: [], decodeWait: [], decoding: [],
+      staticWaveOpen: true, curWave: null, prepWave: null,
+      groupPull: {},
+      // 每实例统计(S2 导出): 完成数 + 峰值队列/显存, 供负载均衡度评估
+      nCompleted: 0, nRouted: 0, peakQueue: 0, peakHbm: 0, qLenSum: 0, qLenSamples: 0,
+    };
+  }
 
   let now = 0;
   let inFlight = [];
@@ -2559,6 +2654,36 @@ function runSimulation(strategy, overrides) {
     // 不是命中率——不能当命中率用(命中 1% 与 99% 的请求会被等价计数)。
     // 守恒: hitTokL1 + hitTokL2 + hitTokL3 + missTok == reqTokTotal
     hitTokL1: 0, hitTokL2: 0, hitTokL3: 0, missTok: 0, reqTokTotal: 0 };
+
+  // ---------- 实例数组与"当前实例"视图(S1/S2, 2026-08-20) ----------
+  // 从 GPU 总数切分: gpusPerInst = floor(gpus/instShare), 余数分给前几个实例(总量守恒)。
+  let instances = [];
+  {
+    let base = Math.floor(p.gpus / instShare), rem = p.gpus % instShare;
+    for (let ii = 0; ii < instShare; ii++) instances.push(makeInstance(ii, base + (ii < rem ? 1 : 0)));
+  }
+  // 主循环逐实例处理时, 用下列**视图变量**指向当前实例的容器 —— 数组全程原地修改
+  // (push/splice), 故绑定引用即可, 无需把主循环里几百处 `prefillQ` 改写为 `inst.prefillQ`。
+  // ⚠️ 但 curWave/prepWave/staticWaveOpen/prevDecodeL3 会被**重新赋值**, 必须写 inst.x
+  //    (视图变量赋值只会改局部, 不会回写实例 —— 这是本次重构最易出错的点)。
+  let inst = instances[0];
+  let pools = inst.pools, caps = inst.caps, links = inst.links;
+  let waitQueue = inst.waitQueue, prefillQ = inst.prefillQ, prefilling = inst.prefilling;
+  let kvXfer = inst.kvXfer, decodeWait = inst.decodeWait, decoding = inst.decoding;
+  let groupPull = inst.groupPull;
+  let effL3BW = inst.effL3BW, l3PoolBytes = inst.l3PoolBytes;
+  // 切换当前实例: 重绑全部视图变量(在主循环的实例遍历里调用)
+  function useInstance(x) {
+    inst = x;
+    pools = x.pools; caps = x.caps; links = x.links;
+    waitQueue = x.waitQueue; prefillQ = x.prefillQ; prefilling = x.prefilling;
+    kvXfer = x.kvXfer; decodeWait = x.decodeWait; decoding = x.decoding;
+    groupPull = x.groupPull;
+    effL3BW = x.effL3BW; l3PoolBytes = x.l3PoolBytes;
+    curWave = x.curWave; prepWave = x.prepWave; prevDecodeL3 = x.prevDecodeL3;
+    // 多实例下 prefill/decode 的资源视图 = 该实例自己的(单实例时 rP/rD 由 PD 逻辑决定)
+    if (multiInst) { rP = x.r; rD = x.r; pP = x.p; }
+  }
 
   function sizeInTier(blk, tier) { return blk.size * tierRatio[tier]; }
 
@@ -2588,24 +2713,8 @@ function runSimulation(strategy, overrides) {
     pool.freq[blkId] = (pool.freq[blkId] || 0) + 1;
   }
 
-  // 跨层链路：L2(PCIe/C2C) 与 L3(NVMe) 各为一条共享总线——
-  // 物理上 PCIe/NVMe 是双向共享带宽的，故 hbm↔dram 双向共用 busyUntil(L2)，
-  // dram↔ssd 双向共用 busyUntil(L3)。传输(预取/淘汰)与 decode 读(见 decode 段)
-  // 都在同一总线上串行排队——竞争带宽，先到先服务。
-  let links = {
-    'hbm>dram': { bw: Math.min(p.pcieBW, p.dramBW) * 1e9, busyUntil: 0 },
-    'dram>hbm': { bw: Math.min(p.pcieBW, p.dramBW) * 1e9, busyUntil: 0 },
-    'dram>ssd': { bw: p.ssdBW * 1e9, busyUntil: 0 },
-    'ssd>dram': { bw: p.ssdBW * 1e9, busyUntil: 0 },
-  };
-  // 双向共享同一总线：L2 = hbm>dram 与 dram>hbm; L3 = dram>ssd 与 ssd>dram
-  links['hbm>dram'].shared = links['dram>hbm'];
-  links['dram>hbm'].shared = links['hbm>dram'];
-  links['dram>ssd'].shared = links['ssd>dram'];
-  links['ssd>dram'].shared = links['dram>ssd'];
-  // 前缀拉取单飞状态(2026-08-18, pFetchCoalesce 开关): gid → 该组前缀 L3 拉取的完成时刻
-  // (完成或在飞)。开启后同组请求共享一次拉取(HiCache 单飞/去重); 关闭=每请求独立重拉
-  let groupPull = {};
+  // 跨层链路(L2 PCIe/C2C + L3 NVMe)与前缀拉取单飞状态已下沉到 makeInstance —— 每实例
+  // 一条独立总线/一份单飞表。主循环通过 links / groupPull 视图变量访问当前实例的那份。
   let coalesce = !!p.fetchCoalesce;
   function scheduleTransfer(blk, from, to) {
     let link = links[from + '>' + to];
@@ -2788,10 +2897,20 @@ function runSimulation(strategy, overrides) {
   }
 
   let s = strategy;
-  let waitQueue = [], prefillQ = [], decoding = [], decodeWait = [], completedReqs = [];
-  let prefilling = [], staticWaveOpen = true;
+  // ---- 路由策略(S2: 轮询; S3 扩展) ----
+  // 契约: 输入请求, 返回目标实例对象。只允许读**当前**可观测量(队列长度/KV 占用),
+  // 不得读未来状态(否则成了"先知路由", 结论无参考价值)。
+  let _rrCursor = 0;
+  function routeRequest(req) {
+    if (instances.length === 1) return instances[0];
+    switch (p.routePolicy) {
+      case 'round_robin':
+      default:
+        return instances[_rrCursor++ % instances.length];
+    }
+  }
+  let completedReqs = [];
   // PD 真分离(2026-08-20): prefill 完成后等待 KV 从 P 传到 D 的队列(仅 pdReal 时非空)
-  let kvXfer = [];
   // P→D 互联有效带宽(B/s) = 标称 × 利用率
   let pdLinkEffBW = Math.max(p.pdLinkBW * 1e9 * p.pdLinkUtil, 1);
   // 每请求需跨节点搬运的 KV 字节数。
@@ -3232,6 +3351,8 @@ function runSimulation(strategy, overrides) {
     let _dT = Math.max(0, req.completeTime - (req.decodeStart || _kvReady));
     stats.latDw += _dW; stats.latDt += _dT;
     stats.completed++; stats.outTokens += req.outputLen;
+    // 每实例完成计数(S2): 按请求被路由到的实例归属(不用当前 inst, 更稳)
+    if (instances[req.instId || 0]) instances[req.instId || 0].nCompleted++;
     if (timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
       prefillStart: req.prefillStart, prefillEnd: req.prefillEnd, completeTime: now });
 
@@ -3310,7 +3431,11 @@ function runSimulation(strategy, overrides) {
   // 剩余排水估计：基于当前未完成请求（排队/在飞/decode），供窗口自动延长使用。
   // 与 drainEst 同口径（位置感知 prefill + 分波 decode），保证延长量覆盖剩余工作
   function estimateRemainingDrain() {
-    let all = pending.concat(waitQueue, prefillQ, prefilling, kvXfer, decodeWait, decoding);
+    let all = pending.slice();
+    for (let ii = 0; ii < instances.length; ii++) {
+      let xi = instances[ii];
+      all = all.concat(xi.waitQueue, xi.prefillQ, xi.prefilling, xi.kvXfer, xi.decodeWait, xi.decoding);
+    }
     let pf = 0, remTok = 0;
     for (let q of all) {
       let L = Math.max(0, (q._pfTotal || q.inputLen || 0) - (q._pfDone || 0));
@@ -3324,16 +3449,17 @@ function runSimulation(strategy, overrides) {
   // L3 统一共享池(2026-08-18, 问题②修复): prefill 拉取与 decode L3 读共享同一条 NVMe
   // 总线——decode 按需读优先(全速), prefill 拉取使用剩余带宽(替代原独立 l3FetchBudget
   // 池与 busyUntil 双通道互不排队的旧模型)
-  let effL3BW = p.ssdBW * 1e9 * 0.9;
-  let l3PoolBytes = effL3BW * DT;   // 每步 L3 容量池(字节)
-  let prevDecodeL3 = 0;             // 上一步 decode L3 读需求(字节/步), 从拉取预算中扣除(2ms 滞后)
+  // (2026-08-20 S1: effL3BW / l3PoolBytes 已下沉到 makeInstance, 每实例一条 NVMe;
+  //  上方视图变量已绑定当前实例的值, 此处不再重复声明)
+  // 下列三者是**实例私有且会被重新赋值**的状态: 声明为视图变量便于读取, 写入必须走 inst.x
+  let prevDecodeL3 = inst.prevDecodeL3;   // 上一步 decode L3 读需求(字节/步), 从拉取预算中扣除(2ms 滞后)
   // 波次组批模式(2026-08-18, pPrefillWave 开关): 对齐 sglang chunked-prefill ——
   // token 预算(maxPrefillTok, 对应 max_prefill_tokens)组波 + 长请求按 chunkSize 切分跨波
   // + 筹备波拉取与执行波计算重叠(overlap 事件循环语义)。仅 wait_complete+continuous 生效;
   // race/best_effort 回退连续流体模型(其拉取与计算深度耦合, 波次化需 sglang 的 chunk Trim, 超范围)
   let waveMode = !!p.prefillWave && s.prefetch.type === 'none' && s.batching.type !== 'static';
-  let curWave = null;   // 执行中的波 {members:[{q,chunk}], endT}
-  let prepWave = null;  // 筹备中的波 {members:[{q,chunk}]}(等待成员 L3 拉取完成)
+  let curWave = inst.curWave;   // 执行中的波 {members:[{q,chunk}], endT}
+  let prepWave = inst.prepWave; // 筹备中的波 {members:[{q,chunk}]}(等待成员 L3 拉取完成)
 
   function refreshLocations() {
     decoding.forEach(q => {
@@ -3379,7 +3505,14 @@ function runSimulation(strategy, overrides) {
     // 是 ①时间加权均值类采样(利用率/DRAM/SSD 占用)按跳过步数加权补齐 ②时间序列图表
     // (concSamples/l2/l3Series)在跳跃终点补一个平坦段样本。busyUntil 链路是纯时间戳无需
     // 步进结算; 跳过 maxSteps 触顶由循环末尾的延长/截断逻辑照常处理。
-    if (pending.length && !waitQueue.length && !prefillQ.length && !prefilling.length && !decodeWait.length && !decoding.length) {
+    // 多实例(S2): "全空闲"须**所有实例**都空(任一实例有在途请求就不能跳)
+    let allIdle = true;
+    for (let ii = 0; ii < instances.length; ii++) {
+      let xi = instances[ii];
+      if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
+        || xi.kvXfer.length || xi.decodeWait.length || xi.decoding.length) { allIdle = false; break; }
+    }
+    if (pending.length && allIdle) {
       let nextEv = pending[0].arrive;
       for (let ei = 0; ei < inFlight.length; ei++) nextEv = Math.min(nextEv, inFlight[ei].arriveAt);
       if (nextEv > now) {
@@ -3402,7 +3535,20 @@ function runSimulation(strategy, overrides) {
       }
     }
 
-    while (pending.length && pending[0].arrive <= now) waitQueue.push(pending.shift());
+    // ---- 路由: 请求到达 → 选实例(S2 轮询; S3 将扩展 least_queue/cache-aware) ----
+    // 决策只用**当前可观测量**(队列长度/KV 占用), 不读未来 —— 保证因果性。
+    while (pending.length && pending[0].arrive <= now) {
+      let req0 = pending.shift();
+      let tgt = routeRequest(req0);
+      req0.instId = tgt.id;
+      tgt.nRouted++;
+      tgt.waitQueue.push(req0);
+    }
+
+    // ======== 逐实例推进(S2): 每个实例独立完成准入→prefill→传输→decode ========
+    // 单实例时循环体只执行一次, 且 useInstance 重绑的就是原来那套容器 ⇒ 行为逐位不变。
+    for (let _ii = 0; _ii < instances.length; _ii++) {
+      useInstance(instances[_ii]);
 
     // 准入：prefill 槽位与 decode 槽位解耦（连续批）
     // 原模型把 prefill/decode 计入同一 running 上限 → decode 波次占满槽位会阻塞后续请求的
@@ -3414,14 +3560,14 @@ function runSimulation(strategy, overrides) {
     // decodeWait（prefill 完成等 decode 槽位）无数量上限：其 KV 已计入 pools 用量，容量
     // 检查自然约束；prefill→decode 转换处由 decode 槽位上限单独执行。static 波次不变。
     if (s.batching.type === 'priority') waitQueue.sort((a, b) => a.inputLen - b.inputLen);
-    if (s.batching.type === 'static' && decoding.length === 0 && prefillQ.length === 0 && prefilling.length === 0) staticWaveOpen = true;
+    if (s.batching.type === 'static' && decoding.length === 0 && prefillQ.length === 0 && prefilling.length === 0) inst.staticWaveOpen = true;
     let prefillSlots = Math.max(1, Math.min(s.batching.max_batch_size || 8, p.prefillSlotsCap || 16));  // prefill 并发上限: min(max_batch, 可配 16) (2026-08-14 放开原硬编码 4)
     let fastCap = (caps.hbm + caps.dram) * 0.98; // 快层容量：HBM+DRAM 为"软家"，SSD 是最后手段
     for (let i = 0; i < waitQueue.length; i++) {
       if (s.batching.type === 'static') {
-        if (!staticWaveOpen) break;
+        if (!inst.staticWaveOpen) break;
         let running = decoding.length + prefillQ.length + prefilling.length;
-        if (running >= s.batching.max_batch_size) { staticWaveOpen = false; break; }
+        if (running >= s.batching.max_batch_size) { inst.staticWaveOpen = false; break; }
       } else if (!waveMode && !p.singleBatch && prefillQ.length + prefilling.length >= prefillSlots) break;
       // 波次模式: 请求数槽位由 token 预算替代(组波时约束), 准入只受快层容量约束(sglang 无请求数上限)
       // 单批模式: 准入门控全部跳过——所有请求立即准入, 构成单批 batch
@@ -3517,7 +3663,7 @@ function runSimulation(strategy, overrides) {
           wv.members.push({ q: rq, chunk: chunk }); waveTok += chunk;
           dirty = true;
         }
-        if (wv.members.length) prepWave = wv;
+        if (wv.members.length) inst.prepWave = prepWave = wv;
       }
     }
     if (prefilling.length) {
@@ -3642,7 +3788,7 @@ function runSimulation(strategy, overrides) {
         else if (bq._ft1 === undefined) bq._ft1 = now;
       }
       // decode 按需读优先: 拉取只用剩余带宽(上一步 decode L3 读需求, 2ms 滞后)
-      let fetchBudget = Math.max(0, l3PoolBytes - prevDecodeL3);
+      let fetchBudget = Math.max(0, l3PoolBytes - inst.prevDecodeL3);
       for (let j of fetchJobs) {
         if (fetchBudget <= 1) break;
         let take = Math.min(Math.min(j.rem, l3PoolBytes), fetchBudget);
@@ -3696,7 +3842,7 @@ function runSimulation(strategy, overrides) {
             if ((m.q.fetchTime || 0) > (m.q._fetchDone || 0)) { m.q._fetchWait += DT; allReady = false; }
           }
           if (allReady) {
-            curWave = prepWave; prepWave = null;
+            inst.curWave = curWave = prepWave; inst.prepWave = prepWave = null;
             // 波次效率按波 token 量标定: a/b 校准于 chunkSize 大小的前向(权重读/TP 固定开销按
             // chunk 分摊——见 estimatePrefillParams 的 wRead/tp 项), 更大的波摊薄这些固定项,
             // 上限 PREFILL_UTIL_CAP/mfu(GPU 饱和); ≤chunkSize 的波保持校准基线 boost=1。
@@ -3727,7 +3873,7 @@ function runSimulation(strategy, overrides) {
         // 未完成的成员留在 prefilling(解除在飞标记), 下一波优先继续(sglang stash/resume chunked_req)
         if (curWave && now >= curWave.endT) {
           let finished = curWave.members;
-          curWave = null;
+          inst.curWave = curWave = null;
           for (let m of finished) {
             let q = m.q;
             q._wvInFlight = 0;
@@ -3921,7 +4067,7 @@ function runSimulation(strategy, overrides) {
         let fin = st + sumD * pFinal / Math.max(l2Link.bw, 1);
         l2Link.busyUntil = fin; l2Link.shared.busyUntil = fin;
       }
-      prevDecodeL3 = sumS * pFinal; // 本步 decode L3 读需求(字节/步, 供下一步拉取预算扣除)
+      inst.prevDecodeL3 = sumS * pFinal; // 本步 decode L3 读需求(字节/步, 供下一步拉取预算扣除)
       // decode 读字节计入链路累计 → 瞬时差分(instL2/L3)同时含 decode 读 + 预取/淘汰突发
       stats.transferL2Bytes += sumD * pFinal;
       stats.transferL3Bytes += sumS * pFinal;
@@ -3976,25 +4122,48 @@ function runSimulation(strategy, overrides) {
       }
     }
 
+      // 每实例队列/显存画像(S2): 供负载均衡度(CV)评估
+      let _qh = inst.waitQueue.length + inst.prefillQ.length + inst.prefilling.length
+        + inst.kvXfer.length + inst.decodeWait.length + inst.decoding.length;
+      if (_qh > inst.peakQueue) inst.peakQueue = _qh;
+      if (inst.pools.hbm.used > inst.peakHbm) inst.peakHbm = inst.pools.hbm.used;
+      inst.qLenSum += _qh; inst.qLenSamples++;
+    } // ======== end 逐实例推进 ========
+
     // 显存利用率采样（峰值 + 时间加权平均）+ 并发度采样
-    let u = pools.hbm.used / Math.max(caps.hbm, 1);
+    // 多实例(S2): 容量/占用类指标按**全部实例求和**(整机视角), 利用率按总容量归一
+    let _sHbmUsed = 0, _sHbmCap = 0, _sDram = 0, _sSsd = 0, _sDec = 0, _sPf = 0, _sQ = 0;
+    for (let ii = 0; ii < instances.length; ii++) {
+      let xi = instances[ii];
+      _sHbmUsed += xi.pools.hbm.used; _sHbmCap += xi.caps.hbm;
+      _sDram += xi.pools.dram.used;   _sSsd += xi.pools.ssd.used;
+      _sDec += xi.decoding.length;    _sPf += xi.prefilling.length;
+      _sQ += xi.waitQueue.length + xi.prefillQ.length;
+    }
+    let u = _sHbmUsed / Math.max(_sHbmCap, 1);
     stats.memUtilSum += u; stats.memUtilSamples++;
     if (u > stats.memUtilPeak) stats.memUtilPeak = u;
-    stats.dramPeak = Math.max(stats.dramPeak, pools.dram.used);
-    stats.ssdPeak = Math.max(stats.ssdPeak, pools.ssd.used);
-    stats.dramUsedSum += pools.dram.used;
-    stats.ssdUsedSum += pools.ssd.used;
+    stats.dramPeak = Math.max(stats.dramPeak, _sDram);
+    stats.ssdPeak = Math.max(stats.ssdPeak, _sSsd);
+    stats.dramUsedSum += _sDram;
+    stats.ssdUsedSum += _sSsd;
     // 传输差分基准：本步末的累计值 → 下一步初的差分起点
     stats._prevL2 = stats.transferL2Bytes;
     stats._prevL3 = stats.transferL3Bytes;
     if (step % 5 === 0) {
-      stats.concSamples.push([+now.toFixed(2), decoding.length, prefilling.length, waitQueue.length + prefillQ.length]);
+      stats.concSamples.push([+now.toFixed(2), _sDec, _sPf, _sQ]);
       // L2/L3 驻留时间序列（GB）——策略行为的瞬态画像（预取/淘汰波次可见）
-      stats.l2Series.push([+now.toFixed(2), +(pools.dram.used / 1e9).toFixed(2)]);
-      stats.l3Series.push([+now.toFixed(2), +(pools.ssd.used / 1e9).toFixed(2)]);
+      stats.l2Series.push([+now.toFixed(2), +(_sDram / 1e9).toFixed(2)]);
+      stats.l3Series.push([+now.toFixed(2), +(_sSsd / 1e9).toFixed(2)]);
     }
 
-    if (!pending.length && !waitQueue.length && !prefillQ.length && !prefilling.length && !kvXfer.length && !decodeWait.length && !decoding.length) { drained = true; break; }
+    let _allDone = !pending.length;
+    for (let ii = 0; _allDone && ii < instances.length; ii++) {
+      let xi = instances[ii];
+      if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
+        || xi.kvXfer.length || xi.decodeWait.length || xi.decoding.length) _allDone = false;
+    }
+    if (_allDone) { drained = true; break; }
     // 触顶未排空 → 按剩余负载自动延长（覆盖排水估计低估，保证"设大上限即可跑完"）；
     // 延长后超过用户上限 simCap ⇒ 截断退出（truncated=true，结果警示并给出建议上限值）。
     if (step + 1 >= maxSteps) {
@@ -4028,12 +4197,15 @@ function runSimulation(strategy, overrides) {
 
   // 未完成请求：记录截至仿真结束的部分生命周期（甘特图浅色显示）
   let incomplete = [];
-  waitQueue.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: null, prefillStart: null, prefillEnd: null, completeTime: null, state: 'queued' }));
-  prefillQ.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: null, prefillEnd: null, completeTime: null, state: 'prefillQ' }));
-  kvXfer.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'kvXfer' }));
-  decodeWait.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decodeWait' }));
-  prefilling.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: null, completeTime: null, state: 'prefilling' }));
-  decoding.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decoding' }));
+  // 未完成请求列表: 跨全部实例汇总(S2)
+  instances.forEach(xi => {
+    xi.waitQueue.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: null, prefillStart: null, prefillEnd: null, completeTime: null, state: 'queued' }));
+    xi.prefillQ.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: null, prefillEnd: null, completeTime: null, state: 'prefillQ' }));
+    xi.kvXfer.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'kvXfer' }));
+    xi.decodeWait.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decodeWait' }));
+    xi.prefilling.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: null, completeTime: null, state: 'prefilling' }));
+    xi.decoding.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decoding' }));
+  });
 
   return {
     name: strategy.name || autoNameStrategy(strategy),
@@ -4081,8 +4253,33 @@ function runSimulation(strategy, overrides) {
       // TTFT = queue + prefillQ + fetch + compute + xfer(真分离时非0)
       xfer: stats.ttftX / stats.completed * 1000
     } : null,
+    // 多实例指标(S2, 2026-08-20): 仅 instances>1 时有效
+    multi: instances.length > 1 ? {
+      count: instances.length,
+      routePolicy: p.routePolicy,
+      gpusPerInst: instances.map(x => x.gpus),
+      // 每实例明细: 路由到的请求数 / 完成数 / 平均与峰值在途队列 / HBM 峰值占用(GB)
+      perInst: instances.map(x => ({
+        id: x.id, gpus: x.gpus, routed: x.nRouted, completed: x.nCompleted,
+        avgQueue: x.qLenSamples > 0 ? x.qLenSum / x.qLenSamples : 0,
+        peakQueue: x.peakQueue, peakHbmGB: x.peakHbm / 1e9,
+        hbmCapGB: x.caps.hbm / 1e9
+      })),
+      // 负载均衡度: 完成数的变异系数(CV=std/mean)。轮询应接近 0, 越大越不均衡
+      loadCV: (function(){
+        let arr = instances.map(x => x.nCompleted);
+        let n = arr.length; if (!n) return 0;
+        let m = arr.reduce((a, b) => a + b, 0) / n;
+        if (m <= 0) return 0;
+        let v = arr.reduce((a, b) => a + (b - m) * (b - m), 0) / n;
+        return Math.sqrt(v) / m * 100;
+      })(),
+      // 校验用: Σ每实例完成 应 == 全局 completed
+      sumCompleted: instances.reduce((a, x) => a + x.nCompleted, 0),
+      sumRouted: instances.reduce((a, x) => a + x.nRouted, 0)
+    } : null,
     // PD 真分离指标(2026-08-20): 仅 pdMode=2 时有效
-    pd: p.pdMode === 2 ? {
+    pd: p.pdMode === 2 && instances.length === 1 ? {
       prefillGpus: pdPrefillGpus, decodeGpus: pdDecodeGpus,
       linkBW: p.pdLinkBW, linkUtil: p.pdLinkUtil, linkEffBW: pdLinkEffBW,
       kvComp: p.pdKvComp,
@@ -4203,6 +4400,13 @@ function drawStrategyMetrics() {
       ['PD 传输(独立/实际)', sr.pd ? sr.pd.xferSoloMs.toFixed(0)+' / '+sr.pd.xferSpanMs.toFixed(0)+' ms' : '—',
         sr.pd && sr.pd.xferSpanMs > sr.pd.xferSoloMs * 1.5 ? 'red' : 'orange'],
       ['PD 卡数(P/D)', sr.pd ? sr.pd.prefillGpus+' / '+sr.pd.decodeGpus+' 卡' : '—', 'accent'],
+      // 多实例(S2, 2026-08-20)
+      ['实例数(卡/实例)', sr.multi ? sr.multi.count+' × '+sr.multi.gpusPerInst.join('/')+' 卡' : '—', 'accent'],
+      ['路由策略', sr.multi ? sr.multi.routePolicy : '—', 'accent'],
+      ['负载均衡度(完成数CV)', sr.multi ? sr.multi.loadCV.toFixed(1)+'%' : '—',
+        sr.multi && sr.multi.loadCV > 20 ? 'red' : (sr.multi && sr.multi.loadCV > 8 ? 'orange' : 'green')],
+      ['各实例完成数', sr.multi ? sr.multi.perInst.map(x => x.completed).join(' / ') : '—', 'accent'],
+      ['各实例平均在途', sr.multi ? sr.multi.perInst.map(x => x.avgQueue.toFixed(1)).join(' / ') : '—', 'orange'],
       ['Decode 传输/pass(独立)', sr.passMs ? (sr.passMs.l2+sr.passMs.l3).toFixed(2)+' ms' : '—', (sr.passMs && (sr.passMs.l2+sr.passMs.l3) > sr.passMs.hbm+sr.passMs.cmp) ? 'red' : 'orange'],
       ['Decode 计算/pass(独立)', sr.passMs ? (sr.passMs.hbm+sr.passMs.cmp+sr.passMs.comm).toFixed(2)+' ms' : '—', 'accent'],
       ['吞吐', formatNum(sr.throughput)+' tok/s', 'green'],
