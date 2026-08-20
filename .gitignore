@@ -42,6 +42,9 @@ _reg_*.js
 _cmp.js
 _gen_report.js
 _baseline.html
+_baseline_*.js
+_baseline_*.json
+_tmp_*
 _probe_*.json
 _sweep_*.json
 dbg*.js

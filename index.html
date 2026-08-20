@@ -157,6 +157,14 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div><label>RoPE 维度</label><input type="number" id="pRopeDim" value="64" min="1"></div>
           <div><label>隐藏维度</label><input type="number" id="pHidden" value="8192" min="1"></div>
         </div>
+        <div class="form-row" id="mlaFields2" style="margin-top:6px;display:none">
+          <div><label>QK nope维度(0=用头维度)</label><input type="number" id="pQkNope" value="0" min="0" step="1" oninput="applyEstimatedParams()" title="MLA 解压式 prefill 的 QK non-RoPE 维度 qk_nope_head_dim。&#10;prefill 走解压式 MHA 时 QK 总维度 = qk_nope + RoPE维度(DS-V3: 128+64=192)。&#10;0 = 回退用「头维度」(DS-V3 两者恰好都是 128)。仅影响 prefill 的位置斜率 b。"></div>
+          <div><label>V头维度(0=用头维度)</label><input type="number" id="pVHeadDim" value="0" min="0" step="1" oninput="applyEstimatedParams()" title="MLA 解压式 prefill 的 v_head_dim。&#10;解压式 MHA 的 PV 阶段维度(DS-V3 = 128)。0 = 回退用「头维度」。仅影响 prefill 的位置斜率 b。"></div>
+          <div><label>prefill注意力路径</label><select id="pMlaPrefillPath" onchange="applyEstimatedParams()" title="MLA 的 prefill 与 decode 走不同 kernel, 计算量差 3.4×(2026-08-20 修正)。&#10;• 解压式MHA(默认, 推荐): sglang MHA_CHUNKED_KV / MHA_ONE_SHOT——kv_b_proj 把压缩 latent 解压为全秩 K/V 再做标准 MHA。QK维=nope+rope=192, PV维=vHead=128。常规 prefill(纯新请求 + 长前缀命中)主路径。&#10;• 吸收式MLA: sglang MLA 分支——W_UK 吸收进 Q 侧, KV 保持压缩。QK维=kvLora+rope=576, PV维=kvLora=512。短前缀/投机解码/CP 场景, 计算量是解压式的 3.4×。&#10;decode 恒为吸收式, 不受此开关影响。">
+            <option value="mha" selected>解压式 MHA(sglang 主路径)</option>
+            <option value="absorb">吸收式 MLA(短前缀/投机/CP)</option>
+          </select></div>
+        </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>词表大小</label><input type="number" id="pVocab" value="128000" min="1" step="1000"></div>
           <div><label>Q头数(0=自动)</label><input type="number" id="pQHeads" value="0" min="0" step="1" oninput="applyEstimatedParams()" title="attention 的 query head 数, 用于推导 prefill 位置斜率 b 的计算量(2026-08-19 Roofline 改造新增)。&#10;0=自动: GQA 按 hidden/headDim 推导(等价于 4×layers×hidden, 与是否填写无关); MLA 按 hidden/headDim 近似。&#10;MLA 必须显式填写: DeepSeek-V3 有 128 个 head, 而 hidden/headDim = 7168/128 = 56, 自动推导会低估 attention 计算量 2.3×。DS-V3/V2 = 128, V2-Lite = 16。"></div>
@@ -257,9 +265,19 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <div><label>Prefill并发上限</label><input type="number" id="pPrefillSlots" value="16" min="1" step="1" title="同时推进 prefill 的请求数上限(2026-08-14 放开: 原硬编码 4 过保守; sglang 实际由 max_prefill_tokens 预算驱动, 此处以请求数近似)。实际并发 = min(max_batch_size, 该值)。仅连续流体模式(默认)生效; 波次组批开启后由 token 预算替代"></div>
           <div><label>Prefill token预算</label><input type="number" id="pMaxPrefillTok" value="16384" min="256" step="1024" title="sglang max_prefill_tokens(默认 16384): 每个 prefill 波次的总 token 预算; 长请求按 Prefill Chunk 切分跨波执行。仅勾选「波次组批」时生效"></div>
         </div>
+        <!-- 稀疏注意力(2026-08-20): DS-V3.2 Indexer / V4 NSA -->
+        <div class="form-row" style="margin-top:6px">
+          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="稀疏注意力(DeepSeek V3.2 Indexer / V4 NSA): 每个 query 只对 top-k 个最相关的历史 KV 做 attention, 而非全部历史。&#10;效果: 位置成本 b 在 pos>topk 后**不再增长**——长上下文 prefill 从 O(L²) 转为 O(L·topk)。&#10;但 Indexer(选择器)本身仍需扫描全部历史 KV 打分, 这部分仍随位置线性增长(斜率 b_idx, 自动推导)。&#10;⚠️ 若忽略 b_idx 会得出'长上下文成本恒定'的错误结论: 稀疏是把 O(L²)的大系数换成 O(L²)小系数 + O(L·topk)大系数, 不是消掉二次项。"><input type="checkbox" id="pSparseAttn" style="width:auto" onchange="toggleSparseFields();applyEstimatedParams()"><label style="margin:0;font-size:.75rem" for="pSparseAttn">稀疏注意力(V3.2 Indexer/V4 NSA)</label></div>
+          <div id="sparseF1" style="display:none"><label>top-k</label><input type="number" id="pSparseTopk" value="2048" min="1" step="128" oninput="applyEstimatedParams()" title="每个 query 实际参与 attention 的 KV 数量上限(DeepSeek V3.2-Exp index_topk = 2048)。&#10;pos ≤ topk 时与稠密同价; pos > topk 后每 token 的 attention 成本恒定 = b×topk。"></div>
+          <div id="sparseF2" style="display:none"><label>Indexer头数</label><input type="number" id="pIdxHeads" value="64" min="1" step="1" oninput="applyEstimatedParams()" title="Indexer 的打分头数 index_n_heads(V3.2 = 64)。用于推导 b_idx。"></div>
+          <div id="sparseF3" style="display:none"><label>Indexer头维度</label><input type="number" id="pIdxHeadDim" value="128" min="1" step="1" oninput="applyEstimatedParams()" title="Indexer 的头维度 index_head_dim(V3.2 = 128)。用于推导 b_idx。"></div>
+          <div id="sparseF4" style="display:none"><label>Indexer斜率b_idx(μs/tok²)</label><input type="number" id="pPrefillBIdx" value="0" min="0" step="0.000001" title="Indexer 扫描全历史打分的位置斜率(自动推导, 可手动覆盖)。&#10;τ(pos) = a + b×min(pos,topk) + b_idx×pos"></div>
+        </div>
         <div class="form-row" style="margin-top:6px">
           <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="applyEstimatedParams()" title="从模型架构+硬件规格推导 a/b 的估计值并填入(无需实测)">🎯 自动估算 a/b</button><span id="estParamsNote" style="font-size:.68rem;color:var(--accent2);margin-left:8px"></span></div>
+          <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="toggleDerivationPanel()" title="展开逐项推导明细: 每一项的 FLOPs/访存字节/计算时间/访存时间/算术强度/瓶颈判定与代入值。公式与引擎计算同源(不是手写文案)">🔬 推导明细</button></div>
         </div>
+        <div id="derivPanel" style="display:none;margin-top:8px"></div>
         <div class="form-row" style="margin-top:6px">
           <div><label>推理引擎</label><span style="font-size:.75rem;color:var(--accent);line-height:1.7">sglang（默认, 2026-08-12 起固定）<br>RadixAttention 渐进前缀</span></div>
           <div><label>前缀缓存</label><select id="pPrefixCache">
@@ -330,6 +348,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
 
   <div class="card" id="quickResults">
     <h2><span>快速概要</span></h2>
+    <div id="feasibilityBox"></div>
     <div class="result-grid" id="quickResultGrid"></div>
     <div class="formula-box" id="formulaQuick"></div>
   </div>
@@ -503,7 +522,8 @@ let models = {
   // qHeads: attention query head 数（Roofline 推导 prefill 位置斜率 b 用）。
   // GQA 省略即可（hidden/headDim 自动推导等价）；MLA 必须显式——DS-V3 有 128 head 而
   // hidden/headDim=56，自动推导低估 attention 计算量 2.3×。V2-Lite 恰好 16=2048/128，可省。
-  'DeepSeek-V2-Lite': {attn:'mla', layers:27, kvLora:512, ropeDim:64, hidden:2048, vocab:128256, paramsB:15.7, actB:2.4, qHeads:16},
+  // qkNope/vHeadDim(2026-08-20): MLA 解压式 prefill 的 QK non-RoPE 维与 V 头维（DS 系列均 128）。
+  'DeepSeek-V2-Lite': {attn:'mla', layers:27, kvLora:512, ropeDim:64, hidden:2048, vocab:128256, paramsB:15.7, actB:2.4, qHeads:16, qkNope:128, vHeadDim:128},
   // 腾讯混元 Hy3 (2026-07-06 GA, Apache 2.0): MoE 192专家/top-8, 80层主网络(+1层MTP),
   // GQA 64头/8KV头/headDim128, hidden 4096, interm 13312, vocab 120832, 256K 上下文, BF16/FP8
   // KV/tok(BF16) = 2×80×8×128×2 = 320KB → 256K 上下文单请求 KV 达 85.9GB(长上下文 KV 压力大)
@@ -511,8 +531,10 @@ let models = {
   // 混元翻译旗舰 Hy-MT2-30B-A3B: MoE 30B/3B 激活（架构细节未完整公开，层数/hidden 按同级 MoE 估计）
   'Hunyuan-MT2-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:120832, paramsB:30, actB:3},
   'DeepSeek-V3':   {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256, paramsB:671, actB:37, qHeads:128,
+    qkNope:128, vHeadDim:128,
     // 实测校准(2026-08-10, 8×H20 分散到达口径): 单请求 2048 tok prefill=444ms → a≈216μs/tok
     // (8/6 同时发送口径曾拟合 79.5, 分散到达实测修正; b=kvPerTok/aggHbmBW=1.1e-3 物理确定)
+    // ⚠️ 2026-08-20: b 的口径已从吸收式改为解压式 MHA(降 3.4×), calibB 是更早期口径拟合值, 建议重新校准
     calibA: 216, calibB: 0.0011},
   'Custom':        {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:128000, paramsB:0, actB:0}
 };
@@ -555,6 +577,18 @@ function getParams(){
     // Q head 数(2026-08-19): 用于推导 prefill 位置斜率 b 的 attention 计算量。
     // 0 = 自动(GQA 按 hidden/headDim 等价推导; MLA 会低估, 建议显式填 —— DS-V3 = 128)
     qHeads: gi('pQHeads'),
+    // MLA prefill 路径与维度(2026-08-20): prefill 走解压式 MHA 时 QK 维 = qkNope+ropeDim, PV 维 = vHeadDim。
+    // 0 = 回退用 headDim(DS-V3 两者恰好都是 128)。mlaPrefillPath: 'mha'(默认) | 'absorb'
+    qkNope: gi('pQkNope'), vHeadDim: gi('pVHeadDim'),
+    mlaPrefillPath: (function(){ var el = document.getElementById('pMlaPrefillPath');
+      return (el && el.value) ? el.value : 'mha'; })(),
+    // 稀疏注意力(2026-08-20): DS-V3.2 Indexer / V4 NSA —— 每 query 只对 top-k 个 KV 做 attention,
+    // 位置成本在 pos>topk 后不再增长; 但 Indexer 仍需扫全历史打分(bIdx 项, 见 prefillTau)
+    sparseAttn: !!(document.getElementById('pSparseAttn') && document.getElementById('pSparseAttn').checked),
+    sparseTopk: gi('pSparseTopk') || 2048,
+    idxHeads: gi('pIdxHeads') || 64, idxHeadDim: gi('pIdxHeadDim') || 128,
+    prefillBIdx: (function(){ var el=document.getElementById('pPrefillBIdx');
+      if(!el) return 0; var v=parseFloat(el.value); return isFinite(v)&&v>=0 ? v : 0; })(),
     paramsB: gv('pParamsB'), actB: gv('pActB'),
     gpus: gi('pGpuCount'), hbmPerGpu: gv('pHbm'), hbmBW: gv('pHbmBW'),
     tflops: gv('pTflops'), tpSize: gi('pTpSize'), nvlinkBW: gv('pNvlinkBW'),
@@ -667,6 +701,42 @@ function calcKvPerToken(p){
   return 2 * p.layers * p.kvHeads * p.headDim * p.dtypeBytes;
 }
 
+// ==================== prefill per-token 成本 τ(pos)：全引擎唯一权威 ====================
+// (2026-08-20 新增) 此前 a/b 被 6 处代码各自 `Math.max(p.prefillA,1e-9)` 就地展开，
+// 稀疏注意力引入"位置成本带上限"后无法再用单一线性式表达，故集中到本函数。
+//
+// 稠密(默认): τ(pos) = a + b·pos                        —— 位置成本线性增长
+// 稀疏      : τ(pos) = a + b·min(pos, topk) + bIdx·pos   —— 两段斜率
+//   · attention 主体被 top-k 选择截断: 每个 query 只对 topk 个 KV 做 QK^T/PV,
+//     pos 超过 topk 后**不再增长**(DS-V3.2 topk=2048, V4 NSA 类似)
+//   · 但 Indexer/选择器本身仍需扫描全部历史 KV 打分 → 这部分仍随 pos 线性增长(bIdx),
+//     只是每位置成本远小于完整 attention(V3.2: index_head_dim=128 单头 vs 128头×320维)
+//   ⚠️ 若忽略 bIdx 会得出"长上下文 prefill 成本恒定"的错误结论——稀疏的收益是把
+//     O(L²)·大系数 换成 O(L²)·小系数 + O(L·topk)·大系数，不是把二次项消掉。
+function prefillTau(p, pos) {
+  let a = p.prefillA > 0 ? p.prefillA : 79.5;
+  let b = p.prefillB >= 0 ? p.prefillB : 5.33e-3;
+  let pp = Math.max(pos, 0);
+  if (p.sparseAttn && p.sparseTopk > 0) {
+    return (a + b * Math.min(pp, p.sparseTopk) + (p.prefillBIdx || 0) * pp) * 1e-6;
+  }
+  return (a + b * pp) * 1e-6;
+}
+// τ 的位置积分 = 前 L 个 token 的 prefill 总时间(秒)。稠密: a·L + b·L²/2。
+// 稀疏: a·L + b·[L≤k ? L²/2 : k²/2 + k(L−k)] + bIdx·L²/2
+//   (前 k 个 token 位置成本线性累积, 之后每 token 恒定 k → 从二次转为线性)
+function prefillIntegral(p, L) {
+  let a = p.prefillA > 0 ? p.prefillA : 79.5;
+  let b = p.prefillB >= 0 ? p.prefillB : 5.33e-3;
+  let n = Math.max(L, 0);
+  if (p.sparseAttn && p.sparseTopk > 0) {
+    let k = p.sparseTopk;
+    let attnPos = n <= k ? 0.5 * n * n : 0.5 * k * k + k * (n - k);
+    return (a * n + b * attnPos + (p.prefillBIdx || 0) * 0.5 * n * n) * 1e-6;
+  }
+  return (a * n + 0.5 * b * n * n) * 1e-6;
+}
+
 // ======================== prefill 参数估算（Roofline 口径，2026-08-19 重构） ========================
 // 【关键修正】旧实现把"计算时间 + 访存时间"直接相加（a = 权重读 + 算力 + TP + KV写；
 //   b = kvPerToken/HBM带宽 纯访存），这忽略了真实算子内部计算与访存的 overlap：
@@ -705,15 +775,32 @@ function estimatePrefillParams(p){
   // ---- attention 每 token 每位置的计算量 ----
   // GQA: 每层 QK^T(2×hidden) + PV(2×hidden)，q 侧总维度 = qHeads×headDim ≈ hidden
   //   → 4 × layers × hidden
-  // MLA(吸收式, sglang/vLLM 默认): q 先被 W_UK 吸收投影进压缩 KV 空间，每个 head 直接与
-  //   c_kv(kvLora 维) + k_rope(ropeDim 维) 做内积；PV 也在压缩空间(kvLora 维)。
-  //   → 2 × layers × nHeads × [(kvLora+ropeDim) + kvLora]
-  //   注意 MLA 的 head 数不能用 hidden/headDim 推（DS-V3: 128 head 而 7168/128=56，差 2.3×），
-  //   须显式取值；无覆盖时按 DS-V3 系列惯例 = hidden/headDim × 2.3 的保守下界 hidden/headDim。
+  // MLA(2026-08-20 修正): prefill 与 decode 走**不同 kernel 路径**，计算量差 3.4×——
+  //   · prefill = 解压式 MHA(sglang `MHA_CHUNKED_KV`/`MHA_ONE_SHOT`, vLLM `forward_mha`):
+  //     kv_b_proj 先把压缩 latent 解压成全秩 K/V，再做标准 MHA。
+  //     QK 维度 = qk_nope + qk_rope = 128+64 = 192；PV 维度 = v_head_dim = 128。
+  //     → 2 × layers × nHeads × [(nope+rope) + vHead] = 2×61×128×320
+  //   · decode = 吸收式 MQA(sglang `MLA`, vLLM `forward_mqa`): W_UK 吸收进 Q 侧，
+  //     KV cache 保持压缩不解压，每 head 直接与 c_kv(kvLora) + k_rope(ropeDim) 内积。
+  //     → 2 × layers × nHeads × [(kvLora+ropeDim) + kvLora] = 2×61×128×1088
+  //   本函数只推导 **prefill** 的 a/b，故用解压式。旧实现误用吸收式口径，
+  //   使 DS-V3 的 b 高估 1088/320 = 3.40×（decode 侧不受影响，见 calcAll 的 passTime）。
+  //   依据: sglang `_handle_attention_backend`(deepseek_common/attention_backend_handler.py L93-108)
+  //   ——extend 且 (前缀命中量 ≥ chunked_prefix_cache_threshold 或 无前缀) 时走 MHA 分支，
+  //   即常规 prefill(含纯新请求与长前缀命中)主路径都是解压式 MHA；仅短前缀/投机/CP 落回吸收式。
+  //   nope 维度取值: 优先 pQkNope 输入；留空时按 headDim 回退(DS-V3 两者恰好都是 128)。
   let attnFlop;
   if (p.attn === 'mla') {
     let nHeads = p.qHeads > 0 ? p.qHeads : Math.round(p.hidden / Math.max(p.headDim || 128, 1));
-    attnFlop = 2 * p.layers * nHeads * ((p.kvLora + p.ropeDim) + p.kvLora);
+    if (p.mlaPrefillPath === 'absorb') {
+      // 吸收式(可选): 短前缀/投机解码/CP 场景, 或用户显式指定
+      attnFlop = 2 * p.layers * nHeads * ((p.kvLora + p.ropeDim) + p.kvLora);
+    } else {
+      // 解压式 MHA(默认, sglang prefill 主路径)
+      let nope = p.qkNope > 0 ? p.qkNope : (p.headDim || 128);
+      let vHead = p.vHeadDim > 0 ? p.vHeadDim : (p.headDim || 128);
+      attnFlop = 2 * p.layers * nHeads * ((nope + p.ropeDim) + vHead);
+    }
   } else {
     attnFlop = 4 * p.layers * p.hidden;
   }
@@ -725,27 +812,53 @@ function estimatePrefillParams(p){
   let kvWBytes  = kvPerTok;                                  // B/tok     KV 写（纯访存，无计算）
   let tp = 2 * p.layers * 5 / chunk;                         // μs/tok    TP AllReduce 固定延迟（始终相加）
 
-  let a, b, aBound, bBound;
+  // ---- 稀疏注意力的 Indexer 每 token 每位置成本(2026-08-20) ----
+  // DS-V3.2 Indexer(NSA 风格选择器): 每层为每个 query 对**全部**历史 KV 打分, 再取 top-k。
+  // attention 主体被 topk 截断(见 prefillTau), 但 Indexer 的扫描量仍随位置线性增长。
+  // 逐项(对齐 B 的 mla_indexer, 每 token 每位置):
+  //   · score  : 2 × layers × idxHeads × idxHeadDim   (q·k 内积, 每 head 每维 1 MAC)
+  //   · combine: 2 × layers × idxHeads                (按 head 重要性加权求和)
+  //   · topk   : 1 × layers                            (单遍扫描计一次比较)
+  //   · 访存   : idxHeadDim × dtype / chunk            (Indexer 的单头 K cache, chunk 内共享)
+  // 数量级对比(V3.2): Indexer 2×61×64×128 = 1.0e6 vs 完整 attention 2×61×128×320 = 5.0e6
+  //   → Indexer 约为完整 attention 的 20%, 故 topk 截断在 L≫topk 时仍有 ~5× 收益。
+  let idxFlop = 0, idxBytes = 0;
+  if (p.sparseAttn) {
+    let iH = Math.max(p.idxHeads || 64, 1), iD = Math.max(p.idxHeadDim || 128, 1);
+    idxFlop  = p.layers * (2 * iH * iD + 2 * iH + 1);
+    idxBytes = p.layers * iD * p.dtypeBytes / chunk;
+  }
+
+  let a, b, bIdx, aBound, bBound, bIdxBound;
   if (p.mfuAuto) {
     // ② 自动判瓶颈: 每项独立 max(计算时间, 访存时间)，计算侧用峰值算力
     let gCmp = gemmFlop / peakFlops * 1e6, gMem = gemmBytes / aggHbmBW * 1e6;
     let aCmp = attnFlop / peakFlops * 1e6, aMem = attnBytes / aggHbmBW * 1e6;
+    let iCmp = idxFlop / peakFlops * 1e6, iMem = idxBytes / aggHbmBW * 1e6;
     let kvW = kvWBytes / aggHbmBW * 1e6;                     // KV 写无计算可 overlap → 计入
     a = Math.max(gCmp, gMem) + kvW + tp;
     b = Math.max(aCmp, aMem);
+    bIdx = p.sparseAttn ? Math.max(iCmp, iMem) : 0;
     aBound = gCmp >= gMem ? '计算' : '访存';
     bBound = aCmp >= aMem ? '计算' : '访存';
+    bIdxBound = iCmp >= iMem ? '计算' : '访存';
   } else {
     // ① MFU 模式: 只算计算时间，访存（权重读/KV读/KV写）全部视为被计算 overlap
     a = gemmFlop / effFlops * 1e6 + tp;
     b = attnFlop / effFlops * 1e6;
-    aBound = bBound = '计算(MFU)';
+    bIdx = p.sparseAttn ? idxFlop / effFlops * 1e6 : 0;
+    aBound = bBound = bIdxBound = '计算(MFU)';
   }
   let tauPf = 100 + 110;                                     // μs: NVMe IO(100) + RPC/软件(110)
-  return {a, b, tauPf, aBound, bBound, mfuAuto: !!p.mfuAuto,
+  return {a, b, bIdx, tauPf, aBound, bBound, bIdxBound, mfuAuto: !!p.mfuAuto,
+    sparseAttn: !!p.sparseAttn, sparseTopk: p.sparseTopk,
     // 诊断: 算术强度与 ridge point（供 UI 解释瓶颈判定）
     gemmIntensity: gemmFlop / Math.max(gemmBytes, 1e-9),
     attnIntensity: attnFlop / Math.max(attnBytes, 1e-9),
+    idxIntensity: idxFlop / Math.max(idxBytes, 1e-9),
+    // 分项原始量(供推导明细面板展开, 公式与计算同源)
+    parts: {gemmFlop, gemmBytes, attnFlop, attnBytes, kvWBytes, idxFlop, idxBytes, tp, chunk,
+      peakFlops, effFlops, aggHbmBW, act, kvPerTok},
     ridgePoint: peakFlops / aggHbmBW};
 }
 // 把推导值填入输入框（换模型/硬件预设/改 MFU 时自动调用；用户可在同配置下手动覆盖）
@@ -754,6 +867,7 @@ function applyEstimatedParams(){
   let e = estimatePrefillParams(p);
   $('pPrefillA').value = e.a.toFixed(2);
   $('pPrefillB').value = e.b.toFixed(6);
+  if ($('pPrefillBIdx')) $('pPrefillBIdx').value = e.bIdx.toFixed(6);
   $('pFetchFixedUs').value = 0;   // 简化传输模型(2026-08-12): 传输延迟=大小/带宽, 每块固定开销 τ_pf 不再自动填入
   let n = $('estParamsNote');
   if (n) {
@@ -761,10 +875,100 @@ function applyEstimatedParams(){
       ? 'Roofline自动(峰值算力 vs HBM带宽, ridge='+e.ridgePoint.toFixed(1)+' FLOP/B)'
       : 'MFU模式 '+(p.mfu*100).toFixed(0)+'%(只计算, 访存被overlap)';
     n.textContent = mode + ' → a=' + e.a.toFixed(1) + '(' + e.aBound + ') · b='
-      + (e.b * 1e3).toFixed(2) + 'e-3(' + e.bBound + ') · GEMM强度='
-      + e.gemmIntensity.toFixed(0) + ' / Attn强度=' + e.attnIntensity.toFixed(0) + ' FLOP/B';
+      + (e.b * 1e3).toFixed(2) + 'e-3(' + e.bBound + ')'
+      + (e.sparseAttn ? ' · b_idx=' + (e.bIdx * 1e3).toFixed(3) + 'e-3(稀疏topk=' + e.sparseTopk + ')' : '')
+      + ' · GEMM强度=' + e.gemmIntensity.toFixed(0) + ' / Attn强度=' + e.attnIntensity.toFixed(0) + ' FLOP/B';
   }
+  renderDerivationPanel(p, e);
   recalcAll();
+}
+
+// ==================== a/b 推导明细面板（2026-08-20, 借鉴 B 的 time_formula 做法）====================
+// 设计要点: 表格数据全部来自 estimatePrefillParams 返回的 e.parts —— **与引擎计算同源**,
+// 不是另写一份文案。此前 UI 的公式说明是手写字符串拼接, 引擎口径变了容易忘记同步(漂移风险)。
+function toggleSparseFields(){
+  let on = !!(document.getElementById('pSparseAttn') && document.getElementById('pSparseAttn').checked);
+  ['sparseF1','sparseF2','sparseF3','sparseF4'].forEach(function(id){
+    let el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none';
+  });
+}
+function toggleDerivationPanel(){
+  let el = $('derivPanel'); if (!el) return;
+  let show = el.style.display === 'none';
+  el.style.display = show ? '' : 'none';
+  if (show) { let p = getParams(); renderDerivationPanel(p, estimatePrefillParams(p)); }
+}
+function renderDerivationPanel(p, e){
+  let el = $('derivPanel'); if (!el || el.style.display === 'none') return;
+  let q = e.parts, us = 1e6;
+  // 每一项: [名称, FLOP/tok(或/tok/pos), 访存B, 归属(a 或 b), 说明]
+  let rows = [
+    ['非attention GEMM', q.gemmFlop, q.gemmBytes, 'a',
+     '2×激活参数 = 2×'+formatNum(q.act)+' FLOP/tok；权重读 激活参数×权重精度÷chunk('+q.chunk+')'],
+    ['attention(位置项)', q.attnFlop, q.attnBytes, 'b',
+     p.attn==='mla'
+       ? (p.mlaPrefillPath==='absorb'
+          ? '吸收式 2×L×nH×[(kvLora+rope)+kvLora]；KV读 kvPerTok÷chunk'
+          : '解压式MHA 2×L×nH×[(nope+rope)+vHead]；KV读 kvPerTok÷chunk')
+       : 'GQA 4×L×hidden；KV读 kvPerTok÷chunk'],
+  ];
+  if (e.sparseAttn) rows.push(['Indexer(位置项)', q.idxFlop, q.idxBytes, 'b_idx',
+    '2×L×idxHeads×idxHeadDim + combine + topk；扫全历史打分, 不受 topk 截断']);
+  let cmpT = f => f / q.peakFlops * us, memT = b => b / q.aggHbmBW * us;
+  let effT = f => f / q.effFlops * us;
+  let h = '<div style="background:var(--card,#1a1d27);border:1px solid var(--border,#2a2e3a);border-radius:8px;padding:10px 12px;font-size:.72rem">';
+  h += '<div style="color:var(--accent2);margin-bottom:6px;font-weight:600">🔬 a/b 逐项推导明细'
+    + (e.mfuAuto ? '（Roofline 自动：每项取 max(计算,访存)）' : '（MFU '+(p.mfu*100).toFixed(0)+'%：只计算时间，访存视为被 overlap）')
+    + '　ridge point = '+e.ridgePoint.toFixed(1)+' FLOP/B</div>';
+  h += '<table style="width:100%;border-collapse:collapse;font-size:.7rem">';
+  h += '<tr style="color:var(--muted,#8b93a7);text-align:right">'
+    + '<th style="text-align:left;padding:3px 5px">分项</th><th>FLOPs</th><th>访存B</th>'
+    + '<th>算术强度</th><th>计算时间μs</th><th>访存时间μs</th><th>取值μs</th><th style="text-align:left;padding-left:8px">归属</th></tr>';
+  for (let r of rows) {
+    let name=r[0], f=r[1], b=r[2], to=r[3];
+    let ct = e.mfuAuto ? cmpT(f) : effT(f), mt = memT(b);
+    let take = e.mfuAuto ? Math.max(ct, mt) : ct;
+    let bound = e.mfuAuto ? (ct>=mt ? '计算' : '访存') : '计算(MFU)';
+    let intensity = f / Math.max(b, 1e-9);
+    h += '<tr style="text-align:right;border-top:1px solid var(--border,#2a2e3a)">'
+      + '<td style="text-align:left;padding:3px 5px" title="'+r[4]+'">'+name+'</td>'
+      + '<td>'+formatNum(f)+'</td><td>'+formatNum(b)+'</td>'
+      + '<td>'+intensity.toFixed(0)+'</td>'
+      + '<td'+(e.mfuAuto&&ct>=mt?' style="color:var(--accent)"':'')+'>'+ct.toExponential(2)+'</td>'
+      + '<td'+(e.mfuAuto&&mt>ct?' style="color:var(--accent)"':'')+'>'+mt.toExponential(2)+'</td>'
+      + '<td style="font-weight:600">'+take.toExponential(3)+'</td>'
+      + '<td style="text-align:left;padding-left:8px">'+to+' ('+bound+')</td></tr>';
+  }
+  // a 的附加项(KV 写 + TP 延迟, 始终相加)
+  let kvW = memT(q.kvWBytes);
+  h += '<tr style="text-align:right;border-top:1px solid var(--border,#2a2e3a);color:var(--muted,#8b93a7)">'
+    + '<td style="text-align:left;padding:3px 5px" title="KV 写无计算可 overlap（MFU 模式下视为被 overlap 不计入）">KV 写</td>'
+    + '<td>—</td><td>'+formatNum(q.kvWBytes)+'</td><td>—</td><td>—</td><td>'+kvW.toExponential(2)+'</td>'
+    + '<td style="font-weight:600">'+(e.mfuAuto?kvW.toExponential(3):'0(overlap)')+'</td>'
+    + '<td style="text-align:left;padding-left:8px">a</td></tr>';
+  h += '<tr style="text-align:right;color:var(--muted,#8b93a7)">'
+    + '<td style="text-align:left;padding:3px 5px" title="TP AllReduce 固定延迟 2×layers×5μs÷chunk，网络往返无法被计算 overlap，两模式都相加">TP 固定延迟</td>'
+    + '<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>'
+    + '<td style="font-weight:600">'+q.tp.toExponential(3)+'</td>'
+    + '<td style="text-align:left;padding-left:8px">a</td></tr>';
+  h += '</table>';
+  h += '<div style="margin-top:7px;padding-top:6px;border-top:1px solid var(--border,#2a2e3a);line-height:1.8">'
+    + '<b>合成</b>: a = '+e.a.toFixed(3)+' μs/tok　·　b = '+e.b.toExponential(4)+' μs/tok²'
+    + (e.sparseAttn ? '　·　b_idx = '+e.bIdx.toExponential(4)+' μs/tok²' : '') + '<br>';
+  if (e.sparseAttn) {
+    let k = e.sparseTopk, L = p.inputLen;
+    let attnPos = L <= k ? 0.5*L*L : 0.5*k*k + k*(L-k);
+    h += '<b>τ(pos)</b> = a + b×min(pos, '+k+') + b_idx×pos　<span style="color:var(--muted,#8b93a7)">（稀疏：attention 被 top-k 截断，Indexer 仍扫全历史）</span><br>'
+      + '<b>T_prefill</b>(L='+formatNum(L)+') = a·L + b·['+(L<=k?'L²/2':'k²/2 + k(L−k)')+'] + b_idx·L²/2 = '
+      + (prefillIntegral(p, L)*1000).toFixed(1)+' ms<br>'
+      + '<span style="color:var(--accent2)">稀疏收益: 若按稠密(不截断)则 attention 位置项 = L²/2 = '+formatNum(0.5*L*L)
+      + '，实际 = '+formatNum(attnPos)+' → 该项降 '+(0.5*L*L/Math.max(attnPos,1)).toFixed(2)+'×</span>';
+  } else {
+    h += '<b>τ(pos)</b> = a + b×pos　·　<b>T_prefill</b>(L='+formatNum(p.inputLen)+') = a·L + b·L²/2 = '
+      + (prefillIntegral(p, p.inputLen)*1000).toFixed(1)+' ms';
+  }
+  h += '</div></div>';
+  el.innerHTML = h;
 }
 
 // 与仿真引擎一致的前缀组模型：4组差异化前缀比例的均值
@@ -817,13 +1021,12 @@ function calcAll(p){
   // 算力（TFLOPS × MFU）与带宽分离 —— Roofline 基础
   let computeFlops = p.tflops * 1e12 * p.gpus * p.mfu;
   let aggHbmBW = p.hbmBW * 1e12 * p.gpus;
-  // P0-2: Prefill 位置感知 —— per-token 成本 τ(i) = a + b·i μs（实测拟合，默认 79.5+5.33e-3·i）。
-  // 第 i 个 token 的 attention 需读 i 个 KV → 成本随位置线性增长，总 prefill 时间 = a·L + b·L²/2。
+  // P0-2: Prefill 位置感知 —— per-token 成本 τ(i)（稠密 a+b·i；稀疏 a+b·min(i,topk)+bIdx·i）。
+  // 第 i 个 token 的 attention 需读 i 个 KV → 成本随位置增长。位置积分见 prefillIntegral()。
   // prefillTps 定义为位置 0 的基准速率（与旧模型兼容），TTFT 用位置积分（下方 ttftEst）。
   let prefillTps = computeFlops / (2 * activatedParams);
-  let pfa = p.prefillA > 0 ? p.prefillA : 79.5;          // μs/tok 固定项
-  let pfb = p.prefillB >= 0 ? p.prefillB : 5.33e-3;      // μs/tok² 位置斜率
-  let prefillTimeL = (pfa * p.inputLen + 0.5 * pfb * p.inputLen * p.inputLen) * 1e-6; // 秒（位置积分）
+  // 位置积分统一走 prefillIntegral（顶层唯一权威, 稠密/稀疏分支都在那里）
+  let prefillTimeL = prefillIntegral(p, p.inputLen); // 秒
 
   // TP AllReduce 通信开销（Megatron式：每层2次AllReduce；ring有效数据 2×(TP-1)/TP × 消息）
   // 带宽项随token数线性增长；小消息延迟项每次前向固定 2×layers×5μs
@@ -928,11 +1131,13 @@ function initParamsTab(){
   updatePrefixHitFill();
   $('pAttnType').onchange=()=>{toggleMlaFields(); recalcAll();};
   toggleMlaFields();
+  toggleSparseFields();   // 稀疏注意力字段初始可见性(2026-08-20)
 }
 
 function toggleMlaFields(){
   let mla = $('pAttnType').value === 'mla';
   $('mlaFields').style.display = mla ? 'flex' : 'none';
+  let m2 = $('mlaFields2'); if (m2) m2.style.display = mla ? 'flex' : 'none';
 }
 
 // 前缀命中比例滑块 UI 同步: 填充色 + 数值标签(如 "40%") 随 value 刷新
@@ -1014,6 +1219,9 @@ function applyModel(name,el){
   if (m.vocab) $('pVocab').value=m.vocab;
   $('pParamsB').value=m.paramsB||0; $('pActB').value=m.actB||0;
   $('pQHeads').value=m.qHeads||0;   // MLA 必须显式(DS-V3=128); GQA 留 0 自动推导
+  // MLA 解压式 prefill 维度(2026-08-20): 0 = 回退用 headDim
+  if ($('pQkNope')) $('pQkNope').value = m.qkNope||0;
+  if ($('pVHeadDim')) $('pVHeadDim').value = m.vHeadDim||0;
   toggleMlaFields();
   // 模型有实测校准值(calibA/calibB)时优先使用(如 DS-V3 8/10 校准), 否则自动推导
   if (m.calibA != null && m.calibB != null) {
@@ -1027,8 +1235,107 @@ function applyModel(name,el){
   }
 }
 
+// ==================== 配置可行性前置校验（2026-08-20）====================
+// 动机: 引擎此前只在存储页展示 availHbm 数值, 没有对"这套配置根本跑不起来"给出显式告警——
+// 例如 671B FP8 权重 671GB 放进 8×96GB=768GB 后 availHbm 只剩 ~40GB, 单请求 64K 上下文
+// 就要 4.4GB, 12 并发直接溢出。用户容易在"为什么 TTFT 这么离谱"上浪费时间。
+// 这里在算任何指标之前先把硬约束检查一遍, 按严重程度分级并给出可操作建议。
+function renderFeasibility(p, r){
+  let box = $('feasibilityBox'); if (!box) return;
+  let errs = [], warns = [], infos = [];
+  let totalHbm = r.totalHbm, wBytes = r.modelWeightBytes;
+
+  // ① 权重本身是否装得下(最硬的约束)
+  if (wBytes >= totalHbm) {
+    errs.push('<b>权重装不下</b>：模型权重 '+formatBytes(wBytes)+' ≥ 总 HBM '+formatBytes(totalHbm)+
+      '（'+p.gpus+'×'+p.hbmPerGpu+'GB）。至少需要 '+Math.ceil(wBytes/(p.hbmPerGpu*1e9))+
+      ' 张卡，或改用更低权重精度（当前 '+p.weightDtype+'B/参数）。');
+  } else if (r.availHbm <= 0) {
+    errs.push('<b>KV 无可用空间</b>：权重 '+formatBytes(wBytes)+' + 固定开销 '+formatBytes(r.overhead)+
+      ' 已占满 '+formatBytes(totalHbm)+'，KV 可用 = 0。增加卡数或降低权重精度。');
+  } else if (r.availHbm < totalHbm * 0.05) {
+    // 权重占比过高使 KV 空间被压缩到 <5%。但"空间小"不等于"一定溢出"——
+    // 要看它能否装下当前负载(maxHbmRequests vs 并发)。否则短输入场景会误报:
+    // 例如 671B FP8 只剩 35.6GB, 但 4096 tok 的请求单个仅 0.17GB → 可容 206 个, 完全够用。
+    let tight = '权重 '+formatBytes(wBytes)+' 占去 '+(wBytes/totalHbm*100).toFixed(0)+
+      '% 的 HBM，KV 可用仅 '+formatBytes(r.availHbm)+'（总量的 '+(r.availHbm/totalHbm*100).toFixed(1)+'%）';
+    if (r.maxHbmRequests < p.concurrency) {
+      warns.push('<b>KV 空间极紧</b>：'+tight+'，当前负载已超出（可容 '+r.maxHbmRequests+
+        ' 个 vs 并发 '+p.concurrency+'）→ KV 将大量溢出到 L2/L3，TTFT/TPOT 由外部带宽主导。');
+    } else {
+      infos.push('<b>KV 空间偏小但够用</b>：'+tight+'，当前输入长度下仍可容 '+r.maxHbmRequests+
+        ' 个请求（并发 '+p.concurrency+'）。注意上调输入长度或并发时容易触顶。');
+    }
+  }
+
+  // ② 单请求 KV 是否超出可用 HBM(即便并发=1 也放不下)
+  if (r.availHbm > 0 && r.effPerReqKv > r.availHbm) {
+    errs.push('<b>单请求 KV 超容</b>：一个请求需 '+formatBytes(r.effPerReqKv)+
+      '（输入 '+formatNum(p.inputLen)+' tok，已扣前缀命中）> HBM 可用 '+formatBytes(r.availHbm)+
+      '。即使并发=1 也无法全驻留' + (p.tieredKv ? '，将持续依赖 L2/L3 换入换出。' : '；建议开启「分层KV缓存」或缩短输入长度。'));
+  }
+
+  // ③ 并发是否超过 HBM 容量(未开分层时是硬上限)
+  if (r.availHbm > 0 && r.maxHbmRequests < p.concurrency) {
+    let msg = '<b>并发超出 HBM 容量</b>：HBM 仅容 '+r.maxHbmRequests+' 个请求，当前设 '+p.concurrency+
+      ' 个（需 '+formatBytes(r.totalKvDemand)+' vs 可用 '+formatBytes(r.availHbm)+'）。';
+    if (p.tieredKv) {
+      let fastCap = r.availHbm + r.dramTotal;
+      if (r.totalKvDemand > fastCap + r.ssdTotal) {
+        errs.push(msg + ' 且 <b>三层总容量('+formatBytes(fastCap + r.ssdTotal)+')也不够</b> —— 请求会被准入拒绝或大量淘汰。');
+      } else if (r.totalKvDemand > fastCap) {
+        warns.push(msg + ' 分层已开：超出部分落到 L3(SSD)，TTFT 将受 SSD 带宽（'+p.ssdBW+'GB/s）主导。');
+      } else {
+        infos.push(msg + ' 分层已开：超出部分由 L2(DRAM '+formatBytes(r.dramTotal)+') 承接。');
+      }
+    } else {
+      errs.push(msg + ' <b>未开启分层KV缓存</b> → 超出的请求将被准入拒绝/淘汰，完成数会显著低于请求数。建议开启分层或把并发降到 '+r.maxHbmRequests+'。');
+    }
+  }
+
+  // ④ 负载与容量的稳态一致性(Little 定律)
+  if (r.littleConcurrency > p.concurrency * 2 && p.qps > 0) {
+    warns.push('<b>过载</b>：按 Little 定律 稳态并发需 '+r.littleConcurrency.toFixed(0)+
+      '（QPS '+p.qps+' × 延迟 '+(r.estLatency*1000).toFixed(0)+'ms），远超设定的 '+p.concurrency+
+      ' —— 队列会无界增长，TTFT 主要由排队构成。降 QPS 或提并发上限。');
+  }
+
+  // ⑤ 仿真窗口是否足够
+  let estWall = p.concurrency > 0 ? r.estLatency * Math.max(1, p.concurrency / Math.max(p.maxBatch,1)) : r.estLatency;
+  if (estWall > p.simMaxTime) {
+    warns.push('<b>仿真窗口可能不足</b>：粗估排水需 ~'+estWall.toFixed(0)+'s > 窗口上限 '+p.simMaxTime+
+      's，结果可能被截断（完成数 < 请求数）。建议调大「仿真窗口上限」。');
+  }
+
+  // ⑥ MLA 必填项提醒
+  if (p.attn === 'mla' && p.qHeads <= 0) {
+    warns.push('<b>MLA 未填 Q 头数</b>：自动按 hidden/headDim = '+
+      Math.round(p.hidden/Math.max(p.headDim||128,1))+' 推导，而 DeepSeek-V3 实际有 128 个 head —— '+
+      'attention 计算量会低估约 2.3×，请显式填写「Q头数」。');
+  }
+
+  if (!errs.length && !warns.length && !infos.length) {
+    box.innerHTML = '<div style="background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.35);border-radius:6px;'+
+      'padding:7px 10px;margin-bottom:8px;font-size:.73rem;color:#4ade80">✓ 配置可行性检查通过：权重与 KV 均可容纳，负载与容量匹配。</div>';
+    return;
+  }
+  let h = '';
+  let blk = (items, bg, bd, col, icon, title) => {
+    if (!items.length) return '';
+    return '<div style="background:'+bg+';border:1px solid '+bd+';border-radius:6px;padding:7px 10px;'+
+      'margin-bottom:6px;font-size:.73rem;color:'+col+';line-height:1.7">'+
+      '<b>'+icon+' '+title+'</b><ul style="margin:3px 0 0;padding-left:18px;font-size:.73rem">'+
+      items.map(t=>'<li>'+t+'</li>').join('')+'</ul></div>';
+  };
+  h += blk(errs,  'rgba(239,68,68,.08)',  'rgba(239,68,68,.4)',  '#f87171', '⚠️', '配置不可行 / 结果不可信');
+  h += blk(warns, 'rgba(245,158,11,.08)', 'rgba(245,158,11,.4)', '#fbbf24', '⚡', '需注意');
+  h += blk(infos, 'rgba(99,102,241,.08)', 'rgba(99,102,241,.4)', '#a5b4fc', 'ℹ️', '说明');
+  box.innerHTML = h;
+}
+
 function updateQuickResults(){
   let p=getParams(), r=calcAll(p);
+  renderFeasibility(p, r);
   let grid=$('quickResultGrid');
   let littleOk = Math.abs(r.littleConcurrency - p.concurrency) / Math.max(p.concurrency,1) < 0.5;
   grid.innerHTML=[
@@ -1417,7 +1724,7 @@ function drawBatching(){
     let passT = Math.max(passMem, passCmp) + r.commTime(b);
     let tp = b/passT;                                  // 批次总吞吐 tok/s
     // prefill 用位置感知积分(与 TTFT/引擎同源), 旧实现用 prefillTps 线性口径与 a/b 不一致
-    let pfT = (p.prefillA * p.inputLen + 0.5 * p.prefillB * p.inputLen * p.inputLen) * 1e-6;
+    let pfT = prefillIntegral(p, p.inputLen);
     let lat = (pfT + p.outputLen*passT)*1000;  // ms
     return {b:b, lat:lat, tp:tp, bound:passCmp>passMem?'算力':'带宽'};
   });
@@ -2802,11 +3109,9 @@ function runSimulation(strategy, overrides) {
   // 触顶时不截断，由 estimateRemainingDrain 按剩余负载自动延长，直至全部请求排空
   // （estPass 需含 decode 每请求开销，与 perReqMs 校准一致——旧公式低估导致
   //   Aggressive 静态批高并发场景 0 完成、P99 显示 0；权重项保守按总权重）
-  // P0-2: 位置感知 prefill 的窗口估计——per-token 成本 τ(i)=a+b·i，总时间 = a·L + b·L²/2
+  // P0-2: 位置感知 prefill 的窗口估计——per-token 成本 τ(i)（稠密 a+b·i / 稀疏含 topk 截断）
   //（线性公式 2P·L/F 低估长上下文 prefill，导致重负载场景仿真窗口截断、0 完成）
-  let pfa2 = p.prefillA > 0 ? p.prefillA : 79.5;
-  let pfb2 = p.prefillB >= 0 ? p.prefillB : 5.33e-3;
-  let totalPrefillEst = pending.reduce((s2, q) => s2 + (pfa2 * q.inputLen + 0.5 * pfb2 * q.inputLen * q.inputLen) * 1e-6, 0);
+  let totalPrefillEst = pending.reduce((s2, q) => s2 + prefillIntegral(p, q.inputLen), 0);
   let estN = Math.min(s.batching.max_batch_size || 8, N);
   // decode 单 pass 排水估计（与仿真引擎同口径的 KV 分层减速，2541-2550 行）：
   // 批 KV = n×avgLifetimeKv，按 快层(availHbm) → DRAM → SSD 水注分层；
@@ -2843,7 +3148,7 @@ function runSimulation(strategy, overrides) {
     let pf = 0, remTok = 0;
     for (let q of all) {
       let L = Math.max(0, (q._pfTotal || q.inputLen || 0) - (q._pfDone || 0));
-      if (L > 0) pf += (pfa2 * L + 0.5 * pfb2 * L * L) * 1e-6;
+      if (L > 0) pf += prefillIntegral(p, L);
       if (q.inputLen) remTok += Math.max(0, (q.outputLen || 0) - (q.tokensGen || 0));
     }
     return pf + Math.ceil(remTok / Math.max(1, estN)) * estDecodePass(estN) * 2;
@@ -3079,7 +3384,7 @@ function runSimulation(strategy, overrides) {
       // 被静默忽略, 且 Roofline 自动模式下 a 含访存项时口径彻底错位。
       // 现改为直接用 τ(i) = (a + b·i)·1e-6 秒作为每 token 的独占 GPU 时间 —— a/b 成为
       // prefill 速度的唯一权威来源, 与"快速结果"的 prefillTimeL 位置积分完全同源。
-      let pfA = Math.max(p.prefillA, 1e-9), pfB = Math.max(p.prefillB, 0);
+      // (2026-08-20) 改走顶层 prefillTau(p, pos): 稠密 = a+b·pos; 稀疏 = a+b·min(pos,topk)+bIdx·pos。
       let gpuTime = DT * boost * pfFactor;   // 本步可用的等效独占 GPU 秒数
       let sumCost = 0;                        // Σ 各活跃请求推进 1 token 所需 GPU 秒数
       for (let qi = 0; qi < prefilling.length; qi++) {
@@ -3090,7 +3395,7 @@ function runSimulation(strategy, overrides) {
           let H = qq._pfStartPos || 0;
           let pos = qq._raceMeetTok < 0 ? qq._pfDone
             : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
-          sumCost += (pfA + pfB * pos) * 1e-6;
+          sumCost += prefillTau(p, pos);
           continue;
         }
         // best_effort(修正): 重算未拉前缀(位置0→cap) + 后缀(位置H→L), 全程占算力;
@@ -3106,7 +3411,7 @@ function runSimulation(strategy, overrides) {
           // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
           pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         }
-        sumCost += (pfA + pfB * pos) * 1e-6;
+        sumCost += prefillTau(p, pos);
       }
       let perReqTok = sumCost > 0 ? gpuTime / sumCost : 0; // 每请求每步推进 token 数
       // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
@@ -3246,7 +3551,7 @@ function runSimulation(strategy, overrides) {
             let cost = 0;
             for (let m of curWave.members) {
               let posMid = (m.q._pfStartPos || 0) + m.q._pfDone + m.chunk / 2;
-              cost += m.chunk * (Math.max(p.prefillA, 1e-9) + Math.max(p.prefillB, 0) * posMid) * 1e-6;
+              cost += m.chunk * prefillTau(p, posMid);
             }
             curWave.endT = now + cost / Math.max(wBoost * wPfFactor, 1e-9);
             for (let m of curWave.members) m.q._wvInFlight = m.chunk; // 在飞 chunk 登记(组波时扣除)
@@ -3454,7 +3759,7 @@ function runSimulation(strategy, overrides) {
         if (q._recomputeTok > 0) {
           // 位置感知重算速率: 每秒重算 token 数 = 1/τ_rec(pos)，pos 取当前已生成位置
           let recPos = Math.min(q.inputLen + q._outAllocTok, q.inputLen + q.outputLen - 1);
-          let perTokRec = (p.prefillA + p.prefillB * recPos) * 1e-6; // 秒/token
+          let perTokRec = prefillTau(p, recPos);                    // 秒/token
           let recRate = 1 / Math.max(perTokRec, 1e-9);              // token/s
           // 重算算力竞争：与 decode 共享 GPU，按算力占比折算（简化：同批平分）
           let recPerStep = recRate * DT / Math.max(1, decoding.length);
