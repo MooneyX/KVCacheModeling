@@ -2692,6 +2692,8 @@ function runSimulation(strategy, overrides) {
     // PD 真分离(2026-08-20): ttftX = P→D KV 传输段(TTFT 第5分量); pdXfer* = 传输量与耗时统计
     ttftX: 0, pdXferBytes: 0, pdXferSpanSum: 0, pdXferSoloSum: 0, pdXferCount: 0,
     fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
+    // GPU 占用画像(2026-08-21): 见 prefill 段 nAct 注释。跨实例累加(整机视角)
+    pfGpuBusySec: 0, pfBusySteps: 0, pfActSum: 0,
     fetchSpanSum: 0,                                        // prefill 传输过程实际耗时累计(_ft1-_ft0, 含带宽排队/不含计算)
     fetchBytesPulled: 0,                                    // prefill 拉取字节总量(统一共享池口径, 单飞去重效果可由此观察)
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
@@ -3906,6 +3908,10 @@ function runSimulation(strategy, overrides) {
       // (2026-08-20) 改走顶层 prefillTau(p, pos): 稠密 = a+b·pos; 稀疏 = a+b·min(pos,topk)+bIdx·pos。
       let gpuTime = DT * boost * pfFactor;   // 本步可用的等效独占 GPU 秒数
       let sumCost = 0;                        // Σ 各活跃请求推进 1 token 所需 GPU 秒数
+      // nAct = 本步**真正占算力**的请求数(2026-08-21): 拉取中的请求(wait_complete)不占算力,
+      // 故 nAct 可远小于 prefilling.length。它是区分"计算便宜"与"GPU 被存储饿死"的关键量 ——
+      // 见下方 pfGpuBusySec/pfActSum 的用途说明。
+      let nAct = 0;
       for (let qi = 0; qi < prefilling.length; qi++) {
         let qq = prefilling[qi];
         if (qq._race) {
@@ -3915,6 +3921,7 @@ function runSimulation(strategy, overrides) {
           let pos = qq._raceMeetTok < 0 ? qq._pfDone
             : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
           sumCost += prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b(卡数不同)
+          nAct++;
           continue;
         }
         // best_effort(修正): 重算未拉前缀(位置0→cap) + 后缀(位置H→L), 全程占算力;
@@ -3931,8 +3938,15 @@ function runSimulation(strategy, overrides) {
           pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         }
         sumCost += prefillTau(pP, pos);     // PD 真分离: prefill 走 P 节点 a/b
+        nAct++;
       }
       let perReqTok = sumCost > 0 ? gpuTime / sumCost : 0; // 每请求每步推进 token 数
+      // GPU 占用画像(2026-08-21): 补齐 compute 分量看不到的信息。
+      // 背景: ttftBreakdown.compute 是**残差**(prefill墙钟 − 拉取等待), 拉取慢时会被挤压到
+      // 甚至小于"单请求独占计算时间" —— 只看它会误判"计算不是瓶颈", 实际是 GPU 被存储饿死。
+      // pfGpuBusySec: GPU 真的在算 prefill 的墙钟(有请求占算力的步数 × DT), 跨实例累加;
+      // pfActSum/pfBusySteps: 平均同时在算的请求数 —— ≈1 说明流水线空转, 远大于 1 说明算力被填满。
+      if (nAct > 0) { stats.pfGpuBusySec += DT; stats.pfBusySteps++; stats.pfActSum += nAct; }
       // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
       // prefill fetch / race 拉取 / be 排队期拉取 与 decode 的 L3 读共享同一条 NVMe 总线
       // (effL3BW)——替代原独立 l3FetchBudget 预算池(与 decode 读互不排队, decode L3 重读
@@ -4465,6 +4479,15 @@ function runSimulation(strategy, overrides) {
       // prefill 传输过程实际耗时（ms, 仿真中传输的真实时长）: 含 L3 并发带宽排队、不含计算——
       // 为避免被计算延迟覆盖而单列为"独立"展示; wc 下 ≈fetch(实际等待), race/be 下为被计算重叠隐藏的拉取过程时长
       fetchReal: stats.fetchSpanSum / stats.completed * 1000,
+      // ---- GPU 占用画像(2026-08-21): compute 是残差, 这两项才反映算力真实使用 ----
+      // computeBusyMs: prefill 期间 GPU 真的在算的**墙钟总时长**(ms, 跨实例累加, 非每请求平均)。
+      //   与 compute(每请求残差平均)是完全不同的量, 不要混用。
+      // computeConc: 平均同时占算力的请求数。≈1 ⇒ 流水线空转(拉取跟不上, GPU 被饿死);
+      //   远大于 1 ⇒ 算力被填满, 此时 compute 才真实反映计算成本。
+      computeBusyMs: stats.pfGpuBusySec * 1000,
+      computeConc: stats.pfBusySteps > 0 ? stats.pfActSum / stats.pfBusySteps : 0,
+      // GPU 忙碌占仿真总时长的比例(%): 低 ⇒ 算力闲置(瓶颈在存储/排队)
+      computeBusyPct: simEnd > 0 ? stats.pfGpuBusySec / simEnd * 100 : 0,
       // PD 真分离: P→D KV 传输段(ms) —— TTFT 第5分量。
       // TTFT = queue + prefillQ + fetch + compute + xfer(真分离时非0)
       xfer: stats.ttftX / stats.completed * 1000
@@ -4634,9 +4657,22 @@ function drawStrategyMetrics() {
       ['平均排队', sr.avgQueue.toFixed(2)+' s', 'orange'],
       // 传输 vs 计算「重叠之前」的独立用时（2026-08-18）：看清带宽/算力各作用于哪个阶段
       // Prefill 传输(独立) = 仿真过程中的实际传输耗时(含 L3 带宽排队, 不含计算)——
-      // 为防被计算延迟覆盖而单列; wc 下≈传输等待(实际), race/be 下为被计算重叠隐藏的拉取过程时长
+      // 用真实时间戳差(_ft1-_ft0)独立测量, 不会被计算覆盖; race/be 下 fetch 计入 TTFT 为 0
+      // 但此处仍如实报出被计算重叠隐藏的拉取过程时长。
       ['Prefill 传输(独立)', sr.ttftBreakdown ? (sr.ttftBreakdown.fetchReal||0).toFixed(0)+' ms' : '—', 'orange'],
-      ['Prefill 计算(独立)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
+      // ⚠️ 改名(2026-08-21): 原名"Prefill 计算(独立)"有误导 —— 它**不是**独立测量, 而是
+      // 每请求"prefill 墙钟 − 拉取等待"的**残差**。拉取慢时会被挤压到甚至小于单请求独占
+      // 计算时间(实测: 残差 134ms < 独占 185ms), 只看它会误判"计算不是瓶颈"。
+      // 真实算力使用看下面两张卡(GPU忙碌 / 并发计算数)。
+      ['Prefill 计算(残差)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
+      // GPU 占用画像(2026-08-21): 区分"计算便宜"与"GPU 被存储饿死"
+      ['Prefill GPU忙碌', sr.ttftBreakdown && sr.ttftBreakdown.computeBusyMs != null
+        ? sr.ttftBreakdown.computeBusyMs.toFixed(0)+' ms ('+(sr.ttftBreakdown.computeBusyPct||0).toFixed(0)+'%窗口)' : '—', 'accent'],
+      // 并发计算数 <2 ⇒ 流水线空转(算力被拉取饿死), 标红提示
+      ['并发计算请求数', sr.ttftBreakdown && sr.ttftBreakdown.computeConc != null
+        ? sr.ttftBreakdown.computeConc.toFixed(1)+' 个' : '—',
+        (sr.ttftBreakdown && sr.ttftBreakdown.computeConc < 2) ? 'red'
+          : ((sr.ttftBreakdown && sr.ttftBreakdown.computeConc < 5) ? 'orange' : 'green')],
       // PD 真分离(2026-08-20): P→D KV 传输是 TTFT 的新增分量, 只在真分离档非 0
       ['PD KV传输(TTFT内)', sr.pd ? (sr.ttftBreakdown ? sr.ttftBreakdown.xfer.toFixed(0)+' ms' : '—') : '—',
         sr.pd && sr.ttftBreakdown && sr.ttftBreakdown.xfer > sr.ttftBreakdown.compute ? 'red' : 'orange'],
@@ -4794,7 +4830,7 @@ function drawStrategyTierDemand(){
     '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
-    '• <b>传输 vs 计算独立用时</b>（结果卡片新增, 重叠之前各自的单独耗时）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——含 L3 并发带宽排队、不含计算，为避免被计算延迟覆盖而单列（wc=prefill开始→拉完; race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(独立)</code>=实际 prefill 计算。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时。勾选「Decode 从 L3 重读」后已拉取前缀块 decode 期按 SSD 读计费(模拟 KV 被驱逐场景)，Decode 传输/pass 将显著上升；decode 的 L3 重读与 prefill 拉取共享同一总线且按需读优先 ⇒ 低带宽下 Prefill 传输(独立) 也会因挤占而上升。取消勾选「Prefill 每请求重复拉取」(=单飞去重) 后同组前缀只拉一次 ⇒ 拉取字节与 Prefill 传输(独立) 显著下降<br>'+
+    '• <b>传输 vs 计算</b>（结果卡片）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——用真实时间戳差独立测量，含 L3 并发带宽排队、不含计算，<b>不会被计算覆盖</b>（wc=prefill开始→拉完; race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(残差)</code>=<b>墙钟残差</b>（prefill墙钟 − 拉取等待），<b>不是独立测量</b>：拉取慢时它会被挤压到甚至小于「单请求独占计算时间」（实测双实例 50GB/s 下残差 134ms &lt; 独占 185ms），<b>只看它会误判「计算不是瓶颈」</b>。要判断算力是否真的空闲，看新增的 <code>Prefill GPU忙碌</code>（GPU 真在算 prefill 的墙钟总时长，跨实例累加，括号内为占仿真窗口比例）与 <code>并发计算请求数</code>（平均同时占算力的请求数）：<b>并发数≈1 ⇒ 流水线空转、GPU 被存储饿死</b>（此时该提 L3 带宽或关「重复拉取」，而不是优化计算）；远大于 1 ⇒ 算力已填满，残差 compute 才真实反映计算成本。实测对照：SSD 50GB/s 时并发 1.3 个、残差 134ms；提到 200GB/s 后残差跳到 2200ms——计算成本一直都在，之前被拉取等待吃掉了。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时。勾选「Decode 从 L3 重读」后已拉取前缀块 decode 期按 SSD 读计费(模拟 KV 被驱逐场景)，Decode 传输/pass 将显著上升；decode 的 L3 重读与 prefill 拉取共享同一总线且按需读优先 ⇒ 低带宽下 Prefill 传输(独立) 也会因挤占而上升。取消勾选「Prefill 每请求重复拉取」(=单飞去重) 后同组前缀只拉一次 ⇒ 拉取字节与 Prefill 传输(独立) 显著下降<br>'+
     '• <b>需求 &gt; 配置</b> ⇒ 该层成为瓶颈（TPOT 上升）；<b>需求 vs 解析上界</b>（基础参数页 L2/L3 卡片）⇒ 策略的资源松弛量'
   );
 }
