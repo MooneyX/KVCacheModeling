@@ -573,6 +573,33 @@ let models = {
   'DeepSeek-V3.2-Exp': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256,
     paramsB:671, actB:37, qHeads:128, qkNope:128, vHeadDim:128,
     sparse:true, sparseTopk:2048, idxHeads:64, idxHeadDim:128},
+  // ===== 1T 级开源模型(2026-08-21 新增, 用于对齐《Agentic AI 推理流量模型分析》的"1T 模型"口径) =====
+  // Kimi K2 (Moonshot AI, 2025-07, Modified MIT): 真正的 1T MoE + MLA。
+  // 官方 config.json 逐字段: 61 层(1 dense + 60 MoE) / hidden 7168 / kv_lora_rank 512 /
+  //   qk_rope_head_dim 64 / qk_nope_head_dim 128 / v_head_dim 128 / num_attention_heads 64 /
+  //   vocab 163840 / 384 experts top-8 + 1 shared / moe_intermediate 2048 / FP8(e4m3) 原生。
+  // ⚠️ 与 DS-V3 的两个关键差异:
+  //   ① qHeads = 64(DS-V3 是 128) ⇒ prefill attention 计算量(位置斜率 b)只有 DS-V3 的一半
+  //   ② KV 结构完全相同(61层 × (512+64)) ⇒ **KV/token 与 DS-V3 一字不差**: BF16 68.6KB / FP8 34.3KB
+  //   ⇒ 对存储网/L3 带宽建模而言 K2 与 DS-V3 等价, 但 prefill 更快 ⇒ 存储网占比更高
+  // 参数量核算(按 config 手算, 与官方宣称对表): 激活 32.7B(官方 32B) / 总 1026B(官方 1T) ✓
+  'Kimi-K2': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:163840,
+    paramsB:1000, actB:32, qHeads:64, qkNope:128, vHeadDim:128},
+  // Kimi K2 Thinking (2025-11, Modified MIT): 架构与 K2 完全相同, 差异在 256K 上下文
+  // + 原生 INT4 量化(QAT) + 思维链。Agentic 长上下文场景更贴近报告设定。
+  // 权重 INT4 ⇒ 权重精度选 FP8 会高估显存 2×, 但引擎权重精度下拉最细到 FP8, 故 paramsB 保持
+  // 1000 由用户按需调权重精度; KV 仍是 BF16/FP8(INT4 只量化权重不量化 KV)。
+  'Kimi-K2-Thinking': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:163840,
+    paramsB:1000, actB:32, qHeads:64, qkNope:128, vHeadDim:128},
+  // Ling-1T (蚂蚁 inclusionAI, 2025-10, MIT): 1T MoE 但用 **GQA** —— 与 K2 形成关键对照。
+  // 官方 config: 80 层 / hidden 8192 / num_key_value_heads 8 / head_dim 128 / 64 q 头 /
+  //   vocab 157184 / 256 experts top-8 + 1 shared / BF16。
+  // ⚠️ **KV/token BF16 = 320KB, 是 Kimi K2(68.6KB) 的 4.7 倍** —— 同样 1T 参数,
+  //    GQA vs MLA 让存储网压力差近 5 倍。这是"1T 模型"这个说法本身不足以确定 KV 流量的铁证:
+  //    做存储网/L3 建模必须看 attention 类型, 不能只看参数量。
+  // 参数量核算: 激活 50.9B(官方 ~50B) / 总 1000B(官方 1T) ✓
+  'Ling-1T': {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:157184,
+    paramsB:1000, actB:51},
   'Custom':        {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:128000, paramsB:0, actB:0}
 };
 
@@ -1208,12 +1235,32 @@ function refreshActiveTab(){
 }
 
 // ======================== TAB 1: PARAMETERS ========================
+// 模型预设按钮的 tooltip(2026-08-21): 1T 级模型的关键差异在 attention 类型而非参数量 ——
+// 同为 1T, GQA 的 KV/token 是 MLA 的 4.7 倍, 对存储网/L3 建模影响近 5 倍, 必须提示。
+var MODEL_TIPS = {
+  'Kimi-K2': 'Moonshot Kimi K2 (2025-07, Modified MIT): 真正的 1T MoE + MLA, 激活 32B。\n'
+    + '官方 config: 61层 / hidden 7168 / kv_lora 512 / rope 64 / 64 attention heads / vocab 163840 /\n'
+    + '384 experts top-8 + 1 shared / 原生 FP8(e4m3) / 128K 上下文。\n'
+    + '⚠️ KV 结构与 DeepSeek-V3 完全相同 ⇒ KV/token 一字不差(BF16 68.6KB / FP8 34.3KB);\n'
+    + '但 qHeads 只有 64(DS-V3 是 128) ⇒ prefill attention 计算量减半, 存储网占 TTFT 比例更高。',
+  'Kimi-K2-Thinking': 'Kimi K2 Thinking (2025-11, Modified MIT): 架构与 K2 完全相同。\n'
+    + '差异在 256K 上下文 + 原生 INT4 量化(QAT) + 思维链, 更贴近 Agentic 长上下文场景。\n'
+    + 'INT4 只量化权重不量化 KV ⇒ KV/token 与 K2 相同; 引擎权重精度最细到 FP8,\n'
+    + '按 FP8 算会高估权重显存约 2×。',
+  'Ling-1T': '蚂蚁 inclusionAI Ling-1T (2025-10, MIT): 1T MoE 但用 **GQA** 而非 MLA。\n'
+    + '官方 config: 80层 / hidden 8192 / 8 KV heads / head_dim 128 / 64 q heads / vocab 157184 /\n'
+    + '256 experts top-8 + 1 shared / BF16 / 激活约 50B。\n'
+    + '⚠️★ KV/token BF16 = 320KB, 是 Kimi K2(68.6KB) 的 **4.7 倍** —— 同样 1T 参数,\n'
+    + 'GQA vs MLA 让存储网压力差近 5 倍。这说明"1T 模型"这个说法不足以确定 KV 流量:\n'
+    + '做存储网/L3 带宽建模必须看 attention 类型, 不能只看参数量。',
+};
 function initParamsTab(){
   let bar = $('modelPresets');
   Object.keys(models).forEach(name=>{
     let btn = document.createElement('button');
     btn.className='preset-tag'+(name===currentModel?' active':'');
     btn.textContent=name;
+    if (MODEL_TIPS[name]) btn.title = MODEL_TIPS[name];
     btn.onclick=function(){applyModel(name,this)};
     bar.appendChild(btn);
   });
