@@ -2640,6 +2640,18 @@ function runSimulation(strategy, overrides) {
     let iP = instGpus === p.gpus ? p : Object.assign({}, p,
       { gpus: instGpus, tpSize: Math.min(p.tpSize || instGpus, instGpus) });
     let iR = instGpus === p.gpus ? r : calcAll(iP);
+    // ⚠️ prefill a/b 必须按**每实例卡数**重算(2026-08-21 修 bug, 与 PD 真分离同处理):
+    // a 与 b 都 ∝ 1/gpus(peakFlops 与 aggHbmBW 都随卡数线性放大), 直接复用输入框里
+    // 按**总卡数**拟合/推导的值, 会让每实例的 prefill 速度错一整个倍数 ——
+    // 实测 16卡拆2实例时每台仍用 16卡的 a=18.13(应为 8卡的 35.87), prefill 快 2×,
+    // 导致"多实例 TTFT 反而更低"的错误结论。
+    // estimatePrefillParams 由架构+硬件纯推导, 不读输入框, 故此处重算不会吞掉用户手填值
+    // 的语义 —— 手填值本就只对"总卡数"这一套硬件成立。
+    let iPP = iP;
+    if (instGpus !== p.gpus) {
+      let eI = estimatePrefillParams(iP);
+      iPP = Object.assign({}, iP, { prefillA: eI.a, prefillB: eI.b, prefillBIdx: eI.bIdx });
+    }
     // 分层容量: HBM 随卡数缩放(calcAll 已算), DRAM/SSD 按实例数均分(一台机器的内存/盘由本实例独占)
     let iCaps = { hbm: iR.availHbm,
       dram: p.tieredKv ? iR.dramTotal / instShare : 0,
@@ -2673,6 +2685,8 @@ function runSimulation(strategy, overrides) {
       // 每实例统计(S2 导出): 完成数 + 峰值队列/显存, 供负载均衡度评估
       nCompleted: 0, nRouted: 0, peakQueue: 0, peakHbm: 0, qLenSum: 0, qLenSamples: 0,
       qBusySum: 0, qBusySamples: 0,   // 仅"系统有负载"窗内的队列采样(均衡度用, 见主循环注释)
+      // 该实例的 prefill 参数视图(含按本实例卡数重算的 a/b, 2026-08-21)
+      pP: iPP,
       // S4 前缀亲和: 该实例自己的前缀缓存视图(gid → {prefixTokLen, blkIds, activated})。
       // 亲和关闭时全部实例共用同一个对象引用(= 全局共享前缀池, 口径与历史一致);
       // 亲和开启时每实例一份独立副本 ⇒ 命中要求"同前缀曾被路由到本实例"。
@@ -2769,7 +2783,9 @@ function runSimulation(strategy, overrides) {
     curWave = x.curWave; prepWave = x.prepWave; prevDecodeL3 = x.prevDecodeL3;
     if (x.prefixMap) prefixGroupMap = x.prefixMap;   // S4: 前缀池视图(亲和开时各实例独立)
     // 多实例下 prefill/decode 的资源视图 = 该实例自己的(单实例时 rP/rD 由 PD 逻辑决定)
-    if (multiInst) { rP = x.r; rD = x.r; pP = x.p; }
+    // ⚠️ pP 用 x.pP 而非 x.p(2026-08-21 修 bug): x.pP 含**按本实例卡数重算的 a/b**;
+    // 用 x.p 会让每实例沿用按总卡数推导的 a/b ⇒ prefill 速度快 gpus/instGpus 倍。
+    if (multiInst) { rP = x.r; rD = x.r; pP = x.pP; }
   }
 
   function sizeInTier(blk, tier) { return blk.size * tierRatio[tier]; }
