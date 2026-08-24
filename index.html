@@ -457,6 +457,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
         <option value="fetch_ratio">L3拉取时间占比(%)</option>
+        <option value="compute_net">纯计算(ms)</option><option value="compute_wait">算力竞争等待(ms)</option><option value="compute_wait_ratio">算力竞争等待占比(%)</option>
       </select></div>
       <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
@@ -2759,6 +2760,12 @@ function runSimulation(strategy, overrides) {
     // TTFT/延迟分解累计（秒）：TTFT = 到达排队 + prefill排队 + L3拉取fetch + prefill计算；
     // 延迟 = TTFT + decode槽位等待 + decode执行（L3 读占比的落点）
     ttftQ: 0, ttftP: 0, ttftF: 0, ttftC: 0, latDw: 0, latDt: 0,
+    // computeNet(2026-08-24): compute 残差里的**纯 GPU 计算**部分(秒, 每请求累计后求和)。
+    // 定义: 每步该请求推进 token 所**独占**的 GPU 时间 = perReqTok × τ(pos)
+    //   = DT·boost·pfFactor × τ(pos)/sumCost —— 对本步全部活跃请求求和恰好 = DT·boost·pfFactor
+    //   (守恒: 一份 GPU 时间被瓜分, 各请求份额之和 = 总供给)。
+    // 于是 computeWait = compute − computeNet 就是**算力竞争等待**(被其他请求占用算力的时长)。
+    ttftCnet: 0,
     // PD 真分离(2026-08-20): ttftX = P→D KV 传输段(TTFT 第5分量); pdXfer* = 传输量与耗时统计
     ttftX: 0, pdXferBytes: 0, pdXferSpanSum: 0, pdXferSoloSum: 0, pdXferCount: 0,
     fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
@@ -3606,6 +3613,12 @@ function runSimulation(strategy, overrides) {
       _cW = 0;
       _fW = Math.max(0, req.prefillEnd - req.prefillStart);
     }
+    // computeNet(2026-08-24): compute 残差中的**纯 GPU 计算**部分。
+    // _cNet 是逐步累计的独占份额(perReqTok × τ(pos), 见主循环)。上界裁剪到 _cW:
+    //   物理上纯计算不可能超过 prefill 墙钟残差; 超出只可能来自 DT 离散化(末步推进超出 _pfTotal)。
+    // ⇒ computeWait = compute − computeNet ≥ 0 恒成立, 三者构成严格加性分解。
+    let _cNet = Math.min(_cW, Math.max(0, req._cNet || 0));
+    stats.ttftCnet += _cNet;
     stats.ttftQ += _qW; stats.ttftP += _pW; stats.ttftF += _fW; stats.ttftC += _cW;
     // PD 真分离: P→D KV 传输段(prefillEnd → KV 到位), 是 TTFT 的第 5 个分量。
     // 非真分离档恒为 0 ⇒ 分解口径与改动前一致。
@@ -3986,13 +3999,15 @@ function runSimulation(strategy, overrides) {
       let nAct = 0;
       for (let qi = 0; qi < prefilling.length; qi++) {
         let qq = prefilling[qi];
+        qq._tauNow = 0;   // 本步该请求的 τ(pos); 0 = 本步不占算力(拉取中/已算完), 见下方 computeNet 累计
         if (qq._race) {
           // race: 阶段0 GPU 从前往后计算前缀[0, H](pos=已算前缀数, 位置从0递增);
           // 相遇后阶段1 计算非复用后缀[H, L](pos=H+已算后缀数, 位置从H递增)
           let H = qq._pfStartPos || 0;
           let pos = qq._raceMeetTok < 0 ? qq._pfDone
             : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
-          sumCost += prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b(卡数不同)
+          qq._tauNow = prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b(卡数不同)
+          sumCost += qq._tauNow;
           nAct++;
           continue;
         }
@@ -4009,10 +4024,20 @@ function runSimulation(strategy, overrides) {
           // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
           pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
         }
-        sumCost += prefillTau(pP, pos);     // PD 真分离: prefill 走 P 节点 a/b
+        qq._tauNow = prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b
+        sumCost += qq._tauNow;
         nAct++;
       }
       let perReqTok = sumCost > 0 ? gpuTime / sumCost : 0; // 每请求每步推进 token 数
+      // computeNet 累计(2026-08-24): 每个活跃请求本步**独占**的 GPU 时间 = perReqTok × τ(pos)。
+      // 守恒校验: Σ(perReqTok × τᵢ) = perReqTok × sumCost = gpuTime —— 一份 GPU 供给被完整瓜分。
+      // ⇒ 累计到请求上就是"若独占 GPU 需多久", 与并发数无关; compute − 它 = 算力竞争等待。
+      if (perReqTok > 0) {
+        for (let qi = 0; qi < prefilling.length; qi++) {
+          let qq = prefilling[qi];
+          if (qq._tauNow > 0) qq._cNet = (qq._cNet || 0) + perReqTok * qq._tauNow;
+        }
+      }
       // GPU 占用画像(2026-08-21): 补齐 compute 分量看不到的信息。
       // 背景: ttftBreakdown.compute 是**残差**(prefill墙钟 − 拉取等待), 拉取慢时会被挤压到
       // 甚至小于"单请求独占计算时间" —— 只看它会误判"计算不是瓶颈", 实际是 GPU 被存储饿死。
@@ -4156,9 +4181,15 @@ function runSimulation(strategy, overrides) {
             let cost = 0;
             for (let m of curWave.members) {
               let posMid = (m.q._pfStartPos || 0) + m.q._pfDone + m.chunk / 2;
-              cost += m.chunk * prefillTau(pP, posMid);   // PD 真分离: 波次同样走 P 节点 a/b
+              m._cost = m.chunk * prefillTau(pP, posMid);   // PD 真分离: 波次同样走 P 节点 a/b
+              cost += m._cost;
             }
             curWave.endT = now + cost / Math.max(wBoost * wPfFactor, 1e-9);
+            // computeNet(2026-08-24, 波次口径): 成员自身 chunk 的计算时间(经 boost/折扣缩放)。
+            // 守恒: Σ(m._cost)/(wBoost·wPfFactor) = 波耗时 ⇒ 各成员份额之和 = 整波墙钟。
+            // 波次模式下成员等整波结束才推进 ⇒ compute − computeNet = 等其他成员算完的时间。
+            for (let m of curWave.members)
+              m.q._cNet = (m.q._cNet || 0) + m._cost / Math.max(wBoost * wPfFactor, 1e-9);
             for (let m of curWave.members) m.q._wvInFlight = m.chunk; // 在飞 chunk 登记(组波时扣除)
           }
         }
@@ -4543,6 +4574,15 @@ function runSimulation(strategy, overrides) {
       prefillQ: stats.ttftP / stats.completed * 1000,
       fetch: stats.ttftF / stats.completed * 1000,
       compute: stats.ttftC / stats.completed * 1000,
+      // ---- compute 的二级拆分(2026-08-24): compute = computeNet + computeWait ----
+      // computeNet : **纯 GPU 计算**(每步独占份额 perReqTok × τ(pos) 累计)。与并发数无关,
+      //   等于"该请求若独占 GPU 需算多久" ⇒ 可直接对标解析式 prefillIntegral 的增量。
+      // computeWait: **算力竞争等待** = compute − computeNet。N 个请求瓜分算力时, 每个请求
+      //   都把整段墙钟记进自己的 compute, 差额就是被别人占用算力的时长。
+      //   (注意: 拉取等待已单列为 fetch, 不在这里; 这一项纯粹是算力侧竞争。)
+      // 波次模式下 computeWait 还含"等整波其他成员算完"的波次量化等待。
+      computeNet: stats.ttftCnet / stats.completed * 1000,
+      computeWait: Math.max(0, (stats.ttftC - stats.ttftCnet)) / stats.completed * 1000,
       dWait: stats.latDw / stats.completed * 1000,
       dTime: stats.latDt / stats.completed * 1000,
       // prefill 传输独立用时（ms, 未与计算重叠前）: wait_complete 下 ≈fetch(串行);
@@ -4737,6 +4777,24 @@ function drawStrategyMetrics() {
       // 计算时间(实测: 残差 134ms < 独占 185ms), 只看它会误判"计算不是瓶颈"。
       // 真实算力使用看下面两张卡(GPU忙碌 / 并发计算数)。
       ['Prefill 计算(残差)', sr.ttftBreakdown ? sr.ttftBreakdown.compute.toFixed(0)+' ms' : '—', 'accent'],
+      // ★ compute 的二级拆分(2026-08-24): compute = 纯计算 + 算力竞争等待
+      // ├ 纯计算   = 每步该请求**独占**的 GPU 时间(perReqTok × τ(pos))逐步累计。
+      //             与并发数无关(实测 qps 1→1000 离散仅 1.41%), 直接对标解析式
+      //             prefillIntegral 增量(误差 2.5%, 优于"compute÷并发"的 10.3%)。
+      // └ 算力竞争 = compute − 纯计算。N 个请求瓜分算力时, 每个都把整段墙钟记进自己的
+      //             compute, 差额即被他人占用算力的时长。⚠️ 不含拉取等待(那在 fetch 里)。
+      // 波次模式下"算力竞争"还含等整波其他成员算完的波次量化等待。
+      ['├ 纯计算(独占)', sr.ttftBreakdown && sr.ttftBreakdown.computeNet != null
+        ? sr.ttftBreakdown.computeNet.toFixed(0)+' ms' : '—', 'green'],
+      // 竞争等待占 compute 过半 ⇒ 算力已被并发瓜分严重, 标红
+      ['└ 算力竞争等待', sr.ttftBreakdown && sr.ttftBreakdown.computeWait != null
+        ? sr.ttftBreakdown.computeWait.toFixed(0)+' ms ('
+          + (sr.ttftBreakdown.computeWait / Math.max(sr.ttftBreakdown.compute, 1e-9) * 100).toFixed(0)
+          + '%)' : '—',
+        (sr.ttftBreakdown && sr.ttftBreakdown.computeWait
+          > sr.ttftBreakdown.compute * 0.5) ? 'red'
+          : ((sr.ttftBreakdown && sr.ttftBreakdown.computeWait
+              > sr.ttftBreakdown.compute * 0.25) ? 'orange' : 'green')],
       // GPU 占用画像(2026-08-21): 区分"计算便宜"与"GPU 被存储饿死"
       ['Prefill GPU忙碌', sr.ttftBreakdown && sr.ttftBreakdown.computeBusyMs != null
         ? sr.ttftBreakdown.computeBusyMs.toFixed(0)+' ms ('+(sr.ttftBreakdown.computeBusyPct||0).toFixed(0)+'%窗口)' : '—', 'accent'],
@@ -4745,6 +4803,18 @@ function drawStrategyMetrics() {
         ? sr.ttftBreakdown.computeConc.toFixed(1)+' 个' : '—',
         (sr.ttftBreakdown && sr.ttftBreakdown.computeConc < 2) ? 'red'
           : ((sr.ttftBreakdown && sr.ttftBreakdown.computeConc < 5) ? 'orange' : 'green')],
+      // ⚠️ 已被上面「├ 纯计算(独占)」取代(2026-08-24): 那是逐步累计的**直接测量**,
+      // 这里的 compute÷并发 只是**比值估计**(实测误差 10.3% vs 直接测量 2.5%,
+      // 因为 computeConc 是"GPU 忙时的条件平均", 与逐请求口径不完全一致)。
+      // 保留此卡作**口径交叉校验**: 两者偏差大 ⇒ 并发分布很不均匀(有请求长期独占/长期挨饿)。
+      ['└ 校验:残差÷并发', sr.ttftBreakdown && sr.ttftBreakdown.computeConc > 0
+        ? (sr.ttftBreakdown.compute / sr.ttftBreakdown.computeConc).toFixed(0)+' ms'
+          + (sr.ttftBreakdown.computeNet > 0
+            ? ' (vs 直测 '
+              + ((sr.ttftBreakdown.compute / sr.ttftBreakdown.computeConc
+                  / sr.ttftBreakdown.computeNet - 1) * 100).toFixed(0) + '%)'
+            : '')
+        : '—', 'accent'],
       // PD 真分离(2026-08-20): P→D KV 传输是 TTFT 的新增分量, 只在真分离档非 0
       ['PD KV传输(TTFT内)', sr.pd ? (sr.ttftBreakdown ? sr.ttftBreakdown.xfer.toFixed(0)+' ms' : '—') : '—',
         sr.pd && sr.ttftBreakdown && sr.ttftBreakdown.xfer > sr.ttftBreakdown.compute ? 'red' : 'orange'],
@@ -4838,9 +4908,12 @@ function drawStrategyTierDemand(){
   // 图1: TTFT 分解 + passTime 分解（各 100% 堆叠，每策略两条）
   // TTFT 条 = prefill 段时间账（到达排队/准入排队/L3拉取/计算）；passTime 条 = decode 每 token 前向账
   // ——区分「TTFT 时间花在哪」vs「延迟(每前向)时间花在哪」，L3 拉取与 L3 读的落点一目了然
-  let ttftNames = ['TTFT·到达排队','TTFT·prefill排队','TTFT·L3拉取','TTFT·prefill计算'];
-  let ttftKeys = ['queue','prefillQ','fetch','compute'];
-  let ttftColors = ['#B5D4F4','#85B7EB','#FAC775','#185FA5'];
+  // compute 拆成两段(2026-08-24): 纯计算(独占 GPU) + 算力竞争等待(被其他请求瓜分算力)。
+  // 这样一眼能分清"计算真的贵" vs "算力被并发瓜分" —— 前者要加算力, 后者要做并发准入控制。
+  // 兼容: computeNet/computeWait 缺失(旧结果)时回退为整块 compute 记入"纯计算"段。
+  let ttftNames = ['TTFT·到达排队','TTFT·prefill排队','TTFT·L3拉取','TTFT·纯计算','TTFT·算力竞争等待'];
+  let ttftKeys = ['queue','prefillQ','fetch','computeNet','computeWait'];
+  let ttftColors = ['#B5D4F4','#85B7EB','#FAC775','#185FA5','#C8341F'];
   let ycats = [];
   simResults.forEach(s => { ycats.push(s.name + ' · TTFT'); ycats.push(s.name + ' · 每token前向'); });
   let ch = initChart('chartStrategyPt');
@@ -4854,7 +4927,12 @@ function drawStrategyTierDemand(){
       ...ttftKeys.map((k,i)=>({
         name:ttftNames[i],type:'bar',stack:'ttft',barMaxWidth:22,
         data:simResults.map(s=>{ let b=s.ttftBreakdown; if(!b) return 0;
-          let t=b.queue+b.prefillQ+b.fetch+b.compute; return t>0?+(b[k]/t*100).toFixed(1):0; }),
+          let t=b.queue+b.prefillQ+b.fetch+b.compute;
+          // 旧结果无二级拆分字段 ⇒ 整块 compute 归入"纯计算", 竞争段为 0(口径向后兼容)
+          let v = (b.computeNet == null)
+            ? (k==='computeNet' ? b.compute : (k==='computeWait' ? 0 : b[k]))
+            : b[k];
+          return t>0?+((v||0)/t*100).toFixed(1):0; }),
         itemStyle:{color:ttftColors[i]}
       })),
       ...keys.map(k=>({
@@ -4899,7 +4977,8 @@ function drawStrategyTierDemand(){
     '<b>📐 L2/L3 需求推导（实测轨迹 → 所需资源，任意代码策略适用）</b><br>'+
     '• <b>带宽需求</b>: 每步瞬时链路速率 = decode读(<code>ΣKV<sub>T</sub>/passTime</code>) + 本步换入换出字节/DT；取 <code>P99 分位 = 推荐所需带宽</code>（峰值评估最坏突发）——平均口径会低估，预取/淘汰突发才是需求决定因素<br>'+
     '• <b>容量需求</b>: 该策略下 L2/L3 峰值占用（低于它必发生淘汰/丢弃/排队）<br>'+
-    '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + prefill计算——TTFT 时间花在哪<br>'+
+    '• <b>TTFT 分解</b>（每个策略上条）: 到达排队(→准入) + prefill排队(→prefill开始) + <b>L3拉取fetch</b>(前缀KV从SSD拉回, wait_complete) + <b>纯计算</b> + <b>算力竞争等待</b>——TTFT 时间花在哪<br>'+
+    '• <b>compute 已二级拆分</b>（2026-08-24）: 原来的「prefill计算」是<b>墙钟残差</b>，里面混着真计算与算力竞争等待，现在拆开：<code>纯计算(独占)</code>= 每步该请求<b>独占</b>的 GPU 时间（<code>perReqTok × τ(pos)</code> 逐步累计，守恒: 各请求份额之和 = 本步 GPU 总供给），<b>与并发数无关</b>——实测 qps 1→1000 离散仅 1.41%，直接对标解析式 <code>prefillIntegral</code> 增量（误差 2.5%，优于「残差÷并发」的 10.3%）；<code>算力竞争等待</code>= <code>compute − 纯计算</code>，即被<b>其他请求占用算力</b>的时长（N 个请求瓜分算力时，每个都把整段墙钟记进自己的 compute，差额就是它）。<b>⚠️ 不含拉取等待</b>（那已单列为 fetch）。波次组批模式下这一项还含「等整波其他成员算完」的波次量化等待。<b>诊断价值</b>: 纯计算占主体 ⇒ 真的算力不足，该加卡/降精度/上稀疏；竞争等待占主体（卡片标红）⇒ 算力被并发瓜分，该做 prefill 并发准入控制（收紧 <code>pPrefillSlots</code>），加算力收益有限。实测 B300×8+Kimi-K2+h95: 纯计算恒 89ms，而竞争等待随 qps 从 20ms 涨到 91ms（占 compute 由 18.6% 升到 50.8%）<br>'+
     '• <b>每token前向分解</b>（下条, 原 passTime 分解）: 名义分量 <code>HBM读/L2读/L3读/算力/TP通信</code> 占比（passTime = max[带宽和,算力] + 通信），占比最大者 = 当前瓶颈——decode 延迟时间花在哪<br>'+
     '• <b>两者分工</b>: TTFT 条揭示 <code>fetch vs prefill计算</code> 的 trade-off（L3 拉取代价占比）；前向条揭示 decode 的 L3 读占比（如 77%）——同一图表区分 TTFT 与延迟（每前向）的分解<br>'+
     '• <b>传输 vs 计算</b>（结果卡片）: <code>Prefill 传输(独立)</code>=<b>仿真过程中的实际传输耗时</b>——用真实时间戳差独立测量，含 L3 并发带宽排队、不含计算，<b>不会被计算覆盖</b>（wc=prefill开始→拉完; race=prefill开始→相遇点, 即被计算重叠隐藏的拉取过程; be=到达→拉完或准入终止）。<code>Prefill 计算(残差)</code>=<b>墙钟残差</b>（prefill墙钟 − 拉取等待），<b>不是独立测量</b>：拉取慢时它会被挤压到甚至小于「单请求独占计算时间」（实测双实例 50GB/s 下残差 134ms &lt; 独占 185ms），<b>只看它会误判「计算不是瓶颈」</b>。要判断算力是否真的空闲，看新增的 <code>Prefill GPU忙碌</code>（GPU 真在算 prefill 的墙钟总时长，跨实例累加，括号内为占仿真窗口比例）与 <code>并发计算请求数</code>（平均同时占算力的请求数）：<b>并发数≈1 ⇒ 流水线空转、GPU 被存储饿死</b>（此时该提 L3 带宽或关「重复拉取」，而不是优化计算）；远大于 1 ⇒ 算力已填满，残差 compute 才真实反映计算成本。实测对照：SSD 50GB/s 时并发 1.3 个、残差 134ms；提到 200GB/s 后残差跳到 2200ms——计算成本一直都在，之前被拉取等待吃掉了。<code>Decode 传输/pass(独立)</code>=L2+L3 跨层读(含链路排队)，<code>Decode 计算/pass(独立)</code>=HBM读+算力下限+TP通信；passTime = max(带宽项, 算力项)+通信 ⇒ 两项独立用时中较大者主导实际每前向耗时。勾选「Decode 从 L3 重读」后已拉取前缀块 decode 期按 SSD 读计费(模拟 KV 被驱逐场景)，Decode 传输/pass 将显著上升；decode 的 L3 重读与 prefill 拉取共享同一总线且按需读优先 ⇒ 低带宽下 Prefill 传输(独立) 也会因挤占而上升。取消勾选「Prefill 每请求重复拉取」(=单飞去重) 后同组前缀只拉一次 ⇒ 拉取字节与 Prefill 传输(独立) 显著下降<br>'+
@@ -4957,7 +5036,14 @@ function extractSensMetrics(r) {
     // hit_rate 保持"HBM 访问命中率"语义(历史敏感性/导出口径); 前缀分层命中率见 prefix_hit_rate
     throughput: r.throughput, hit_rate: r.hbmHitRate, mem_util: r.memUtilPeak, p99_latency: r.p99,
     prefix_hit_rate: r.hitRate ? r.hitRate.total : 0,
-    fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0 };  // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
+    fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0,   // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
+    // compute 二级拆分的扫描指标(2026-08-24): 用于扫出"带宽/并发提升把等待从存储搬到算力"的曲线。
+    // compute_net  : 纯计算(ms) —— 与并发/带宽都无关的基线, 扫描曲线应近似水平(可作正确性哨兵)
+    // compute_wait : 算力竞争等待(ms) —— 随并发单调上升
+    // compute_wait_ratio: 竞争等待占 compute 的比例(%) —— >50% ⇒ 该做并发准入控制而非加算力
+    compute_net: b ? (b.computeNet || 0) : 0,
+    compute_wait: b ? (b.computeWait || 0) : 0,
+    compute_wait_ratio: (b && b.compute > 0) ? 100 * (b.computeWait || 0) / b.compute : 0 };
 }
 
 // 各参数默认档位（选择对比参数时自动填充；可手动编辑）
@@ -5032,7 +5118,7 @@ function runSensitivity() {
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)'}[metric];
+  let metricLabel = {hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)', compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)'}[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
   // ③ 预取策略（第三维=节点形状）：勾选的要对比的策略；prefetch.type 映射 wait_complete→none
