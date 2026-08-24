@@ -203,6 +203,11 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           <button class="preset-tag" data-hw="a100x8">A100×8</button>
           <button class="preset-tag" data-hw="b200x8">B200×8</button>
           <button class="preset-tag" data-hw="b300x8" title="NVIDIA HGX/DGX B300 (Blackwell Ultra): 288GB HBM3E/卡 × 8 = 2.3TB 显存池, HBM 8TB/s, NVLink5 1.8TB/s, PCIe Gen6 256GB/s。&#10;算力填 BF16/FP16 dense 2250 TFLOPS —— 与 B200 相同(Blackwell Ultra 的提升在显存容量与 NVFP4/attention, BF16 与 FP8 未变)。&#10;⇒ 在本仿真中 B300 vs B200 的差异体现在 KV 容量: 每卡多 96GB, 8 卡多 768GB, 对长上下文与高前缀命中场景收益显著。">B300×8</button>
+          <span style="display:inline-block;width:1px;height:14px;background:var(--border);margin:0 4px;vertical-align:middle" title="以下为国产 AI 芯片"></span>
+          <button class="preset-tag" data-hw="a950pr8" title="华为昇腾 950PR ×8 (2026Q1, Atlas 350 标卡) —— 面向推理 Prefill 与推荐场景。&#10;自研 HBM HiBL 1.0: 128GB/卡 × 8 = 1TB 显存池, 带宽 1.6TB/s(四款国产卡里最低——prefill 算力密集, 对带宽不敏感)。&#10;灵衢(UB)互联 2TB/s。&#10;⚠️ 算力口径: 官方公布 FP8 = 1 PFLOPS, 而本预设 tflops 字段统一按 BF16 填(与 NVIDIA 各卡可比), 故折算为 500 TFLOPS。若负载确实跑 FP8, 请手动改成 1000。">昇腾950PR×8</button>
+          <button class="preset-tag" data-hw="a950dt8" title="华为昇腾 950DT ×8 (2026Q4) —— 面向推理 Decode 与训练。&#10;自研 HBM HiZQ 2.0: 144GB/卡 × 8 = 1.15TB 显存池, 带宽 4TB/s(是 950PR 的 2.5×)。&#10;⇒ PR 与 DT 的核心区别就在带宽: decode 是访存密集型, 所以 DT 把带宽拉到 4TB/s。&#10;算力与互联同 950PR。&#10;⚠️ 部分媒体把 PR/DT 的显存参数写反了, 此处以华为全联接大会 2025 官方口径为准。">昇腾950DT×8</button>
+          <button class="preset-tag" data-hw="klxp800x8" title="昆仑芯 P800 ×8 (百度, 昆仑芯三代 XPU-P, 2024 量产) —— 96GB HBM3/卡 × 8 = 768GB, 带宽 2.4TB/s。&#10;FP16/BF16 345 TFLOPS(官方称约为 H20 的 2.3×), 400W, OAM 模组, 节点内 XPU Link。&#10;⇒ 单机 8 卡即可跑 DS-V3/R1 671B 满血版(768GB 刚好装下 FP8 权重), 这是它最常被引用的卖点。&#10;算力口径为 FP16, 与 NVIDIA 各卡直接可比。">昆仑芯P800×8</button>
+          <button class="preset-tag" data-hw="klxp900x32" title="昆仑芯 P900 天池超节点 ×32 (2026) —— 四款国产卡里唯一的超节点形态。&#10;单柜 32 卡全互联, 显存池 3072GB ⇒ 每卡 96GB; 卡间 400GB/s, 时延 1.5μs。&#10;GPU 数默认给 32(而非 8): 百度官方 DS-R1 部署方案正是 32 卡占满一个 P900 做 Decode(TP1+EP32)。&#10;⚠️ 单卡算力与显存带宽官方均未公布, 690 TFLOPS 与 4.8TB/s 是按 P800 的 2× 估算, 不确定性较大 —— 做定量结论前请自行校准。">昆仑芯P900×32</button>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
           <div><label>GPU数</label><input type="number" id="pGpuCount" value="8" min="1"></div>
@@ -633,7 +638,42 @@ let hwPresets = {
   //    所以本仿真(BF16 口径)下 B300 与 B200 的算力相同, 差异体现在 KV 容量, 这正是它对
   //    长上下文/高前缀命中场景的价值所在。若要按 FP8 或 NVFP4 口径评估请手动改此字段。
   // NVLink5 1.8TB/s; PCIe Gen6 x16 = 256GB/s 双向(B200 为 Gen5 128GB/s)。
-  'b300x8': {hbm:288,hbmBW:8,   tflops:2250,tp:8, nvlink:1800, pcie:256, dram:2048, dramBW:500, ssd:40, ssdBW:50, gpus:8}
+  'b300x8': {hbm:288,hbmBW:8,   tflops:2250,tp:8, nvlink:1800, pcie:256, dram:2048, dramBW:500, ssd:40, ssdBW:50, gpus:8},
+
+  // ======== 国产 AI 芯片(2026-08-24 新增) ========
+  // ⚠️ 算力口径统一说明: 上面 NVIDIA 各卡填的是 **BF16/FP16 dense**。国产卡官方普遍
+  //    只公布 FP8/FP4 峰值(昇腾 950)或 FP16 峰值(昆仑芯), 为保证可比性:
+  //    · 昇腾 950PR/DT: 官方 FP8 = 1 PFLOPS。本仿真默认 dtype 常用 FP8, 但 tflops 字段
+  //      口径是 BF16 ⇒ 按"FP8 吞吐通常为 BF16 的 2×"折算 BF16 ≈ 500 TFLOPS。
+  //      若你的负载确实跑 FP8, 请手动把 tflops 改成 1000。
+  //    · 昆仑芯 P800: 官方直接给 FP16/BF16 = 345 TFLOPS, 可直接填。
+  //    · 昆仑芯 P900: 官方未公布单卡算力细节, 按 P800 的 2× 估 690(**估算值**)。
+
+  // 华为昇腾 950PR (2026Q1, Atlas 350 标卡): 面向 **推理 Prefill 与推荐** 场景。
+  // 自研 HBM HiBL 1.0: 128GB / 1.6TB/s —— 容量尚可但**带宽是四款里最低的**,
+  // 这正好对应它的定位(prefill 是算力密集型, 对带宽不敏感)。
+  // 灵衢(UB)互联 2TB/s = 2000GB/s(相当于 NVLink 位置); 主机侧按 PCIe 5.0 x16 = 128GB/s。
+  'a950pr8': {hbm:128,hbmBW:1.6, tflops:500, tp:8, nvlink:2000, pcie:128, dram:1024, dramBW:400, ssd:20, ssdBW:50, gpus:8},
+
+  // 华为昇腾 950DT (2026Q4): 面向 **推理 Decode 与训练**。自研 HBM HiZQ 2.0:
+  // 144GB / **4TB/s** —— 带宽是 950PR 的 2.5×, 这是 PR/DT 分工的核心区别
+  // (decode 是访存密集型)。算力/互联与 950PR 相同。
+  // ⚠️ 注意有媒体(中国电子报等)把 PR/DT 的显存参数写反了(说 PR=144GB/4TB/s、
+  //    DT=128GB/1.6TB/s), 此处以华为全联接大会 2025 官方口径为准(多个一手来源一致)。
+  'a950dt8': {hbm:144,hbmBW:4,   tflops:500, tp:8, nvlink:2000, pcie:128, dram:1024, dramBW:400, ssd:20, ssdBW:50, gpus:8},
+
+  // 昆仑芯 P800 (百度, 昆仑芯三代 XPU-P, 2024 量产): 96GB HBM3 / 2.4TB/s,
+  // FP16 345 TFLOPS(官方称约为 H20 的 2.3×), 400W, OAM 模组。
+  // 单机 8 卡即可跑 DS-V3/R1 671B 满血版 —— 96×8=768GB 刚好装下 FP8 权重。
+  // 节点内 XPU Link; 主机 PCIe 5.0 x16 = 128GB/s。
+  'klxp800x8': {hbm:96, hbmBW:2.4, tflops:345, tp:8, nvlink:400, pcie:128, dram:1024, dramBW:400, ssd:20, ssdBW:50, gpus:8},
+
+  // 昆仑芯 P900 (天池超节点, 2026): **单柜 32 卡**全互联, 显存池 3072GB ⇒ 每卡 96GB。
+  // 卡间 400GB/s、时延 1.5μs。这是四款里唯一的**超节点形态**, gpus 默认给 32
+  // (而非 8) —— 百度官方 DS-R1 部署方案正是 32 卡占满一个 P900 做 Decode(TP1+EP32)。
+  // ⚠️ 单卡算力官方未公布, 690 TFLOPS 是按 P800 的 2× **估算**; 显存带宽同样按
+  //    P800 的 2× 估为 4.8TB/s。这两项不确定性较大, 做定量结论前请自行校准。
+  'klxp900x32': {hbm:96, hbmBW:4.8, tflops:690, tp:32, nvlink:400, pcie:128, dram:2048, dramBW:500, ssd:40, ssdBW:50, gpus:32}
 };
 
 let currentModel = 'Llama-3-70B';
