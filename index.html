@@ -601,6 +601,23 @@ let models = {
   // 参数量核算: 激活 50.9B(官方 ~50B) / 总 1000B(官方 1T) ✓
   'Ling-1T': {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:157184,
     paramsB:1000, actB:51},
+  // GLM-5.1 (智谱 AI, 2026-04, MIT): 744B-A40B MoE + MLA + DSA 稀疏注意力。
+  // 官方 config.json 逐字段(三源交叉验证: HF raw / transformers 文档 / ModelScope 量化版):
+  //   model_type=glm_moe_dsa / num_hidden_layers=78(前 3 层 dense + 75 层 MoE) / hidden_size=6144 /
+  //   num_attention_heads=64 / kv_lora_rank=512 / qk_rope_head_dim=64 / qk_nope_head_dim=192 /
+  //   v_head_dim=256 / vocab_size=154880 / n_routed_experts=256 top-8 + 1 shared /
+  //   index_topk=2048 / index_n_heads=32 / index_head_dim=128 / max_position_embeddings=202752
+  // ★ 与 DeepSeek 系列(V3/V3.2/K2)的两处关键差异, 直接影响本平台的 KV 与 prefill 口径:
+  //   ① **层数 78 而非 61** ⇒ KV/token = 78×(512+64)×dt, 比 DS 系列高 27.9%
+  //      (BF16 87.8KB / FP8 43.9KB, 对比 DS-V3/K2 的 68.6KB / 34.3KB)
+  //   ② **解压式 prefill 维度翻倍**: qk_nope 192(DS 是 128) + v_head_dim 256(DS 是 128)
+  //      ⇒ 每层每 head 维度和 = (192+64)+256 = 512, 是 DS 系列 320 的 1.60×
+  //      ⇒ 位置斜率 b 显著高于同为 MLA 的 K2, prefill 更贵 ⇒ 存储网占 TTFT 比例相应下降
+  // ⚠️ index_n_heads=32(DS-V3.2 是 64) ⇒ Indexer 打分开销只有 V3.2 的一半, 稀疏收益更纯。
+  // calibA/calibB 不设: 本架构无实测校准值, 由 Roofline 自动推导(见 estimatePrefillParams)。
+  'GLM-5.1': {attn:'mla', layers:78, kvLora:512, ropeDim:64, hidden:6144, vocab:154880,
+    paramsB:744, actB:40, qHeads:64, qkNope:192, vHeadDim:256,
+    sparse:true, sparseTopk:2048, idxHeads:32, idxHeadDim:128},
   'Custom':        {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:128000, paramsB:0, actB:0}
 };
 
@@ -1254,6 +1271,15 @@ var MODEL_TIPS = {
     + '⚠️★ KV/token BF16 = 320KB, 是 Kimi K2(68.6KB) 的 **4.7 倍** —— 同样 1T 参数,\n'
     + 'GQA vs MLA 让存储网压力差近 5 倍。这说明"1T 模型"这个说法不足以确定 KV 流量:\n'
     + '做存储网/L3 带宽建模必须看 attention 类型, 不能只看参数量。',
+  'GLM-5.1': '智谱 GLM-5.1 (2026-04, MIT): 744B-A40B MoE + MLA + DSA 稀疏注意力。\n'
+    + '官方 config: 78层(前3 dense + 75 MoE) / hidden 6144 / kv_lora 512 / rope 64 /\n'
+    + '64 attention heads / qk_nope 192 / v_head_dim 256 / vocab 154880 /\n'
+    + '256 experts top-8 + 1 shared / index_topk 2048 / 200K 上下文。\n'
+    + '★ 与 DeepSeek 系列(61层)的两处关键差异:\n'
+    + '① 层数 78 ⇒ KV/token 比 DS-V3/K2 高 27.9%(BF16 87.8KB vs 68.6KB) ⇒ L3 流量更大;\n'
+    + '② 解压式 prefill 维度和 512(DS 是 320, 1.60×) ⇒ 位置斜率 b 更高, prefill 更贵\n'
+    + '  ⇒ 存储网占 TTFT 的比例被计算侧摊薄。两个效应方向相反, 需实测定净向。\n'
+    + 'index_n_heads 仅 32(V3.2 是 64) ⇒ Indexer 打分开销减半, 稀疏收益更纯。',
 };
 function initParamsTab(){
   let bar = $('modelPresets');
