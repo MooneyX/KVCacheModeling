@@ -481,7 +481,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <span style="font-size:.73rem;color:var(--text-dim)">导出当前图表：</span>
       <button class="btn btn-sm" id="btnSensExportPng" disabled onclick="exportSensImage('png')" title="PNG 无损位图, 2× 像素比(高清, 贴进文档/PPT 缩放后不发虚)。背景为深色以匹配平台配色。">🖼 PNG</button>
       <button class="btn btn-sm" id="btnSensExportJpg" disabled onclick="exportSensImage('jpeg')" title="JPG 有损压缩, 体积约为 PNG 的 1/3, 适合邮件/IM 分享。&#10;注: JPEG 无透明通道, 已显式填充深色背景(否则透明区会压成纯黑)。">🖼 JPG</button>
-      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;附带: ①数据表(可一键复制为 TSV 粘进 Excel) ②方法说明 ③全参数快照(可粘回本平台「导入参数」复现同一次扫描)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
+      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★ 可在页内**切换纵轴指标**(20 项全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;附带: ①数据表(随指标同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③全参数快照(可粘回本平台「导入参数」复现同一次扫描)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
       <span id="sensExportNote" style="font-size:.72rem;color:var(--accent2)"></span>
     </div>
     <div class="formula-box" id="formulaSensitivity"></div>
@@ -5245,7 +5245,29 @@ function buildSensHtml() {
   // JSON 内嵌进 <script> 时必须断开 "</" , 否则含该串会提前闭合脚本标签
   let safeJson = function (o) { return JSON.stringify(o).replace(/<\//g, '<\\/'); };
 
+  // ===== 指标切换数据(2026-08-25) =====
+  // 一次扫描的每个点本就带齐全部指标(extractSensMetrics), 把它们全部烧进导出页 ⇒
+  // 收图的人无需回到平台重跑就能换纵轴看同一批仿真的其他指标。
+  // 数值口径与平台绘图**完全一致**(同样 +toFixed(1)), 保证"导出页切到指标X == 平台切到指标X"。
+  // 只收录 curveRecs 里真实存在该字段的指标; 老快照(无 curveRecs)则整个功能降级隐藏。
+  let recs = st.curveRecs || null;
+  let metricData = {}, metricKeys = [];
+  if (recs && recs.length) {
+    Object.keys(SENS_METRIC_LABEL).forEach(function (k) {
+      let any = false;
+      let cols = recs.map(function (arr) {
+        return (arr || []).map(function (rec) {
+          if (rec && rec[k] != null && isFinite(rec[k])) { any = true; return +Number(rec[k]).toFixed(1); }
+          return 0;
+        });
+      });
+      if (any) { metricData[k] = cols; metricKeys.push(k); }
+    });
+  }
+  let hasSwitch = metricKeys.length > 1;
+
   // 数据表: 行 = 横轴档位, 列 = 各系列。离线打不开图时这份数字仍完整可用
+  // (切换指标时由页内 renderTable() 重绘, 此处生成的是当前指标的初始版本)
   let sers = (opt.series || []);
   let head = '<tr><th>' + esc(st.paramLabel) + '</th>'
     + sers.map(function (s) { return '<th>' + esc(s.name) + '</th>'; }).join('') + '</tr>';
@@ -5258,13 +5280,16 @@ function buildSensHtml() {
   }).join('\n');
 
   // 维度摘要(纯文本, 不含 HTML 标签) —— descHtml 里有 <code>, 直接复用即可
+  // 「纵轴」一项在切换指标时要跟着变 ⇒ 单独拆出来给个 id, 由页内 applyMetric() 改写,
+  //  否则头部写着"纵轴：平均TTFT"而图上画的是吞吐, 收图的人会被误导。
   let dims = [];
   dims.push('横轴：' + st.paramLabel);
   if (st.compareParam) dims.push('颜色：' + SENS_PARAM_LABEL[st.compareParam]
     + '（' + st.compareVals.join(', ') + '）');
   if (st.hasPf) dims.push('形状：' + (st.shapeDim === 'gpu_preset' ? 'GPU硬件' : '预取策略')
     + '（' + st.shapeList.join(' / ') + '）');
-  dims.push('纵轴：' + st.metricLabel);
+  let dimsHtml = dims.map(esc).join(' ｜ ')
+    + ' ｜ 纵轴：<span id="dimY">' + esc(st.metricLabel) + '</span>';
 
   let L = [];
   L.push('<!DOCTYPE html>');
@@ -5293,11 +5318,40 @@ function buildSensHtml() {
   L.push('h2{font-size:.9rem;margin:0 0 10px;display:flex;align-items:center;gap:10px}');
   L.push('pre{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;overflow:auto;font-size:.7rem;color:var(--text-dim);max-height:220px;margin:0}');
   L.push('.foot{color:var(--text-dim);font-size:.72rem;text-align:center;padding:8px 0 0}');
+  // 指标切换条: 下拉 + 快捷按钮组(点一下即切, 比拉下拉快)
+  L.push('.mbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}');
+  L.push('.mbar label{font-size:.75rem;color:var(--text-dim)}');
+  L.push('select{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:.76rem}');
+  L.push('.chip{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:.71rem;cursor:pointer}');
+  L.push('.chip:hover{border-color:var(--accent);color:var(--text)}');
+  L.push('.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}');
   L.push('</style></head><body><div class="wrap">');
   L.push('<h1>参数<span>敏感性</span>分析</h1>');
-  L.push('<p class="sub">' + esc(dims.join(' ｜ ')) + '<br>基准策略 <b>' + esc(st.strategyName)
+  L.push('<p class="sub">' + dimsHtml + '<br>基准策略 <b>' + esc(st.strategyName)
     + '</b> · 随机种子 ' + esc(st.seed) + ' · 导出于 ' + esc(st.at.toLocaleString('zh-CN')) + '</p>');
-  L.push('<div class="card"><div id="chart"></div></div>');
+  L.push('<div class="card">');
+  if (hasSwitch) {
+    // 只在有 ≥2 个可用指标时才出现切换条 —— 单指标时下拉是噪音
+    L.push('<div class="mbar"><label>纵轴指标</label><select id="mSel">'
+      + metricKeys.map(function (k) {
+          return '<option value="' + esc(k) + '"' + (k === st.metric ? ' selected' : '') + '>'
+            + esc(SENS_METRIC_LABEL[k]) + '</option>';
+        }).join('')
+      + '</select>');
+    // 常用指标快捷 chip(只放本次扫描确实有数据的)
+    let quick = ['ttft', 'ttft_p99', 'latency', 'tpot', 'throughput', 'fetch_ratio',
+      'prefix_hit_rate', 'compute_net', 'compute_wait', 'prefill_thr'].filter(function (k) { return metricKeys.indexOf(k) >= 0; });
+    if (quick.length) {
+      L.push('<span style="color:var(--border)">|</span>');
+      L.push(quick.map(function (k) {
+        return '<button class="chip" data-m="' + esc(k) + '">' + esc(SENS_METRIC_LABEL[k]) + '</button>';
+      }).join(''));
+    }
+    L.push('<span id="mNote" style="font-size:.71rem;color:var(--text-dim);margin-left:auto">'
+      + '共 ' + metricKeys.length + ' 个指标 · 同一批仿真结果，切换零重算</span>');
+    L.push('</div>');
+  }
+  L.push('<div id="chart"></div></div>');
   L.push('<div class="card"><div class="box"><b>📐 敏感度分析方法</b><br>' + st.descHtml
     + '<br>共同随机数法：扫描时固定其他全部参数与随机种子，因此曲线差异只来自横轴（与颜色/形状）维度本身。</div></div>');
   L.push('<div class="card"><h2>📋 数据表 <button class="btn" onclick="copyTsv()">复制为 TSV（可直接粘贴到 Excel）</button>'
@@ -5307,10 +5361,23 @@ function buildSensHtml() {
     L.push('<div class="card"><h2>🔧 参数快照（可粘回平台「导入参数」以复现本次扫描）</h2>');
     L.push('<pre>' + esc(st.paramsJson) + '</pre></div>');
   }
-  L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放）需联网加载 echarts；离线时数据表仍完整可用</p>');
+  L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放'
+    + (hasSwitch ? ' / 指标切换' : '') + '）需联网加载 echarts；离线时数据表仍完整可用</p>');
   L.push('</div>');
   L.push('<script>');
   L.push('var OPT = ' + safeJson(opt) + ';');
+  // ---- 指标切换的三份数据(2026-08-25) ----
+  // METRIC_DATA[key][seriesIndex][pointIndex] = 数值(已 toFixed(1), 与平台绘图同口径)
+  // 无切换能力时(老快照/单指标)这三份为空, 页内逻辑走 hasSwitch=false 分支
+  L.push('var METRIC_DATA = ' + safeJson(metricData) + ';');
+  L.push('var METRIC_LABEL = ' + safeJson((function () {
+    let m = {}; metricKeys.forEach(function (k) { m[k] = SENS_METRIC_LABEL[k]; }); return m;
+  })()) + ';');
+  L.push('var CUR_METRIC = ' + safeJson(st.metric) + ';');
+  L.push('var X_LABEL = ' + safeJson(st.paramLabel) + ';');
+  // IS_MULTI: 多曲线(有颜色/形状维) ⇒ series.name 是"档位·形状"标签, 切指标时**不能**改;
+  //           单曲线 ⇒ series.name 本身就是指标名(平台绘图口径), 切指标时必须同步改。
+  L.push('var IS_MULTI = ' + (st.isMulti ? 'true' : 'false') + ';');
   // 重建 tooltip formatter: 与平台内实现等价(图例小图标随 series.symbol 变化)
   L.push('function symbolMarker(sym,color){');
   L.push('  var W=\'width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"\';');
@@ -5334,10 +5401,64 @@ function buildSensHtml() {
   L.push('  return h;');
   L.push('};');
   // 导出页额外给一个工具栏(平台内没有, 这里方便二次保存图片)
-  L.push('OPT.toolbox = {right:8,top:0,feature:{saveAsImage:{title:"保存为图片",pixelRatio:2,backgroundColor:"#1a1d27"},dataZoom:{title:{zoom:"区域缩放",back:"还原"}},restore:{title:"还原"}},iconStyle:{borderColor:"#9ca0b0"}};');
-  L.push('if(window.echarts){ var ch = echarts.init(document.getElementById("chart")); ch.setOption(OPT);');
+  // saveAsImage 的文件名随当前指标变 ⇒ 连切几个指标各存一张图不会互相覆盖
+  L.push('OPT.toolbox = {right:8,top:0,feature:{saveAsImage:{title:"保存为图片",name:"敏感性_"+(METRIC_LABEL[CUR_METRIC]||"").replace(/[\\/:*?"<>|()\\s]+/g,""),pixelRatio:2,backgroundColor:"#1a1d27"},dataZoom:{title:{zoom:"区域缩放",back:"还原"}},restore:{title:"还原"}},iconStyle:{borderColor:"#9ca0b0"}};');
+  L.push('var ch = null;');
+  L.push('if(window.echarts){ ch = echarts.init(document.getElementById("chart")); ch.setOption(OPT);');
   L.push('  window.addEventListener("resize", function(){ try{ch.resize()}catch(e){} }); }');
   L.push('else { document.getElementById("chart").innerHTML = "<div style=\\"padding:24px;color:#9ca0b0;font-size:.82rem\\">⚠ 未能加载 echarts（当前离线？）——图表无法渲染，但下方数据表完整可用。</div>"; }');
+  // ---- 切换指标: 只换 series.data 与 yAxis.name, 不动颜色/形状/图例 ----
+  // 用 setOption 的**增量合并**(不传 notMerge) ⇒ 用户已做的图例开关/缩放状态不被重置。
+  // 单曲线场景平台会开 label.show(数值直接标在点上), 增量合并保留该设置, 无需特殊处理。
+  L.push('function renderTable(){');
+  L.push('  var tb = document.querySelector("#tbl tbody"); if(!tb) return;');
+  L.push('  var cols = METRIC_DATA[CUR_METRIC]; if(!cols) return;');
+  L.push('  var rs = tb.querySelectorAll("tr");');
+  L.push('  for(var i=0;i<rs.length;i++){');
+  L.push('    var cs = rs[i].querySelectorAll("td");');
+  // cs[0] 是档位名(class="k"), 数值列从 1 开始, 与 cols 的曲线序号错开 1
+  L.push('    for(var j=1;j<cs.length;j++){ var v=(cols[j-1]&&cols[j-1][i]!=null)?cols[j-1][i]:""; cs[j].textContent=v; }');
+  L.push('  }');
+  L.push('}');
+  L.push('function applyMetric(k){');
+  L.push('  if(!METRIC_DATA[k]) return;');
+  L.push('  CUR_METRIC = k;');
+  L.push('  var lb = METRIC_LABEL[k]||k, cols = METRIC_DATA[k];');
+  L.push('  if(ch){');
+  // 增量补丁: 每条 series 只给 data(+单曲线时给 name), 其余样式字段一律不动
+  L.push('    var ns = OPT.series.map(function(s,i){');
+  L.push('      var patch = {data: (cols[i]||[]).slice()};');
+  L.push('      if(!IS_MULTI){ patch.name = lb; s.name = lb; }');
+  L.push('      s.data = patch.data.slice();');
+  L.push('      return patch;');
+  L.push('    });');
+  L.push('    OPT.yAxis.name = lb;');
+  L.push('    ch.setOption({series: ns, yAxis: {name: lb}});');
+  L.push('    try{ ch.setOption({toolbox:{feature:{saveAsImage:{name:"敏感性_"+lb.replace(/[\\/:*?"<>|()\\s]+/g,"")}}}}); }catch(e){}');
+  L.push('  }');
+  L.push('  var dy = document.getElementById("dimY"); if(dy) dy.textContent = lb;');
+  L.push('  document.title = "参数敏感性 · " + X_LABEL + " → " + lb;');
+  L.push('  var sel = document.getElementById("mSel"); if(sel && sel.value!==k) sel.value = k;');
+  L.push('  var chips = document.querySelectorAll(".chip[data-m]");');
+  L.push('  for(var i=0;i<chips.length;i++){ chips[i].className = "chip" + (chips[i].getAttribute("data-m")===k ? " on" : ""); }');
+  L.push('  renderTable();');
+  L.push('}');
+  L.push('(function(){');
+  L.push('  var sel = document.getElementById("mSel");');
+  L.push('  if(sel) sel.addEventListener("change", function(){ applyMetric(sel.value); });');
+  L.push('  var chips = document.querySelectorAll(".chip[data-m]");');
+  L.push('  for(var i=0;i<chips.length;i++){ (function(c){ c.addEventListener("click", function(){ applyMetric(c.getAttribute("data-m")); }); })(chips[i]); }');
+  // 初始高亮当前指标的 chip(若当前指标恰在快捷列表里)
+  L.push('  for(var j=0;j<chips.length;j++){ if(chips[j].getAttribute("data-m")===CUR_METRIC) chips[j].className="chip on"; }');
+  // 键盘 ←/→ 在指标列表里前后切换 —— 汇报时不用回鼠标点下拉
+  L.push('  var keys = Object.keys(METRIC_LABEL);');
+  L.push('  if(keys.length>1) document.addEventListener("keydown", function(e){');
+  L.push('    if(e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;');
+  L.push('    var d = (e.key==="ArrowRight")?1:((e.key==="ArrowLeft")?-1:0); if(!d) return;');
+  L.push('    var i = keys.indexOf(CUR_METRIC); if(i<0) i=0;');
+  L.push('    applyMetric(keys[(i+d+keys.length)%keys.length]); e.preventDefault();');
+  L.push('  });');
+  L.push('})();');
   L.push('function copyTsv(){');
   L.push('  var rs = document.querySelectorAll("#tbl tr");');
   L.push('  var out = [];');
@@ -5362,7 +5483,12 @@ function exportSensHtml() {
     let html = buildSensHtml();
     let url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
     triggerDownload(url, sensExportFileName('html'), true);
-    sensExportNote('✓ 已导出可交互 HTML（' + (html.length / 1024).toFixed(0) + ' KB，含数据表与参数快照）');
+    // 提示里报出可切换的指标数 —— 让用户知道导出文件里带了多少东西(不只是当前那一张图)
+    let nm = (function () {
+      try { return Object.keys(sensExportState.curveRecs && sensExportState.curveRecs[0] && sensExportState.curveRecs[0][0] || {}).length; } catch (e) { return 0; }
+    })();
+    sensExportNote('✓ 已导出可交互 HTML（' + (html.length / 1024).toFixed(0) + ' KB'
+      + (nm > 1 ? '，可页内切换 ' + nm + ' 个指标' : '') + '，含数据表与参数快照）');
   } catch (e) {
     sensExportNote('⚠ 导出失败: ' + ((e && e.message) ? e.message : e), true);
   }
@@ -5423,6 +5549,21 @@ const SENS_GPU_LABEL = { 'h20x8':'H20×8', 'h100x8':'H100×8', 'a100x8':'A100×8
   'b200x8':'B200×8', 'b300x8':'B300×8', 'a950pr8':'昇腾950PR×8', 'a950dt8':'昇腾950DT×8',
   'klxp800x8':'昆仑芯P800×8', 'klxp900x32':'昆仑芯P900×32' };
 const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'L3聚合带宽', input_len:'输入长度', qps:'到达率QPS', concurrency:'并发请求数', gpu_preset:'GPU硬件'};
+// 观察指标(纵轴)标签表 —— 2026-08-25 由 runSensitivity 内联字面量提升为全局常量:
+// 导出的 HTML 需要在页面内**切换指标**, 必须拿到同一份 key→中文标签映射, 否则两处各写一份
+// 早晚漂移(平台里加了指标而导出页下拉里没有)。**新增扫描指标必须同时改三处**:
+//   ① extractSensMetrics 里算出该字段  ② 本表加标签  ③ #sSweepMetric 下拉加 <option>
+// 顺序即导出页下拉的顺序, 与 #sSweepMetric 的 option 顺序保持一致以免用户对不上。
+const SENS_METRIC_LABEL = {
+  hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)',
+  latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)',
+  ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)',
+  tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)',
+  throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)',
+  prefill_thr:'Prefill吞吐-名义(tok/s)', prefill_comp_thr:'Prefill吞吐-GPU实算(tok/s)', prefill_cache_amp:'缓存放大倍数(×)',
+  fetch_ratio:'L3拉取时间占比(%)',
+  compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)'
+};
 function sensParamUnit(param, v) {
   if (param === 'gpu_preset') return SENS_GPU_LABEL[v] || String(v);  // 非数值维度, 直接查表
   if (param === 'ssd_bw') return v + 'GB/s';
@@ -5509,7 +5650,7 @@ function runSensitivity() {
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)', compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)', prefill_thr:'Prefill吞吐-名义(tok/s)', prefill_comp_thr:'Prefill吞吐-GPU实算(tok/s)', prefill_cache_amp:'缓存放大倍数(×)'}[metric];
+  let metricLabel = SENS_METRIC_LABEL[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
   // ===== ③ 第三维 = 节点形状(2026-08-25 改造: 由「固定预取策略」改为「可绑定」) =====
@@ -5575,6 +5716,11 @@ function runSensitivity() {
   function paint(results) {
     let ch = initChart('chartSensitivity');
     let series = [];
+    // curveRecs[i] = 第 i 条曲线的**全指标记录数组**(与 series[i] 一一对应, 顺序必须同步维护)。
+    // 用途: 导出 HTML 时把全部指标一次性烧进页面, 使导出页可离线切换纵轴(2026-08-25)。
+    // 之所以存 rec 而不是只存当前 metric 的数值 —— 扫描一次的代价是几十次仿真, 结果里
+    // 每个 rec 本来就带齐 20 个指标(见 extractSensMetrics), 不额外花任何计算。
+    let curveRecs = [];
     let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
     if (compareParam || hasPf) {
       let cmpLoop = compareParam ? compareVals.length : 1;
@@ -5587,6 +5733,7 @@ function runSensitivity() {
           let nameParts = [];
           if (compareParam) nameParts.push(cmpLabel(compareVals[ci]));
           if (hasPf) nameParts.push(shapeLabelOf(shapeList[pi]));
+          curveRecs.push(data);
           series.push({
             name: nameParts.join(' · '), type: 'line', smooth: true,
             data: data.map(rec => +metricOf(rec).toFixed(1)),
@@ -5598,6 +5745,7 @@ function runSensitivity() {
         }
       }
     } else {
+      curveRecs.push(results);
       series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(rec => +metricOf(rec).toFixed(1)),
         lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
         itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
@@ -5650,6 +5798,10 @@ function runSensitivity() {
       param: param, paramLabel: paramLabel, metric: metric, metricLabel: metricLabel,
       compareParam: compareParam, compareVals: compareVals,
       shapeDim: shapeDim, shapeList: shapeList, hasPf: hasPf,
+      // curveRecs: 每条曲线的全指标记录, 供导出 HTML 内的「切换指标」下拉使用(2026-08-25)。
+      // ⚠️ 与 series 同序; 单曲线时长度为 1。位图导出不用它。
+      curveRecs: curveRecs,
+      isMulti: !!(compareParam || hasPf),
       descHtml: desc, strategyName: baseStrategy.name,
       dsl: baseStrategy.dsl || '', seed: gi('pSeed'),
       // 全参数快照: 导出的 HTML 附带它, 别人拿到图能复现同一次扫描
