@@ -438,6 +438,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
         <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
         <option value="concurrency">并发请求数</option>
+        <option value="gpu_preset">GPU硬件</option>
       </select></div>
       <div><label>扫描范围(起,止,步长)</label><input id="sSweepRange" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div><label>② 对比参数(颜色, 可空)</label><select id="sSweepCompareParam">
@@ -447,13 +448,20 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
         <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
         <option value="concurrency">并发请求数</option>
+        <option value="gpu_preset">GPU硬件</option>
       </select></div>
       <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="如 0,100,20" style="width:110px"></div>
-      <div style="flex:2"><label style="text-transform:none;letter-spacing:0">③ 预取策略(形状)</label>
-        <div style="display:flex;align-items:center;gap:14px;height:29px;flex-wrap:wrap">
-          <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfWait" checked style="margin-right:4px">wait_complete</label>
-          <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfBest" checked style="margin-right:4px">best_effort</label>
-          <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfRace" checked style="margin-right:4px">race</label>
+      <div style="flex:2"><label style="text-transform:none;letter-spacing:0">③ 形状维度</label>
+        <div style="display:flex;align-items:center;gap:10px;height:29px;flex-wrap:wrap">
+          <select id="sShapeDim" style="width:104px" title="形状维度绑定对象。&#10;预取策略: 勾选下方 3 个策略(默认, 与历史行为一致)&#10;GPU硬件: 形状=不同加速卡, 档位在右侧填写&#10;⚠️ 形状与颜色不能绑同一参数, 冲突时形状自动降级">
+            <option value="prefetch">预取策略</option><option value="gpu_preset">GPU硬件</option>
+          </select>
+          <span id="sShapePfBox" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfWait" checked style="margin-right:4px">wait_complete</label>
+            <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfBest" checked style="margin-right:4px">best_effort</label>
+            <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfRace" checked style="margin-right:4px">race</label>
+          </span>
+          <input id="sShapeVals" value="h20x8,b300x8" style="width:150px;display:none" placeholder="如 h20x8,b300x8" title="GPU 预设 key 逗号分隔。可选: h20x8 h100x8 a100x8 b200x8 b300x8 a950pr8 a950dt8 klxp800x8 klxp900x32">
         </div>
       </div>
       <div><label>④ 观察指标(纵轴)</label><select id="sSweepMetric">
@@ -461,6 +469,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
         <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
+        <option value="prefill_thr">Prefill吞吐-名义(tok/s)</option><option value="prefill_comp_thr">Prefill吞吐-GPU实算(tok/s)</option><option value="prefill_cache_amp">缓存放大倍数(名义÷实算)</option>
         <option value="fetch_ratio">L3拉取时间占比(%)</option>
         <option value="compute_net">纯计算(ms)</option><option value="compute_wait">算力竞争等待(ms)</option><option value="compute_wait_ratio">算力竞争等待占比(%)</option>
       </select></div>
@@ -2701,7 +2710,40 @@ function loadStrategy(idx) {
 function runSimulation(strategy, overrides) {
   overrides = overrides || {};
   let p = getParams();
-  for (let k in overrides) { if (k !== 'seed' && k !== 'nreq') p[k] = overrides[k]; }
+  // ---- 硬件预设覆盖(2026-08-25, 为「形状=GPU」的多硬件扫描而加) ----
+  // ⚠️ 三条口径约束, 都是实测踩出来的:
+  //  1) **不覆盖 ssdBW**: 九款预设的 ssdBW 全是 50(零区分度) —— 它表示"外挂 L3 存储网带宽",
+  //     是与加速卡无关的独立设施, 并非 GPU 硬件特征(对比 ssd 容量 10/20/40 是有区分的)。
+  //     UI 点预设按钮会连带重置 pSsdBW=50, 那是"整机模板"语义; 但在**扫描**语境下横轴往往
+  //     就是 L3 带宽, 覆盖它会把整条曲线压成一个点(实测: 不排除 ssdBW 时 hwPreset 路径
+  //     TTFT 恒为 ssdBW=50 的值 96.4ms, 而非输入框 100GB/s 的 59.5ms)。
+  //     ⇒ 硬件维度只负责"卡"(算力/显存/互联/主机链路), 存储网带宽交给专门的 ssd_bw 维度。
+  //  2) **预设先套、其余 overrides 后套**: 顺序反了会让显式 overrides 被预设默认值冲掉。
+  //  3) **a/b 必须重估, 且放在全部 overrides 之后**: a/b 是 prefill 速度的唯一权威, 但它
+  //     来自输入框(getParams), 不随 p.tflops/gpus 自动变。实测 GLM-5.1 下 B300 a=4.83/
+  //     b=2.84e-4 而 H20 a=67.95/b=4.32e-3(差 14.1×/15.2×) —— 漏掉这步 H20 会沿用 B300
+  //     的速度, TTFT 失真 11.5×(图看着正常, 数全错)。放最后是为了让任何影响 a/b 的
+  //     override(dtype/稀疏/MLA 路径等)都能被纳入推导, 而非只考虑硬件字段。
+  //     ⚠️ 精度: 此处用 estimatePrefillParams 的**全精度**返回值, 而 UI 路径经输入框
+  //     toFixed(2)/toFixed(6) 截断 ⇒ 两者 TTFT 有 ~0.2% 的量化差(实测 59.381 vs 59.506)。
+  //     为与 UI 显示口径**逐位可复现**, 这里刻意做同样的截断(见 _verify_gpu_sweep.js B2)。
+  let _hwOv = overrides.hwPreset && hwPresets[overrides.hwPreset] ? hwPresets[overrides.hwPreset] : null;
+  if (_hwOv) {
+    p.hbmPerGpu = _hwOv.hbm; p.hbmBW = _hwOv.hbmBW; p.tflops = _hwOv.tflops;
+    p.tpSize = _hwOv.tp; p.nvlinkBW = _hwOv.nvlink; p.pcieBW = _hwOv.pcie;
+    p.dram = _hwOv.dram; p.dramBW = _hwOv.dramBW; p.ssd = _hwOv.ssd;
+    p.gpus = _hwOv.gpus;
+    // 注意: 故意**不**写 p.ssdBW —— 见上方第 1 条
+  }
+  for (let k in overrides) { if (k !== 'seed' && k !== 'nreq' && k !== 'hwPreset') p[k] = overrides[k]; }
+  if (_hwOv) {
+    let _e = estimatePrefillParams(p);
+    // 与 applyEstimatedParams() 写输入框的精度对齐(a 两位小数 / b、bIdx 六位小数),
+    // 保证"扫描出来的点"与"手动点预设按钮跑出来的点"数值逐位一致。
+    p.prefillA = parseFloat(_e.a.toFixed(2));
+    p.prefillB = parseFloat(_e.b.toFixed(6));
+    p.prefillBIdx = parseFloat(_e.bIdx.toFixed(6));
+  }
   let r = calcAll(p);
   // ---------- PD 真分离: 双资源视图(2026-08-20) ----------
   // calcAll(p) 是纯函数, 资源全部由 p.gpus/tflops/hbmBW/hbmPerGpu 推导 ⇒ 直接换 gpus 即可
@@ -2837,6 +2879,9 @@ function runSimulation(strategy, overrides) {
     fetchSoloSum: 0,                                        // prefill 传输独立用时累计(req.fetchTime, 未与计算重叠前的单独耗时)
     // GPU 占用画像(2026-08-21): 见 prefill 段 nAct 注释。跨实例累加(整机视角)
     pfGpuBusySec: 0, pfBusySteps: 0, pfActSum: 0,
+    // prefill 吞吐(2026-08-25): 在 finishPrefill 埋点累计, 与 decode 侧 outTokens 完全独立。
+    // pfReqTokens=名义输入 token / pfCompTokens=GPU 实算 token / pfReqDone=完成 prefill 的请求数
+    pfReqTokens: 0, pfCompTokens: 0, pfReqDone: 0,
     fetchSpanSum: 0,                                        // prefill 传输过程实际耗时累计(_ft1-_ft0, 含带宽排队/不含计算)
     fetchBytesPulled: 0,                                    // prefill 拉取字节总量(统一共享池口径, 单飞去重效果可由此观察)
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
@@ -3547,6 +3592,17 @@ function runSimulation(strategy, overrides) {
   // prefill 完成统一出口（2026-08-18, 波次模式提取共用）：单飞组状态 + 前缀激活 + 转 decode/decodeWait
   function finishPrefill(q) {
     q.prefillEnd = now;
+    // ---- prefill 吞吐统计(2026-08-25) ----
+    // 埋在此处而非 completeRequest: prefill 吞吐的完成事件是"prefill 算完", 与 decode 无关。
+    // 长输入场景(1M tok)下大量请求 prefill 已完成但 decode 远未结束, 用 stats.completed
+    // 当分子会系统性低估(实测 1M/H20 在 600s 窗口内 completed=0, 但 prefill 已处理若干请求)。
+    // 双口径(二者都必要, 勿合并):
+    //   pfReqTokens  = 名义输入 token —— 系统对外交付的 prompt 处理速率(用户可感知的"喂进去多少")
+    //   pfCompTokens = GPU 实算 token(_pfTotal, 已扣除前缀命中/L3 拉取部分) —— 硬件真实算力产出
+    // 前缀命中率 h 越高两者差越大(比值≈1/(1-h)); 只看名义会把"缓存命中"误记为"算力变强"。
+    stats.pfReqDone++;
+    stats.pfReqTokens += (q.inputLen || 0);
+    stats.pfCompTokens += Math.max(0, q._pfTotal || 0);
     if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: be/race 拉取者 prefill 完成 ⇒ 组前缀完整(拉取+重算合并)
     // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续请求命中
     // （此前到达的组内请求按全量 prefill 处理——实测 vLLM 行为一致：组内请求同时到达时前缀
@@ -4610,6 +4666,19 @@ function runSimulation(strategy, overrides) {
     name: strategy.name || autoNameStrategy(strategy),
     hbmHitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
     throughput: stats.outTokens / simEnd,
+    // ---- prefill 吞吐(2026-08-25) ----
+    // 分母统一用 simEnd(与 throughput 同口径, 整机墙钟), 分子来自 finishPrefill 埋点。
+    // prefillThroughput     = 名义 prompt 处理速率(tok/s): 含前缀命中省下的部分, 对外交付视角
+    // prefillComputeThrough = GPU 实算速率(tok/s): 扣除命中/拉取, 硬件真实算力产出
+    // 二者比值 = 1/(1-有效命中率), 是"缓存放大倍数"的直接观测量。
+    // ⚠️ 不要用 completed 反推 prefill 吞吐: 长输入下 prefill 完成 ≫ 请求完成。
+    prefillThroughput: simEnd > 0 ? stats.pfReqTokens / simEnd : 0,
+    prefillComputeThroughput: simEnd > 0 ? stats.pfCompTokens / simEnd : 0,
+    prefillReqDone: stats.pfReqDone,
+    prefillTokensTotal: stats.pfReqTokens,
+    prefillComputeTokensTotal: stats.pfCompTokens,
+    // 缓存放大倍数: 名义÷实算。=1 表示全部靠 GPU 重算(无有效命中), 越大说明缓存省得越多
+    prefillCacheAmp: stats.pfCompTokens > 0 ? stats.pfReqTokens / stats.pfCompTokens : 0,
     memUtilAvg: stats.memUtilSamples ? stats.memUtilSum / stats.memUtilSamples * 100 : 0,
     memUtilPeak: stats.memUtilPeak * 100,
     evictions: stats.evictions, activeEvictions: stats.activeEvictions,
@@ -5101,6 +5170,12 @@ function extractSensMetrics(r) {
     tpot_p50: r.p50Tpot, tpot_p99: r.p99Tpot, latency: r.avgLatency, latency_p50: r.p50,
     // hit_rate 保持"HBM 访问命中率"语义(历史敏感性/导出口径); 前缀分层命中率见 prefix_hit_rate
     throughput: r.throughput, hit_rate: r.hbmHitRate, mem_util: r.memUtilPeak, p99_latency: r.p99,
+    // prefill 吞吐(2026-08-25): 与 throughput(decode 输出口径)是两条独立通道, 勿混用。
+    // prefill_thr      = 名义 prompt 处理速率; prefill_comp_thr = GPU 实算速率
+    // prefill_cache_amp= 名义÷实算 = 缓存放大倍数
+    prefill_thr: r.prefillThroughput || 0,
+    prefill_comp_thr: r.prefillComputeThroughput || 0,
+    prefill_cache_amp: r.prefillCacheAmp || 0,
     prefix_hit_rate: r.hitRate ? r.hitRate.total : 0,
     fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0,   // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
     // compute 二级拆分的扫描指标(2026-08-24): 用于扫出"带宽/并发提升把等待从存储搬到算力"的曲线。
@@ -5123,10 +5198,18 @@ const SENS_LEVELS = {
   ssd_bw: [10,25,50,100,150,200,300,400],
   input_len: [2048,8192,16384,32768,65536],
   qps: [0.1,0.3,1,3,8],
-  concurrency: [8,16,32,64,128,256]  // 单批Prefill基准: batch 规模扫描(2026-08-19)
+  concurrency: [8,16,32,64,128,256],  // 单批Prefill基准: batch 规模扫描(2026-08-19)
+  // GPU 硬件预设(2026-08-25): **唯一的非数值扫描维度**, 档位是 hwPresets 的 key 字符串。
+  // 因此凡是对档位做算术的地方(parseRangeOrList / sensParamUnit / 图例排序)都必须为它开分支。
+  gpu_preset: ['h20x8','b300x8']
 };
-const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'L3聚合带宽', input_len:'输入长度', qps:'到达率QPS', concurrency:'并发请求数'};
+// GPU 档位的可读标签(图例/坐标轴用)。与 hwPresets 的 key 一一对应
+const SENS_GPU_LABEL = { 'h20x8':'H20×8', 'h100x8':'H100×8', 'a100x8':'A100×8',
+  'b200x8':'B200×8', 'b300x8':'B300×8', 'a950pr8':'昇腾950PR×8', 'a950dt8':'昇腾950DT×8',
+  'klxp800x8':'昆仑芯P800×8', 'klxp900x32':'昆仑芯P900×32' };
+const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'L3聚合带宽', input_len:'输入长度', qps:'到达率QPS', concurrency:'并发请求数', gpu_preset:'GPU硬件'};
 function sensParamUnit(param, v) {
+  if (param === 'gpu_preset') return SENS_GPU_LABEL[v] || String(v);  // 非数值维度, 直接查表
   if (param === 'ssd_bw') return v + 'GB/s';
   if (param === 'max_batch_size') return 'B=' + v;
   if (param === 'concurrency') return 'N=' + v;
@@ -5137,7 +5220,13 @@ function sensParamUnit(param, v) {
 
 // 解析"起点,终点,步长"或显式逗号列表：恰好 3 个数且第三个≠0 → 按步长生成序列（含终点若落在步长上，上限 200 点）；
 // 否则视为显式档位列表；空/非法 → []。
-function parseRangeOrList(str) {
+// param(可选, 2026-08-25): 传入 'gpu_preset' 时按**字符串列表**解析(该维度档位是 hwPresets 的 key,
+// 走数值路径会被 isFinite 全部过滤成空数组)。只保留 hwPresets 里真实存在的 key, 避免笔误静默生成空曲线。
+function parseRangeOrList(str, param) {
+  if (param === 'gpu_preset') {
+    return String(str).split(/[,，\s]+/).map(s => s.trim())
+      .filter(s => s && typeof hwPresets !== 'undefined' && hwPresets[s]);
+  }
   let nums = String(str).split(/[,，\s]+/).map(s => parseFloat(s)).filter(v => isFinite(v));
   if (nums.length === 3 && nums[2] !== 0) {
     let [s0, e0, st] = nums;
@@ -5155,9 +5244,24 @@ function guardCompareParam() {
   let sp = $('sSweepParam').value, cp = $('sSweepCompareParam').value;
   if (cp && cp === sp) { $('sSweepCompareParam').value = ''; }
 }
+// 形状维度控件联动(2026-08-25): 切「预取策略/GPU硬件」时显示对应输入区;
+// 且当 GPU 已被横轴或颜色占用时, 形状不能再绑 GPU(否则同一变量控两个视觉通道) ⇒ 自动回退。
+function toggleShapeDim() {
+  let sd = $('sShapeDim') ? $('sShapeDim').value : 'prefetch';
+  let sp = $('sSweepParam') ? $('sSweepParam').value : '';
+  let cp = $('sSweepCompareParam') ? $('sSweepCompareParam').value : '';
+  if (sd === 'gpu_preset' && (sp === 'gpu_preset' || cp === 'gpu_preset')) {
+    if ($('sShapeDim')) $('sShapeDim').value = 'prefetch';
+    sd = 'prefetch';
+  }
+  let pfBox = $('sShapePfBox'), gpuBox = $('sShapeVals');
+  if (pfBox) pfBox.style.display = (sd === 'prefetch') ? 'flex' : 'none';
+  if (gpuBox) gpuBox.style.display = (sd === 'gpu_preset') ? '' : 'none';
+}
 document.addEventListener('change', function(e) {
-  if (e.target && e.target.id === 'sSweepCompareParam') guardCompareParam();
-  if (e.target && e.target.id === 'sSweepParam') guardCompareParam();
+  if (e.target && e.target.id === 'sSweepCompareParam') { guardCompareParam(); toggleShapeDim(); }
+  if (e.target && e.target.id === 'sSweepParam') { guardCompareParam(); toggleShapeDim(); }
+  if (e.target && e.target.id === 'sShapeDim') toggleShapeDim();
 });
 
 function runSensitivity() {
@@ -5170,7 +5274,7 @@ function runSensitivity() {
   let values = null;
   let rangeRaw = ($('sSweepRange') ? $('sSweepRange').value : '').trim();
   if (rangeRaw) {
-    let rv = parseRangeOrList(rangeRaw);
+    let rv = parseRangeOrList(rangeRaw, param);
     if (rv.length) values = rv;
   }
   if (!values) {
@@ -5180,32 +5284,59 @@ function runSensitivity() {
     else if (param === 'input_len') values = [2048,4096,8192,16384,32768,65536];
     else if (param === 'qps') values = [0.1,0.3,1,3,8];
     else if (param === 'concurrency') values = [8,16,32,64,128,256];
+    else if (param === 'gpu_preset') values = SENS_LEVELS.gpu_preset.slice();  // 非数值维度
     else values = [10,20,30,40,50,60,70,80,90];
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = {hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)', compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)'}[metric];
+  let metricLabel = {hit_rate:'HBM命中率(%)', prefix_hit_rate:'前缀命中率实测(%)', latency:'平均延迟(ms)', latency_p50:'延迟P50(ms)', p99_latency:'延迟P99(ms)', ttft:'平均TTFT(ms)', ttft_p50:'TTFT P50(ms)', ttft_p99:'TTFT P99(ms)', tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)', throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)', fetch_ratio:'L3拉取时间占比(%)', compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)', prefill_thr:'Prefill吞吐-名义(tok/s)', prefill_comp_thr:'Prefill吞吐-GPU实算(tok/s)', prefill_cache_amp:'缓存放大倍数(×)'}[metric];
   let paramLabel = SENS_PARAM_LABEL[param];
 
-  // ③ 预取策略（第三维=节点形状）：勾选的要对比的策略；prefetch.type 映射 wait_complete→none
+  // ===== ③ 第三维 = 节点形状(2026-08-25 改造: 由「固定预取策略」改为「可绑定」) =====
+  // 动机: 原设计把形状硬编码给预取策略, 于是"颜色+形状"两个**非策略**自变量无法同时表达
+  // (例: 横轴L3带宽 × 颜色输入长度 × 形状GPU)。现改为下拉选择绑定对象:
+  //   'prefetch'(默认, 与改造前**逐位一致**) | 'gpu_preset'
+  // 形状维度的取值列表统一叫 shapeList, 符号统一由 SHAPE_SYMBOLS 按序号分配。
+  // ⚠️ 形状与颜色必须绑不同东西: 若 shapeDim === compareParam 则形状降级为无(否则同一变量
+  //    既控颜色又控形状, 图例自相矛盾且白跑 N² 次仿真)。
+  const SHAPE_SYMBOLS = ['circle', 'square', 'triangle', 'diamond', 'roundRect', 'pin'];
+  let shapeDim = ($('sShapeDim') ? $('sShapeDim').value : 'prefetch') || 'prefetch';
+  const PF_SYMBOL = { wait_complete: 'circle', best_effort: 'square', race: 'triangle' };
+  const PF_TYPE = { wait_complete: 'none', best_effort: 'best_effort', race: 'race' };
+
   let prefetchList = [];
   if ($('sPfWait') && $('sPfWait').checked) prefetchList.push('wait_complete');
   if ($('sPfBest') && $('sPfBest').checked) prefetchList.push('best_effort');
   if ($('sPfRace') && $('sPfRace').checked) prefetchList.push('race');
-  let hasPf = prefetchList.length >= 1;
-  const PF_SYMBOL = { wait_complete: 'circle', best_effort: 'square', race: 'triangle' };
-  const PF_TYPE = { wait_complete: 'none', best_effort: 'best_effort', race: 'race' };
 
-  // 对比参数（第三维=颜色）：显式下拉选择，档位从输入框读取（自动填充默认，可编辑）
+  // 对比参数（第二维=颜色）：显式下拉选择，档位从输入框读取（自动填充默认，可编辑）
+  // 注意: 此块必须在 shapeList 定案**之前**求值 —— 形状要和颜色做互斥判定。
   let compareParam = ($('sSweepCompareParam') ? $('sSweepCompareParam').value : '') || null;
   let compareVals = [];
   if (compareParam) {
     if (compareParam === param) compareParam = null; // 与扫描参数相同 → 回退单参数
     else {
       let cmpRaw = ($('sSweepCompare') ? $('sSweepCompare').value : '').trim();
-      compareVals = cmpRaw ? parseRangeOrList(cmpRaw) : (SENS_LEVELS[compareParam] || []);
+      compareVals = cmpRaw ? parseRangeOrList(cmpRaw, compareParam) : (SENS_LEVELS[compareParam] || []);
       if (!compareVals.length) compareVals = SENS_LEVELS[compareParam] || [];
     }
+  }
+
+  // 形状维度定案: shapeList = 取值列表, shapeLabelOf = 图例文案, shapeSymbolOf = 符号
+  let shapeList = [], shapeLabel = '';
+  if (shapeDim === 'gpu_preset' && param !== 'gpu_preset' && compareParam !== 'gpu_preset') {
+    let shRaw = ($('sShapeVals') ? $('sShapeVals').value : '').trim();
+    shapeList = shRaw ? parseRangeOrList(shRaw, 'gpu_preset') : SENS_LEVELS.gpu_preset.slice();
+    if (!shapeList.length) shapeList = SENS_LEVELS.gpu_preset.slice();
+    shapeLabel = 'GPU硬件';
+  } else if (shapeDim === 'prefetch') {
+    shapeList = prefetchList;
+    shapeLabel = '预取策略';
+  }
+  let hasPf = shapeList.length >= 1;   // 变量名保留(下游大量引用), 语义已推广为"形状维度启用"
+  function shapeLabelOf(sv) { return shapeDim === 'gpu_preset' ? (SENS_GPU_LABEL[sv] || String(sv)) : String(sv); }
+  function shapeSymbolOf(si, sv) {
+    return shapeDim === 'prefetch' ? (PF_SYMBOL[sv] || 'circle') : SHAPE_SYMBOLS[si % SHAPE_SYMBOLS.length];
   }
   let cmpLabel = compareParam ? (v => sensParamUnit(compareParam, v)) : null;
 
@@ -5213,7 +5344,7 @@ function runSensitivity() {
   // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑；含扫描档位 values（修复 2026-08-11:
   // 旧版漏 values → 改扫描档位重跑命中旧缓存显示旧曲线）
   let paramsFp = getParams(); // 基础参数指纹（含基础 prefixHit/ssdBW，扫描/对比值经 overrides 注入，不在此指纹内）
-  let cacheKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, prefetchList, gi('pSeed')]);
+  let cacheKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, shapeDim, shapeList, gi('pSeed')]);
   let cached = sensCache[cacheKey];
 
   let chartEl = $('chartSensitivity');
@@ -5227,7 +5358,7 @@ function runSensitivity() {
     let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
     if (compareParam || hasPf) {
       let cmpLoop = compareParam ? compareVals.length : 1;
-      let pfLoop = hasPf ? prefetchList.length : 1;
+      let pfLoop = hasPf ? shapeList.length : 1;
       for (let ci = 0; ci < cmpLoop; ci++) {
         for (let pi = 0; pi < pfLoop; pi++) {
           let data;
@@ -5235,13 +5366,13 @@ function runSensitivity() {
           else data = results[ci];
           let nameParts = [];
           if (compareParam) nameParts.push(cmpLabel(compareVals[ci]));
-          if (hasPf) nameParts.push(prefetchList[pi]);
+          if (hasPf) nameParts.push(shapeLabelOf(shapeList[pi]));
           series.push({
             name: nameParts.join(' · '), type: 'line', smooth: true,
             data: data.map(rec => +metricOf(rec).toFixed(1)),
             lineStyle: { color: palette[ci % palette.length], width: 2 },
             itemStyle: { color: palette[ci % palette.length] },
-            symbol: hasPf ? PF_SYMBOL[prefetchList[pi]] : 'circle',
+            symbol: hasPf ? shapeSymbolOf(pi, shapeList[pi]) : 'circle',
             symbolSize: hasPf ? 7 : 6
           });
         }
@@ -5251,10 +5382,16 @@ function runSensitivity() {
         lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
         itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
     }
+    // tooltip 图例小图标: 需与 series.symbol 的取值域保持同步(2026-08-25 形状维度可绑定后
+    // 新增 diamond/roundRect/pin, 若不补分支会全部退化成圆形 ⇒ tooltip 与图上符号不一致)
     function symbolMarker(sym, color) {
-      if (sym === 'square') return '<svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"><rect x="1" y="1" width="8" height="8" fill="'+color+'"/></svg>';
-      if (sym === 'triangle') return '<svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"><polygon points="5,1 9,9 1,9" fill="'+color+'"/></svg>';
-      return '<svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"><circle cx="5" cy="5" r="4" fill="'+color+'"/></svg>';
+      let W = 'width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"';
+      if (sym === 'square') return '<svg '+W+'><rect x="1" y="1" width="8" height="8" fill="'+color+'"/></svg>';
+      if (sym === 'triangle') return '<svg '+W+'><polygon points="5,1 9,9 1,9" fill="'+color+'"/></svg>';
+      if (sym === 'diamond') return '<svg '+W+'><polygon points="5,1 9,5 5,9 1,5" fill="'+color+'"/></svg>';
+      if (sym === 'roundRect') return '<svg '+W+'><rect x="1" y="1" width="8" height="8" rx="3" fill="'+color+'"/></svg>';
+      if (sym === 'pin') return '<svg '+W+'><path d="M5 1C3 1 1.6 2.4 1.6 4.3C1.6 6.3 5 9 5 9S8.4 6.3 8.4 4.3C8.4 2.4 7 1 5 1Z" fill="'+color+'"/></svg>';
+      return '<svg '+W+'><circle cx="5" cy="5" r="4" fill="'+color+'"/></svg>';
     }
     let opt = {
       tooltip: {
@@ -5277,9 +5414,9 @@ function runSensitivity() {
     };
     ch.setOption(opt);
     let desc;
-    if (compareParam && hasPf) desc = '四维敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> × 形状「预取策略」('+prefetchList.map(p=>p).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>（共同随机数法，固定其他参数与种子）';
-    else if (compareParam) desc = '三参数敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code>（'+compareVals.join(', ')+'），纵轴 <code>'+metricLabel+'</code>';
-    else if (hasPf) desc = '双维敏感性：横轴 <code>'+paramLabel+'</code> × 形状「预取策略」('+prefetchList.join(' / ')+')，纵轴 <code>'+metricLabel+'</code>';
+    if (compareParam && hasPf) desc = '四维敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> × 形状「'+shapeLabel+'」('+shapeList.map(shapeLabelOf).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>（共同随机数法，固定其他参数与种子）';
+    else if (compareParam) desc = '三参数敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code>（'+compareVals.map(v=>sensParamUnit(compareParam,v)).join(', ')+'），纵轴 <code>'+metricLabel+'</code>';
+    else if (hasPf) desc = '双维敏感性：横轴 <code>'+paramLabel+'</code> × 形状「'+shapeLabel+'」('+shapeList.map(shapeLabelOf).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>';
     else desc = '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>';
     formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+desc+
       '<br>基准策略: <code>'+baseStrategy.name+'</code> · 同一扫描切换纵轴即时（缓存）'+
@@ -5293,21 +5430,23 @@ function runSensitivity() {
 
   // results: 单参数→一维; 双参数→compareVals×values 二维; 三维(含预取策略)→compareVals×策略×values（元素=全指标记录）
   let results;
-  if (hasPf) results = compareParam ? compareVals.map(() => prefetchList.map(() => new Array(values.length))) : prefetchList.map(() => new Array(values.length));
+  if (hasPf) results = compareParam ? compareVals.map(() => shapeList.map(() => new Array(values.length))) : shapeList.map(() => new Array(values.length));
   else results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
-  let totalRuns = (compareParam ? compareVals.length : 1) * (hasPf ? prefetchList.length : 1) * values.length;
+  let totalRuns = (compareParam ? compareVals.length : 1) * (hasPf ? shapeList.length : 1) * values.length;
   formulaEl.innerHTML = '';
 
   // ===== 任务列表(与旧 setTimeout 循环同顺序 ci→pi→idx): 点级缓存命中直接填充, 未命中进 jobs =====
   let jobs = [], filled = 0, cancelled = false;
   for (let _ci = 0; _ci < (compareParam ? compareVals.length : 1); _ci++) {
-    for (let _pi = 0; _pi < (hasPf ? prefetchList.length : 1); _pi++) {
+    for (let _pi = 0; _pi < (hasPf ? shapeList.length : 1); _pi++) {
       for (let _idx = 0; _idx < values.length; _idx++) {
         let v = values[_idx];
         let cv = compareParam ? compareVals[_ci] : null;
-        let pf = hasPf ? prefetchList[_pi] : null;
-        // 点级缓存：单个参数组合(扫描值×对比值×预取策略×种子)跨批次复用——改档位范围时重叠点直接命中
-        let pointKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name, param, v, compareParam, cv, pf, gi('pSeed')]);
+        let pf = hasPf ? shapeList[_pi] : null;
+        // 点级缓存：单个参数组合(扫描值×对比值×形状值×种子)跨批次复用——改档位范围时重叠点直接命中
+        // ⚠️ key 必须含 shapeDim: 否则「形状=预取策略的 wait_complete」与「形状=GPU 的某档」
+        //    在 pf 字符串不同的情况下虽不会真撞, 但改绑定后语义已变, 显式带上更稳。
+        let pointKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name, param, v, compareParam, cv, shapeDim, pf, gi('pSeed')]);
         let hit = sensPointCache[pointKey];
         if (hit !== undefined) {
           if (hasPf) { if (compareParam) results[_ci][_pi][_idx] = hit; else results[_pi][_idx] = hit; }
@@ -5326,6 +5465,7 @@ function runSensitivity() {
         if (param === 'input_len') overrides.inputLen = v; // 负载参数：平均输入长度
         if (param === 'qps') overrides.qps = v;            // 负载参数：到达率
         if (param === 'concurrency') overrides.nreq = v;   // 负载参数：并发请求数(单批基准的 batch 规模)
+        if (param === 'gpu_preset') overrides.hwPreset = v; // 硬件预设(2026-08-25): runSimulation 内套字段并重算 a/b
         if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
         if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
         if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
@@ -5335,7 +5475,12 @@ function runSensitivity() {
         if (compareParam === 'input_len') overrides.inputLen = cv;
         if (compareParam === 'qps') overrides.qps = cv;
         if (compareParam === 'concurrency') overrides.nreq = cv;
-        if (hasPf) s.prefetch.type = PF_TYPE[pf]; // wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
+        if (compareParam === 'gpu_preset') overrides.hwPreset = cv;
+        // 形状维度落地(2026-08-25): 按绑定对象分派 —— 预取策略改策略对象, GPU 走 overrides
+        if (hasPf) {
+          if (shapeDim === 'prefetch') s.prefetch.type = PF_TYPE[pf]; // wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
+          else if (shapeDim === 'gpu_preset') overrides.hwPreset = pf;
+        }
         jobs.push({ key: pointKey, ci: _ci, pi: _pi, idx: _idx, s: s, overrides: overrides });
       }
     }
