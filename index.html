@@ -473,9 +473,17 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="fetch_ratio">L3拉取时间占比(%)</option>
         <option value="compute_net">纯计算(ms)</option><option value="compute_wait">算力竞争等待(ms)</option><option value="compute_wait_ratio">算力竞争等待占比(%)</option>
       </select></div>
-      <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
+      <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" id="btnRunSens" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
     <div id="chartSensitivity" class="chart-container"></div>
+    <!-- 图表导出(2026-08-25): 出图后才可用, 故初始 disabled, 由 setSensExportEnabled 解锁 -->
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px">
+      <span style="font-size:.73rem;color:var(--text-dim)">导出当前图表：</span>
+      <button class="btn btn-sm" id="btnSensExportPng" disabled onclick="exportSensImage('png')" title="PNG 无损位图, 2× 像素比(高清, 贴进文档/PPT 缩放后不发虚)。背景为深色以匹配平台配色。">🖼 PNG</button>
+      <button class="btn btn-sm" id="btnSensExportJpg" disabled onclick="exportSensImage('jpeg')" title="JPG 有损压缩, 体积约为 PNG 的 1/3, 适合邮件/IM 分享。&#10;注: JPEG 无透明通道, 已显式填充深色背景(否则透明区会压成纯黑)。">🖼 JPG</button>
+      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;附带: ①数据表(可一键复制为 TSV 粘进 Excel) ②方法说明 ③全参数快照(可粘回本平台「导入参数」复现同一次扫描)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
+      <span id="sensExportNote" style="font-size:.72rem;color:var(--accent2)"></span>
+    </div>
     <div class="formula-box" id="formulaSensitivity"></div>
   </div>
 </div>
@@ -5153,6 +5161,213 @@ function drawStrategyComparisonGantt() {
   );
 }
 
+// ======================== 敏感性图表导出(2026-08-25) ========================
+// 三种格式各有适用场景:
+//   PNG  — 无损位图, 贴文档/PPT(2× 像素比, 缩放后不发虚)
+//   JPG  — 有损体积小, 邮件/IM 分享
+//   HTML — 自包含单文件, **保留 tooltip/图例交互**, 并附数据表 + 参数快照 ⇒ 可复现
+// 设计要点(踩过的坑都在这):
+//   · 位图直接取 echarts 实例的 getDataURL ⇒ "导出的就是你看到的那张图", 不重算
+//   · JPEG **必须显式给 backgroundColor**: canvas 默认透明, 而 JPEG 无 alpha 通道,
+//     不给背景色会把透明区压成**纯黑**, 深色文字全糊(PNG 无此问题, 但统一给更省心)
+//   · 导出 HTML 不内联 echarts(min 版 1MB+, 且无法离线取到), 改用 CDN;
+//     同时把数据表写进 HTML ⇒ 即使离线加载不出图, 数字仍完整可读、可复制到 Excel
+//   · opt.tooltip.formatter 是闭包函数, JSON.stringify 会**静默丢弃** ⇒ 导出 HTML 时
+//     在生成的页面里重建一份等价 formatter(含形状图标), 否则 tooltip 退化成默认样式
+let sensExportState = null;
+
+function setSensExportEnabled(on) {
+  ['btnSensExportPng', 'btnSensExportJpg', 'btnSensExportHtml'].forEach(function (id) {
+    let el = document.getElementById(id);
+    if (el) el.disabled = !on;
+  });
+}
+
+// 文件名带上「横轴_颜色维_纵轴_时间戳」—— 批量导出多张后不至于分不清哪张是哪张
+function sensExportFileName(ext) {
+  let st = sensExportState;
+  let ts = (st && st.at) ? st.at : new Date();
+  let pad = function (n) { return String(n).padStart(2, '0'); };
+  let stamp = ts.getFullYear() + pad(ts.getMonth() + 1) + pad(ts.getDate())
+    + '_' + pad(ts.getHours()) + pad(ts.getMinutes()) + pad(ts.getSeconds());
+  // 去掉文件名非法字符与括号单位(如 "平均TTFT(ms)" → "平均TTFT")
+  let clean = function (t) { return String(t || '').replace(/\([^)]*\)/g, '').replace(/[\\\/:*?"<>|%\s]+/g, ''); };
+  let parts = ['敏感性'];
+  if (st) {
+    parts.push(clean(st.paramLabel));
+    if (st.compareParam) parts.push('x' + clean(SENS_PARAM_LABEL[st.compareParam]));
+    parts.push(clean(st.metricLabel));
+  }
+  return parts.join('_') + '_' + stamp + '.' + ext;
+}
+
+function triggerDownload(href, filename, isBlob) {
+  let a = document.createElement('a');
+  a.href = href; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  // Blob URL 需手动释放(dataURL 不需要); 延迟以确保下载已开始
+  if (isBlob) setTimeout(function () { try { URL.revokeObjectURL(href); } catch (e) {} }, 4000);
+}
+
+function sensExportNote(msg, isErr) {
+  let el = document.getElementById('sensExportNote');
+  if (el) { el.textContent = msg; el.style.color = isErr ? 'var(--accent4)' : 'var(--accent2)'; }
+}
+
+// ---- PNG / JPG ----
+function exportSensImage(type) {
+  let el = document.getElementById('chartSensitivity');
+  let ch = (el && window.echarts) ? echarts.getInstanceByDom(el) : null;
+  if (!ch || !sensExportState) { sensExportNote('⚠ 请先运行一次敏感性分析', true); return; }
+  try {
+    let url = ch.getDataURL({
+      type: type,                  // 'png' | 'jpeg'
+      pixelRatio: 2,               // 2× 超采样, 贴进文档缩放后不发虚
+      backgroundColor: '#1a1d27'   // ⚠️ 见文件头注释: JPEG 无 alpha, 不给会变纯黑
+    });
+    triggerDownload(url, sensExportFileName(type === 'jpeg' ? 'jpg' : 'png'));
+    sensExportNote('✓ 已导出 ' + (type === 'jpeg' ? 'JPG' : 'PNG') + '（2× 高清）');
+  } catch (e) {
+    sensExportNote('⚠ 导出失败: ' + ((e && e.message) ? e.message : e), true);
+  }
+}
+
+// ---- 自包含可交互 HTML ----
+// 结构: 标题 + 方法说明 + 交互图(CDN echarts) + 数据表(可一键复制 TSV) + 参数快照(可回填本平台)
+function buildSensHtml() {
+  let st = sensExportState;
+  // 深拷贝顺带丢掉函数字段(formatter) —— 生成页里重建, 见下方 FORMATTER
+  let opt = JSON.parse(JSON.stringify(st.opt));
+  let esc = function (t) {
+    return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  };
+  // JSON 内嵌进 <script> 时必须断开 "</" , 否则含该串会提前闭合脚本标签
+  let safeJson = function (o) { return JSON.stringify(o).replace(/<\//g, '<\\/'); };
+
+  // 数据表: 行 = 横轴档位, 列 = 各系列。离线打不开图时这份数字仍完整可用
+  let sers = (opt.series || []);
+  let head = '<tr><th>' + esc(st.paramLabel) + '</th>'
+    + sers.map(function (s) { return '<th>' + esc(s.name) + '</th>'; }).join('') + '</tr>';
+  let rows = st.labels.map(function (lb, i) {
+    return '<tr><td class="k">' + esc(lb) + '</td>'
+      + sers.map(function (s) {
+        let v = (s.data && s.data[i] != null) ? s.data[i] : '';
+        return '<td>' + esc(v) + '</td>';
+      }).join('') + '</tr>';
+  }).join('\n');
+
+  // 维度摘要(纯文本, 不含 HTML 标签) —— descHtml 里有 <code>, 直接复用即可
+  let dims = [];
+  dims.push('横轴：' + st.paramLabel);
+  if (st.compareParam) dims.push('颜色：' + SENS_PARAM_LABEL[st.compareParam]
+    + '（' + st.compareVals.join(', ') + '）');
+  if (st.hasPf) dims.push('形状：' + (st.shapeDim === 'gpu_preset' ? 'GPU硬件' : '预取策略')
+    + '（' + st.shapeList.join(' / ') + '）');
+  dims.push('纵轴：' + st.metricLabel);
+
+  let L = [];
+  L.push('<!DOCTYPE html>');
+  L.push('<html lang="zh-CN"><head><meta charset="utf-8">');
+  L.push('<meta name="viewport" content="width=device-width,initial-scale=1">');
+  L.push('<title>' + esc('参数敏感性 · ' + st.paramLabel + ' → ' + st.metricLabel) + '</title>');
+  L.push('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"><\/script>');
+  L.push('<style>');
+  L.push(':root{--bg:#0f1117;--surface:#1a1d27;--surface2:#242837;--border:#2e3347;--accent:#6c63ff;--accent2:#34d399;--text:#e4e4e7;--text-dim:#9ca0b0}');
+  L.push('*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;line-height:1.55}');
+  L.push('.wrap{max-width:1080px;margin:0 auto}');
+  L.push('h1{font-size:1.18rem;margin:0 0 4px}h1 span{color:var(--accent)}');
+  L.push('.sub{color:var(--text-dim);font-size:.8rem;margin:0 0 16px}');
+  L.push('.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:14px}');
+  L.push('#chart{height:440px}');
+  L.push('.box{background:var(--surface2);border-left:3px solid var(--accent);border-radius:6px;padding:10px 12px;font-size:.78rem;color:var(--text-dim)}');
+  L.push('.box code{background:rgba(108,99,255,.14);color:var(--accent);padding:1px 5px;border-radius:3px;font-size:.95em}');
+  L.push('.box b{color:var(--text)}');
+  L.push('table{border-collapse:collapse;width:100%;font-size:.78rem}');
+  L.push('th,td{border:1px solid var(--border);padding:5px 9px;text-align:right}');
+  L.push('th{background:var(--surface2);color:var(--text-dim);font-weight:600;text-align:right}');
+  L.push('th:first-child,td.k{text-align:left;color:var(--text-dim)}');
+  L.push('tbody tr:hover{background:rgba(108,99,255,.07)}');
+  L.push('.btn{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:.75rem;font-weight:600;cursor:pointer}');
+  L.push('.btn:hover{background:#7f78ff}');
+  L.push('h2{font-size:.9rem;margin:0 0 10px;display:flex;align-items:center;gap:10px}');
+  L.push('pre{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;overflow:auto;font-size:.7rem;color:var(--text-dim);max-height:220px;margin:0}');
+  L.push('.foot{color:var(--text-dim);font-size:.72rem;text-align:center;padding:8px 0 0}');
+  L.push('</style></head><body><div class="wrap">');
+  L.push('<h1>参数<span>敏感性</span>分析</h1>');
+  L.push('<p class="sub">' + esc(dims.join(' ｜ ')) + '<br>基准策略 <b>' + esc(st.strategyName)
+    + '</b> · 随机种子 ' + esc(st.seed) + ' · 导出于 ' + esc(st.at.toLocaleString('zh-CN')) + '</p>');
+  L.push('<div class="card"><div id="chart"></div></div>');
+  L.push('<div class="card"><div class="box"><b>📐 敏感度分析方法</b><br>' + st.descHtml
+    + '<br>共同随机数法：扫描时固定其他全部参数与随机种子，因此曲线差异只来自横轴（与颜色/形状）维度本身。</div></div>');
+  L.push('<div class="card"><h2>📋 数据表 <button class="btn" onclick="copyTsv()">复制为 TSV（可直接粘贴到 Excel）</button>'
+    + '<span id="copyNote" style="color:var(--accent2);font-size:.72rem"></span></h2>');
+  L.push('<table id="tbl"><thead>' + head + '</thead><tbody>' + rows + '</tbody></table></div>');
+  if (st.paramsJson) {
+    L.push('<div class="card"><h2>🔧 参数快照（可粘回平台「导入参数」以复现本次扫描）</h2>');
+    L.push('<pre>' + esc(st.paramsJson) + '</pre></div>');
+  }
+  L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放）需联网加载 echarts；离线时数据表仍完整可用</p>');
+  L.push('</div>');
+  L.push('<script>');
+  L.push('var OPT = ' + safeJson(opt) + ';');
+  // 重建 tooltip formatter: 与平台内实现等价(图例小图标随 series.symbol 变化)
+  L.push('function symbolMarker(sym,color){');
+  L.push('  var W=\'width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"\';');
+  L.push('  if(sym==="square") return "<svg "+W+"><rect x=\\"1\\" y=\\"1\\" width=\\"8\\" height=\\"8\\" fill=\\""+color+"\\"/></svg>";');
+  L.push('  if(sym==="triangle") return "<svg "+W+"><polygon points=\\"5,1 9,9 1,9\\" fill=\\""+color+"\\"/></svg>";');
+  L.push('  if(sym==="diamond") return "<svg "+W+"><polygon points=\\"5,1 9,5 5,9 1,5\\" fill=\\""+color+"\\"/></svg>";');
+  L.push('  if(sym==="roundRect") return "<svg "+W+"><rect x=\\"1\\" y=\\"1\\" width=\\"8\\" height=\\"8\\" rx=\\"3\\" fill=\\""+color+"\\"/></svg>";');
+  L.push('  if(sym==="pin") return "<svg "+W+"><path d=\\"M5 1C3 1 1.6 2.4 1.6 4.3C1.6 6.3 5 9 5 9S8.4 6.3 8.4 4.3C8.4 2.4 7 1 5 1Z\\" fill=\\""+color+"\\"/></svg>";');
+  L.push('  return "<svg "+W+"><circle cx=\\"5\\" cy=\\"5\\" r=\\"4\\" fill=\\""+color+"\\"/></svg>";');
+  L.push('}');
+  L.push('OPT.tooltip = OPT.tooltip || {}; OPT.tooltip.trigger = "axis";');
+  L.push('OPT.tooltip.formatter = function(ps){');
+  L.push('  if(!ps||!ps.length) return "";');
+  L.push('  var h = "<div style=\\"font-weight:600;margin-bottom:4px\\">"+(ps[0].axisValueLabel||ps[0].name)+"</div>";');
+  L.push('  ps.forEach(function(p){');
+  L.push('    var sym = (OPT.series[p.seriesIndex]&&OPT.series[p.seriesIndex].symbol)||"circle";');
+  L.push('    h += "<div style=\\"display:flex;align-items:center;line-height:18px\\">"+symbolMarker(sym,p.color)');
+  L.push('      + "<span style=\\"color:#9ca0b0;margin-right:8px\\">"+p.seriesName+"</span>"');
+  L.push('      + "<span style=\\"margin-left:auto;color:#9ca0b0\\">"+p.value+"</span></div>";');
+  L.push('  });');
+  L.push('  return h;');
+  L.push('};');
+  // 导出页额外给一个工具栏(平台内没有, 这里方便二次保存图片)
+  L.push('OPT.toolbox = {right:8,top:0,feature:{saveAsImage:{title:"保存为图片",pixelRatio:2,backgroundColor:"#1a1d27"},dataZoom:{title:{zoom:"区域缩放",back:"还原"}},restore:{title:"还原"}},iconStyle:{borderColor:"#9ca0b0"}};');
+  L.push('if(window.echarts){ var ch = echarts.init(document.getElementById("chart")); ch.setOption(OPT);');
+  L.push('  window.addEventListener("resize", function(){ try{ch.resize()}catch(e){} }); }');
+  L.push('else { document.getElementById("chart").innerHTML = "<div style=\\"padding:24px;color:#9ca0b0;font-size:.82rem\\">⚠ 未能加载 echarts（当前离线？）——图表无法渲染，但下方数据表完整可用。</div>"; }');
+  L.push('function copyTsv(){');
+  L.push('  var rs = document.querySelectorAll("#tbl tr");');
+  L.push('  var out = [];');
+  L.push('  for(var i=0;i<rs.length;i++){');
+  L.push('    var cs = rs[i].querySelectorAll("th,td"), line = [];');
+  L.push('    for(var j=0;j<cs.length;j++) line.push(cs[j].textContent.trim());');
+  L.push('    out.push(line.join("\\t"));');
+  L.push('  }');
+  L.push('  var txt = out.join("\\n"), note = document.getElementById("copyNote");');
+  L.push('  function ok(){ if(note){ note.textContent = "✓ 已复制 "+rs.length+" 行"; setTimeout(function(){note.textContent=""},2500); } }');
+  L.push('  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(ok,fallback); } else fallback();');
+  L.push('  function fallback(){ var ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select();');
+  L.push('    try{document.execCommand("copy"); ok();}catch(e){ if(note) note.textContent="⚠ 复制失败，请手动选中表格"; } document.body.removeChild(ta); }');
+  L.push('}');
+  L.push('<\/script></body></html>');
+  return L.join('\n');
+}
+
+function exportSensHtml() {
+  if (!sensExportState) { sensExportNote('⚠ 请先运行一次敏感性分析', true); return; }
+  try {
+    let html = buildSensHtml();
+    let url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+    triggerDownload(url, sensExportFileName('html'), true);
+    sensExportNote('✓ 已导出可交互 HTML（' + (html.length / 1024).toFixed(0) + ' KB，含数据表与参数快照）');
+  } catch (e) {
+    sensExportNote('⚠ 导出失败: ' + ((e && e.message) ? e.message : e), true);
+  }
+}
+
 // ======================== SENSITIVITY ANALYSIS ========================
 // 三参数敏感性：横轴「扫描参数」× 颜色「对比参数」分档 × 纵轴「观察指标」，任意参数组合。
 // 对比参数档位默认自动生成（可选「无」回退单参数扫描），档位文本可编辑。
@@ -5265,8 +5480,13 @@ document.addEventListener('change', function(e) {
 });
 
 function runSensitivity() {
-  let btn = document.querySelector('#sensitivityPanel .btn');
+  // 按 id 取运行按钮(2026-08-25): 原先用 '#sensitivityPanel .btn' 取面板内第一个 .btn,
+  // 依赖 DOM 顺序 —— 一旦有人在其上方加按钮就会误禁用别的按钮。
+  let btn = $('btnRunSens') || document.querySelector('#sensitivityPanel .btn');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 分析中...'; }
+  // 新扫描开始 ⇒ 旧图即将被进度提示覆盖(chartEl.innerHTML 被替换会销毁 echarts 实例),
+  // 此时导出会取到已销毁的画布, 故先禁用导出, 由 paint() 成功后重新解锁。
+  setSensExportEnabled(false);
 
   let baseStrategy = getCurrentStrategy(); // 敏感性基准 = 当前配置的策略（与甘特图/运行当前一致）
   let param = $('sSweepParam').value, metric = $('sSweepMetric').value;
@@ -5421,6 +5641,22 @@ function runSensitivity() {
     formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+desc+
       '<br>基准策略: <code>'+baseStrategy.name+'</code> · 同一扫描切换纵轴即时（缓存）'+
       (cached ? ' · <span style="color:var(--accent)">⚡ 缓存命中，未重跑仿真（切换纵轴即时）</span>' : '');
+    // ---- 导出快照(2026-08-25): 供 PNG/JPG/HTML 三种导出复用 ----
+    // 存 option 与元信息, 而不是重新算一遍 —— 保证"导出的就是你看到的那张图"。
+    // ⚠️ opt.tooltip.formatter 是闭包函数, JSON 序列化会丢失; HTML 导出时单独重建等价实现
+    //    (见 buildSensHtml 里内联的 formatter), 故此处只需原样保留 opt 供位图导出用。
+    sensExportState = {
+      opt: opt, labels: labels, series: series,
+      param: param, paramLabel: paramLabel, metric: metric, metricLabel: metricLabel,
+      compareParam: compareParam, compareVals: compareVals,
+      shapeDim: shapeDim, shapeList: shapeList, hasPf: hasPf,
+      descHtml: desc, strategyName: baseStrategy.name,
+      dsl: baseStrategy.dsl || '', seed: gi('pSeed'),
+      // 全参数快照: 导出的 HTML 附带它, 别人拿到图能复现同一次扫描
+      paramsJson: (function(){ try { return collectParamsJson(); } catch(e) { return ''; } })(),
+      at: new Date()
+    };
+    setSensExportEnabled(true);
     if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
     // 注意: 不要清空 chartEl.innerHTML——echarts.init 已接管元素并渲染 canvas, 清空会销毁图表
   }
