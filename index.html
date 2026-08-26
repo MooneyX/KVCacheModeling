@@ -470,6 +470,10 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
         <option value="prefill_thr">Prefill吞吐-名义(tok/s)</option><option value="prefill_comp_thr">Prefill吞吐-GPU实算(tok/s)</option><option value="prefill_cache_amp">缓存放大倍数(名义÷实算)</option>
+        <option value="decode_thr">Decode吞吐(tok/s)</option>
+        <option value="prefill_thr_per_req">Prefill吞吐-单请求(tok/s)</option><option value="decode_thr_per_req">Decode吞吐-单请求(tok/s)</option>
+        <option value="prefill_active_s">Prefill活跃时长(s)</option><option value="decode_active_s">Decode活跃时长(s)</option>
+        <option value="prefill_overlap">Prefill并发重叠系数(×)</option><option value="decode_overlap">Decode并发重叠系数(×)</option>
         <option value="fetch_ratio">L3拉取时间占比(%)</option>
         <option value="compute_net">纯计算(ms)</option><option value="compute_wait">算力竞争等待(ms)</option><option value="compute_wait_ratio">算力竞争等待占比(%)</option>
         <option value="ttft_queue">TTFT分量-排队等待(ms)</option><option value="ttft_prefillq">TTFT分量-Prefill排队(ms)</option><option value="ttft_fetch">TTFT分量-L3拉取等待(ms)</option><option value="ttft_xfer">TTFT分量-PD KV传输(ms)</option>
@@ -844,6 +848,26 @@ function pctOf(arr, q){
   if(!arr || arr.length === 0) return 0;
   let a = arr.slice().sort((x, y) => x - y);
   return a[Math.min(a.length - 1, Math.floor((a.length - 1) * q))];
+}
+
+// 区间并集时长(2026-08-26): spans = [[start,end], ...] → 合并重叠后的总时长。
+// 用途: prefill / decode 阶段吞吐的**分母**。
+// ★ 为什么必须求并集而不是 Σ(end-start):
+//   多个请求的阶段区间在并发下大量重叠, Σ 会把同一段墙钟重复计入多次,
+//   分母虚增 ⇒ 吞吐被系统性低估。实测 Σ/并集 的比值随并发从 1.18 涨到 6.97。
+//   并集 = "该阶段至少有一个请求在活跃"的真实墙钟, 与"整机在这段时间产出了多少 token"匹配。
+// ★ 两种口径的语义差别(都有用, 但别混):
+//   分子/并集  → 系统产能(整机视角, 随并发上升)
+//   分子/Σ     → 单请求体验速率(随并发下降)
+function unionSpanSec(spans) {
+  if (!spans || !spans.length) return 0;
+  let a = spans.slice().sort((x, y) => x[0] - y[0]);
+  let total = 0, curS = a[0][0], curE = a[0][1];
+  for (let i = 1; i < a.length; i++) {
+    if (a[i][0] > curE) { total += curE - curS; curS = a[i][0]; curE = a[i][1]; }
+    else if (a[i][1] > curE) curE = a[i][1];
+  }
+  return total + (curE - curS);
 }
 
 // Chart registry + single resize handler (避免监听器累积)
@@ -2892,6 +2916,15 @@ function runSimulation(strategy, overrides) {
     // prefill 吞吐(2026-08-25): 在 finishPrefill 埋点累计, 与 decode 侧 outTokens 完全独立。
     // pfReqTokens=名义输入 token / pfCompTokens=GPU 实算 token / pfReqDone=完成 prefill 的请求数
     pfReqTokens: 0, pfCompTokens: 0, pfReqDone: 0,
+    // ---- 阶段时长区间(2026-08-26): 分母不再用 simEnd, 改为各阶段的**墙钟并集** ----
+    // 为什么记区间而不是直接累加时长: Σ(逐请求时长) 会把并发重叠部分重复计入,
+    // 分母被放大 ⇒ 吞吐被系统性低估(实测 Σ/并集 随 qps 可达 6.97 倍)。
+    // 因此先收集 [start,end] 区间, 结算时合并求并集(见 mergeSpans)。
+    pfSpans: [], dcSpans: [],
+    // Σ逐请求时长(供"单请求体验速率"口径与诊断并发重叠程度用, 不作默认分母)
+    pfSpanSum: 0, dcSpanSum: 0,
+    // decode 输出 token 中已完成请求的部分(与 dcSpans 同源, 保证分子分母口径一致)
+    dcOutTokens: 0,
     fetchSpanSum: 0,                                        // prefill 传输过程实际耗时累计(_ft1-_ft0, 含带宽排队/不含计算)
     fetchBytesPulled: 0,                                    // prefill 拉取字节总量(统一共享池口径, 单飞去重效果可由此观察)
     memUtilSamples: 0, memUtilSum: 0, memUtilPeak: 0, outTokens: 0,
@@ -3613,6 +3646,13 @@ function runSimulation(strategy, overrides) {
     stats.pfReqDone++;
     stats.pfReqTokens += (q.inputLen || 0);
     stats.pfCompTokens += Math.max(0, q._pfTotal || 0);
+    // 该请求的 prefill 服务区间 [prefillStart, prefillEnd] —— 结算时合并成并集作分母。
+    // 用 prefillStart(真正开始算)而非 arrive: 排队等待不属于"prefill 在干活"的时间,
+    // 把排队计入分母会让吞吐随 qps 虚降(排队越长分母越大, 而工作量没变)。
+    if (q.prefillStart != null && q.prefillEnd != null && q.prefillEnd > q.prefillStart) {
+      stats.pfSpans.push([q.prefillStart, q.prefillEnd]);
+      stats.pfSpanSum += (q.prefillEnd - q.prefillStart);
+    }
     if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: be/race 拉取者 prefill 完成 ⇒ 组前缀完整(拉取+重算合并)
     // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续请求命中
     // （此前到达的组内请求按全量 prefill 处理——实测 vLLM 行为一致：组内请求同时到达时前缀
@@ -3766,6 +3806,18 @@ function runSimulation(strategy, overrides) {
     let _kvReady = (req._kvXferEnd != null) ? req._kvXferEnd : req.prefillEnd;
     let _dW = Math.max(0, (req.decodeStart || _kvReady) - _kvReady);
     let _dT = Math.max(0, req.completeTime - (req.decodeStart || _kvReady));
+    // ---- decode 吞吐的时间区间(2026-08-26) ----
+    // [decodeStart, completeTime] = 该请求真正在产出 token 的时段。
+    // 与 prefill 侧对称: 用 decodeStart 而非 _kvReady, 把 decodeWait(槽位排队)排除在分母外。
+    // 分子只累加**已完成请求**的 outputLen, 与区间同源 ⇒ 分子分母口径一致。
+    {
+      let _ds = (req.decodeStart != null && req.decodeStart > 0) ? req.decodeStart : _kvReady;
+      if (req.completeTime > _ds) {
+        stats.dcSpans.push([_ds, req.completeTime]);
+        stats.dcSpanSum += (req.completeTime - _ds);
+      }
+      stats.dcOutTokens += (req.outputLen || 0);
+    }
     stats.latDw += _dW; stats.latDt += _dT;
     stats.completed++; stats.outTokens += req.outputLen;
     // 每实例完成计数(S2): 按请求被路由到的实例归属(不用当前 inst, 更稳)
@@ -4676,18 +4728,53 @@ function runSimulation(strategy, overrides) {
     name: strategy.name || autoNameStrategy(strategy),
     hbmHitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
     throughput: stats.outTokens / simEnd,
-    // ---- prefill 吞吐(2026-08-25) ----
-    // 分母统一用 simEnd(与 throughput 同口径, 整机墙钟), 分子来自 finishPrefill 埋点。
-    // prefillThroughput     = 名义 prompt 处理速率(tok/s): 含前缀命中省下的部分, 对外交付视角
-    // prefillComputeThrough = GPU 实算速率(tok/s): 扣除命中/拉取, 硬件真实算力产出
-    // 二者比值 = 1/(1-有效命中率), 是"缓存放大倍数"的直接观测量。
-    // ⚠️ 不要用 completed 反推 prefill 吞吐: 长输入下 prefill 完成 ≫ 请求完成。
-    prefillThroughput: simEnd > 0 ? stats.pfReqTokens / simEnd : 0,
-    prefillComputeThroughput: simEnd > 0 ? stats.pfCompTokens / simEnd : 0,
+    // ================= 分阶段吞吐(2026-08-26 改造) =================
+    // 【改造动机】原先 prefill 吞吐的分母用 simEnd(整机墙钟, 含 decode)，量纲错位：
+    //   simEnd 被 decode 独占时间主导 ⇒ prefill 侧的优化(如提 L3 带宽)在该口径下几乎不可见。
+    //   实测 out=1000 时 decode 占 70.3s 而 TTFT 仅 89ms ⇒ TTFT 只占端到端 0.127%,
+    //   于是「L3 带宽 25→400GB/s」让 ttft_fetch 变化 2235%, 而 prefill 吞吐只动 0.2%。
+    // 【修正】各阶段用**自己的墙钟并集**作分母:
+    //   prefill 吞吐 = Σ输入token ÷ 并集[prefillStart, prefillEnd]
+    //   decode  吞吐 = Σ输出token ÷ 并集[decodeStart, completeTime]
+    // 【为什么用并集而非 Σ逐请求】见 unionSpanSec 注释: Σ 重复计入并发重叠段, 分母虚增。
+    // 【口径自检】该口径对 outputLen **免疫** —— 改 out 时 prefill 吞吐应基本不动(≈1.0×),
+    //   而旧的 simEnd 口径会漂 8.8×、端到端延迟口径漂 40.5×。这是最强的筛子。
+    prefillThroughput: (function () {
+      let d = unionSpanSec(stats.pfSpans);
+      return d > 0 ? stats.pfReqTokens / d : 0;
+    })(),
+    prefillComputeThroughput: (function () {
+      let d = unionSpanSec(stats.pfSpans);
+      return d > 0 ? stats.pfCompTokens / d : 0;
+    })(),
+    decodeThroughput: (function () {
+      let d = unionSpanSec(stats.dcSpans);
+      return d > 0 ? stats.dcOutTokens / d : 0;
+    })(),
+    // 阶段活跃墙钟(秒): 并集 = 分母本身; Sum = Σ逐请求(诊断并发重叠程度用)
+    prefillActiveSec: unionSpanSec(stats.pfSpans),
+    decodeActiveSec: unionSpanSec(stats.dcSpans),
+    prefillSpanSumSec: stats.pfSpanSum,
+    decodeSpanSumSec: stats.dcSpanSum,
+    // 重叠系数 = Σ ÷ 并集。1.0 = 完全串行; 越大说明并发重叠越多。
+    // 它同时是"单请求体验速率"与"整机产能"两口径的比值, 便于换算而无需重跑。
+    prefillOverlap: (function () {
+      let u = unionSpanSec(stats.pfSpans);
+      return u > 0 ? stats.pfSpanSum / u : 0;
+    })(),
+    decodeOverlap: (function () {
+      let u = unionSpanSec(stats.dcSpans);
+      return u > 0 ? stats.dcSpanSum / u : 0;
+    })(),
+    // 单请求视角吞吐(分母 = Σ逐请求时长): 回答"一个请求能多快", 随并发下降
+    prefillThroughputPerReq: stats.pfSpanSum > 0 ? stats.pfReqTokens / stats.pfSpanSum : 0,
+    decodeThroughputPerReq: stats.dcSpanSum > 0 ? stats.dcOutTokens / stats.dcSpanSum : 0,
     prefillReqDone: stats.pfReqDone,
     prefillTokensTotal: stats.pfReqTokens,
     prefillComputeTokensTotal: stats.pfCompTokens,
+    decodeTokensTotal: stats.dcOutTokens,
     // 缓存放大倍数: 名义÷实算。=1 表示全部靠 GPU 重算(无有效命中), 越大说明缓存省得越多
+    // (与分母无关 —— 两者共用同一分母, 比值恒等于 1/(1-h_eff))
     prefillCacheAmp: stats.pfCompTokens > 0 ? stats.pfReqTokens / stats.pfCompTokens : 0,
     memUtilAvg: stats.memUtilSamples ? stats.memUtilSum / stats.memUtilSamples * 100 : 0,
     memUtilPeak: stats.memUtilPeak * 100,
@@ -5671,11 +5758,23 @@ function extractSensMetrics(r) {
     // hit_rate 保持"HBM 访问命中率"语义(历史敏感性/导出口径); 前缀分层命中率见 prefix_hit_rate
     throughput: r.throughput, hit_rate: r.hbmHitRate, mem_util: r.memUtilPeak, p99_latency: r.p99,
     // prefill 吞吐(2026-08-25): 与 throughput(decode 输出口径)是两条独立通道, 勿混用。
+    // 分阶段吞吐(2026-08-26 改口径): 分母 = 各阶段自己的墙钟并集, 不再是 simEnd。
     // prefill_thr      = 名义 prompt 处理速率; prefill_comp_thr = GPU 实算速率
     // prefill_cache_amp= 名义÷实算 = 缓存放大倍数
+    // decode_thr       = decode 输出速率(分母 = decode 活跃并集), 与 throughput(整机 simEnd 口径)不同
+    // ⚠️ throughput 保留原 simEnd 口径不动 —— 它是"整机对外交付速率", 与阶段口径互补, 勿混用
     prefill_thr: r.prefillThroughput || 0,
     prefill_comp_thr: r.prefillComputeThroughput || 0,
     prefill_cache_amp: r.prefillCacheAmp || 0,
+    decode_thr: r.decodeThroughput || 0,
+    // 阶段活跃时长与重叠系数: 用于诊断"分母到底多长""并发重叠多严重"
+    prefill_active_s: r.prefillActiveSec || 0,
+    decode_active_s: r.decodeActiveSec || 0,
+    prefill_overlap: r.prefillOverlap || 0,
+    decode_overlap: r.decodeOverlap || 0,
+    // 单请求视角(分母 = Σ逐请求时长): 回答"单个请求能多快", 随并发下降
+    prefill_thr_per_req: r.prefillThroughputPerReq || 0,
+    decode_thr_per_req: r.decodeThroughputPerReq || 0,
     prefix_hit_rate: r.hitRate ? r.hitRate.total : 0,
     fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0,   // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
     // compute 二级拆分的扫描指标(2026-08-24): 用于扫出"带宽/并发提升把等待从存储搬到算力"的曲线。
@@ -5757,6 +5856,11 @@ const SENS_METRIC_LABEL = {
   tpot:'平均TPOT(ms/tok)', tpot_p50:'TPOT P50(ms/tok)', tpot_p99:'TPOT P99(ms/tok)',
   throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)',
   prefill_thr:'Prefill吞吐-名义(tok/s)', prefill_comp_thr:'Prefill吞吐-GPU实算(tok/s)', prefill_cache_amp:'缓存放大倍数(×)',
+  // 分阶段吞吐(2026-08-26): 分母 = 各阶段墙钟并集。decode_thr 与 throughput(simEnd 口径)互补
+  decode_thr:'Decode吞吐(tok/s)',
+  prefill_thr_per_req:'Prefill吞吐-单请求(tok/s)', decode_thr_per_req:'Decode吞吐-单请求(tok/s)',
+  prefill_active_s:'Prefill活跃时长(s)', decode_active_s:'Decode活跃时长(s)',
+  prefill_overlap:'Prefill并发重叠系数(×)', decode_overlap:'Decode并发重叠系数(×)',
   fetch_ratio:'L3拉取时间占比(%)',
   compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)',
   // TTFT 六分量(2026-08-26): 既是堆叠柱的组成部分, 也可各自单独作折线纵轴
