@@ -472,6 +472,8 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="prefill_thr">Prefill吞吐-名义(tok/s)</option><option value="prefill_comp_thr">Prefill吞吐-GPU实算(tok/s)</option><option value="prefill_cache_amp">缓存放大倍数(名义÷实算)</option>
         <option value="fetch_ratio">L3拉取时间占比(%)</option>
         <option value="compute_net">纯计算(ms)</option><option value="compute_wait">算力竞争等待(ms)</option><option value="compute_wait_ratio">算力竞争等待占比(%)</option>
+        <option value="ttft_queue">TTFT分量-排队等待(ms)</option><option value="ttft_prefillq">TTFT分量-Prefill排队(ms)</option><option value="ttft_fetch">TTFT分量-L3拉取等待(ms)</option><option value="ttft_xfer">TTFT分量-PD KV传输(ms)</option>
+        <option value="ttft_stack">📊 TTFT构成(堆叠柱)</option>
       </select></div>
       <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" id="btnRunSens" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
@@ -5266,18 +5268,67 @@ function buildSensHtml() {
   }
   let hasSwitch = metricKeys.length > 1;
 
-  // 数据表: 行 = 横轴档位, 列 = 各系列。离线打不开图时这份数字仍完整可用
-  // (切换指标时由页内 renderTable() 重绘, 此处生成的是当前指标的初始版本)
+  // ===== 堆叠柱数据(2026-08-26) =====
+  // STACK_DATA[分量key] = 拉平后的场景数组(与 STACK_LABELS 一一对应)。
+  // 与 METRIC_DATA 的区别: METRIC_DATA 是 [曲线][点] 二维(折线用), STACK_DATA 是
+  // **一维拉平**(堆叠柱把曲线维也摊到 x 轴上) ⇒ 两者不能互相套用, 切换时要换整套结构。
+  let stackParts = st.stackParts || null;
+  let stackLabels = st.stackLabels || null;
+  let stackData = {};
+  let stackTotals = [];
+  let canStack = !!(stackParts && stackLabels && recs && recs.length);
+  if (canStack) {
+    // 按 curveRecs 顺序拉平(与 paint 里 sceneLabels 同序)
+    let flat = [];
+    recs.forEach(function (arr) { (arr || []).forEach(function (r) { flat.push(r); }); });
+    // 长度不一致说明快照被外部改过 ⇒ 关掉堆叠功能而不是画出错位的图
+    if (flat.length !== stackLabels.length) { canStack = false; }
+    else {
+      stackParts.forEach(function (p) {
+        stackData[p.key] = flat.map(function (r) {
+          let v = (r && r[p.key] != null && isFinite(r[p.key])) ? +Number(r[p.key]).toFixed(1) : 0;
+          return v;
+        });
+      });
+      stackTotals = flat.map(function (r, i) {
+        return +stackParts.reduce(function (a, p) { return a + stackData[p.key][i]; }, 0).toFixed(1);
+      });
+    }
+  }
+  // 堆叠柱指标必须真有数据才放进下拉 —— 否则用户切过去看到空图
+  if (canStack && metricKeys.indexOf(TTFT_STACK_KEY) < 0) metricKeys.push(TTFT_STACK_KEY);
+  if (!canStack) {
+    let i = metricKeys.indexOf(TTFT_STACK_KEY);
+    if (i >= 0) metricKeys.splice(i, 1);
+  }
+  hasSwitch = metricKeys.length > 1;
+
+  // 数据表: 两套结构, 由页内 renderTable() 按当前指标类型整体重建 —— 不是就地改数值。
+  //   折线指标 → 行=横轴档位, 列=各曲线
+  //   堆叠柱   → 行=场景,     列=6 个分量 + 合计
+  // 此处生成的是**当前指标**对应的那一套(离线打不开图时这份数字仍完整可用)。
   let sers = (opt.series || []);
-  let head = '<tr><th>' + esc(st.paramLabel) + '</th>'
-    + sers.map(function (s) { return '<th>' + esc(s.name) + '</th>'; }).join('') + '</tr>';
-  let rows = st.labels.map(function (lb, i) {
-    return '<tr><td class="k">' + esc(lb) + '</td>'
-      + sers.map(function (s) {
-        let v = (s.data && s.data[i] != null) ? s.data[i] : '';
-        return '<td>' + esc(v) + '</td>';
-      }).join('') + '</tr>';
-  }).join('\n');
+  let head, rows;
+  if (st.stackMode && canStack) {
+    head = '<tr><th>场景</th>'
+      + stackParts.map(function (p) { return '<th>' + esc(p.label) + '</th>'; }).join('')
+      + '<th>TTFT合计</th></tr>';
+    rows = stackLabels.map(function (lb, i) {
+      return '<tr><td class="k">' + esc(lb) + '</td>'
+        + stackParts.map(function (p) { return '<td>' + esc(stackData[p.key][i]) + '</td>'; }).join('')
+        + '<td><b>' + esc(stackTotals[i]) + '</b></td></tr>';
+    }).join('\n');
+  } else {
+    head = '<tr><th>' + esc(st.paramLabel) + '</th>'
+      + sers.map(function (s) { return '<th>' + esc(s.name) + '</th>'; }).join('') + '</tr>';
+    rows = st.labels.map(function (lb, i) {
+      return '<tr><td class="k">' + esc(lb) + '</td>'
+        + sers.map(function (s) {
+          let v = (s.data && s.data[i] != null) ? s.data[i] : '';
+          return '<td>' + esc(v) + '</td>';
+        }).join('') + '</tr>';
+    }).join('\n');
+  }
 
   // 维度摘要(纯文本, 不含 HTML 标签) —— descHtml 里有 <code>, 直接复用即可
   // 「纵轴」一项在切换指标时要跟着变 ⇒ 单独拆出来给个 id, 由页内 applyMetric() 改写,
@@ -5334,17 +5385,21 @@ function buildSensHtml() {
     // 只在有 ≥2 个可用指标时才出现切换条 —— 单指标时下拉是噪音
     L.push('<div class="mbar"><label>纵轴指标</label><select id="mSel">'
       + metricKeys.map(function (k) {
+          let txt = (k === TTFT_STACK_KEY) ? ('📊 ' + SENS_METRIC_LABEL[k]) : SENS_METRIC_LABEL[k];
           return '<option value="' + esc(k) + '"' + (k === st.metric ? ' selected' : '') + '>'
-            + esc(SENS_METRIC_LABEL[k]) + '</option>';
+            + esc(txt) + '</option>';
         }).join('')
       + '</select>');
     // 常用指标快捷 chip(只放本次扫描确实有数据的)
-    let quick = ['ttft', 'ttft_p99', 'latency', 'tpot', 'throughput', 'fetch_ratio',
-      'prefix_hit_rate', 'compute_net', 'compute_wait', 'prefill_thr'].filter(function (k) { return metricKeys.indexOf(k) >= 0; });
+    // ttft_stack 放**第一位** —— 它是信息量最大的一张(一眼看出时间花在哪), 优先给到手边
+    let quick = ['ttft_stack', 'ttft', 'ttft_p99', 'latency', 'tpot', 'throughput', 'fetch_ratio',
+      'prefix_hit_rate', 'compute_net', 'compute_wait'].filter(function (k) { return metricKeys.indexOf(k) >= 0; });
     if (quick.length) {
       L.push('<span style="color:var(--border)">|</span>');
       L.push(quick.map(function (k) {
-        return '<button class="chip" data-m="' + esc(k) + '">' + esc(SENS_METRIC_LABEL[k]) + '</button>';
+        // 堆叠柱 chip 加图标提示它是结构不同的一张图
+        let txt = (k === TTFT_STACK_KEY) ? ('📊 ' + SENS_METRIC_LABEL[k]) : SENS_METRIC_LABEL[k];
+        return '<button class="chip" data-m="' + esc(k) + '">' + esc(txt) + '</button>';
       }).join(''));
     }
     L.push('<span id="mNote" style="font-size:.71rem;color:var(--text-dim);margin-left:auto">'
@@ -5378,6 +5433,23 @@ function buildSensHtml() {
   // IS_MULTI: 多曲线(有颜色/形状维) ⇒ series.name 是"档位·形状"标签, 切指标时**不能**改;
   //           单曲线 ⇒ series.name 本身就是指标名(平台绘图口径), 切指标时必须同步改。
   L.push('var IS_MULTI = ' + (st.isMulti ? 'true' : 'false') + ';');
+  // ---- 堆叠柱所需的四份数据(2026-08-26) ----
+  // 折线与堆叠柱是**两种结构**(前者 [曲线][点] 二维 + labels 轴; 后者一维拉平 + 场景轴),
+  // 所以导出页必须同时持有两套 x 轴标签、两套 series 模板, 切换时整体重建 series。
+  L.push('var STACK_KEY = ' + safeJson(TTFT_STACK_KEY) + ';');
+  L.push('var STACK_PARTS = ' + safeJson(canStack ? stackParts : []) + ';');
+  L.push('var STACK_DATA = ' + safeJson(canStack ? stackData : {}) + ';');
+  L.push('var STACK_TOTALS = ' + safeJson(canStack ? stackTotals : []) + ';');
+  L.push('var STACK_LABELS = ' + safeJson(canStack ? stackLabels : []) + ';');
+  L.push('var LINE_LABELS = ' + safeJson(st.labels || []) + ';');
+  // LINE_TPL: 折线样式模板。堆叠柱状态下导出时 OPT.series 里只有 bar, 折线的
+  // 名称/配色/符号全丢 ⇒ 必须靠模板还原(见平台侧 lineTpl 注释)
+  L.push('var LINE_TPL = ' + safeJson(st.lineTpl || []) + ';');
+  L.push('var CUR_IS_STACK = ' + (st.stackMode && canStack ? 'true' : 'false') + ';');
+  // 折线模式下的轴名(切回折线时恢复); 堆叠柱固定用"TTFT 构成(ms)"
+  L.push('var LINE_X_NAME = ' + safeJson(st.paramLabel) + ';');
+  L.push('var STACK_X_NAME = ' + safeJson((st.lineTpl && st.lineTpl.length > 1)
+    ? (st.paramLabel + ' × 场景') : st.paramLabel) + ';');
   // 重建 tooltip formatter: 与平台内实现等价(图例小图标随 series.symbol 变化)
   L.push('function symbolMarker(sym,color){');
   L.push('  var W=\'width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"\';');
@@ -5392,6 +5464,22 @@ function buildSensHtml() {
   L.push('OPT.tooltip.formatter = function(ps){');
   L.push('  if(!ps||!ps.length) return "";');
   L.push('  var h = "<div style=\\"font-weight:600;margin-bottom:4px\\">"+(ps[0].axisValueLabel||ps[0].name)+"</div>";');
+  // 堆叠柱: 显示 分量/绝对值/占比 + 合计行(与平台内 tooltip 逐字等价)
+  L.push('  if(CUR_IS_STACK){');
+  L.push('    var tot = 0; ps.forEach(function(p){ tot += (+p.value||0); });');
+  L.push('    ps.forEach(function(p){');
+  L.push('      var v = +p.value||0, pct = tot>0 ? (100*v/tot) : 0;');
+  L.push('      h += "<div style=\\"display:flex;align-items:center;line-height:18px\\">"');
+  L.push('        + "<span style=\\"display:inline-block;width:9px;height:9px;border-radius:2px;background:"+p.color+";margin-right:6px;flex:none\\"></span>"');
+  L.push('        + "<span style=\\"color:#9ca0b0;margin-right:10px\\">"+p.seriesName+"</span>"');
+  L.push('        + "<span style=\\"margin-left:auto\\"><b style=\\"color:#e4e4e7\\">"+v.toFixed(1)+"</b>"');
+  L.push('        + "<span style=\\"color:#9ca0b0\\"> ms · "+pct.toFixed(1)+"%</span></span></div>";');
+  L.push('    });');
+  L.push('    h += "<div style=\\"border-top:1px solid #2e3347;margin-top:4px;padding-top:4px;display:flex;line-height:18px\\">"');
+  L.push('      + "<span style=\\"color:#9ca0b0;margin-right:10px\\">TTFT 合计</span>"');
+  L.push('      + "<span style=\\"margin-left:auto;font-weight:600;color:#e4e4e7\\">"+tot.toFixed(1)+" ms</span></div>";');
+  L.push('    return h;');
+  L.push('  }');
   L.push('  ps.forEach(function(p){');
   L.push('    var sym = (OPT.series[p.seriesIndex]&&OPT.series[p.seriesIndex].symbol)||"circle";');
   L.push('    h += "<div style=\\"display:flex;align-items:center;line-height:18px\\">"+symbolMarker(sym,p.color)');
@@ -5410,30 +5498,101 @@ function buildSensHtml() {
   // ---- 切换指标: 只换 series.data 与 yAxis.name, 不动颜色/形状/图例 ----
   // 用 setOption 的**增量合并**(不传 notMerge) ⇒ 用户已做的图例开关/缩放状态不被重置。
   // 单曲线场景平台会开 label.show(数值直接标在点上), 增量合并保留该设置, 无需特殊处理。
+  // ⚠️ 例外: 折线 ↔ 堆叠柱互切时 series 的**数量与类型都变**, 增量合并会残留旧 series
+  //    (echarts 按索引合并, 多出来的旧 series 不会消失) ⇒ 该情况必须走 notMerge=true 全量重建。
+  //
+  // renderTable(2026-08-26 改造): 从"就地改数值"升级为"整表重建" ——
+  // 折线表(行=档位, 列=曲线)与堆叠柱表(行=场景, 列=6分量+合计)行列数都不同,
+  // 就地改数值只能应付前者。重建 thead+tbody 才能两种结构互切。
+  L.push('function esc2(t){ return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }');
   L.push('function renderTable(){');
-  L.push('  var tb = document.querySelector("#tbl tbody"); if(!tb) return;');
-  L.push('  var cols = METRIC_DATA[CUR_METRIC]; if(!cols) return;');
-  L.push('  var rs = tb.querySelectorAll("tr");');
-  L.push('  for(var i=0;i<rs.length;i++){');
-  L.push('    var cs = rs[i].querySelectorAll("td");');
-  // cs[0] 是档位名(class="k"), 数值列从 1 开始, 与 cols 的曲线序号错开 1
-  L.push('    for(var j=1;j<cs.length;j++){ var v=(cols[j-1]&&cols[j-1][i]!=null)?cols[j-1][i]:""; cs[j].textContent=v; }');
+  L.push('  var tbl = document.getElementById("tbl"); if(!tbl) return;');
+  L.push('  var th = tbl.querySelector("thead"), tb = tbl.querySelector("tbody");');
+  L.push('  if(!th||!tb) return;');
+  L.push('  if(CUR_IS_STACK){');
+  L.push('    th.innerHTML = "<tr><th>场景</th>" + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("") + "<th>TTFT合计</th></tr>";');
+  L.push('    tb.innerHTML = STACK_LABELS.map(function(lb,i){');
+  L.push('      return "<tr><td class=\\"k\\">"+esc2(lb)+"</td>"');
+  L.push('        + STACK_PARTS.map(function(p){ return "<td>"+esc2((STACK_DATA[p.key]||[])[i])+"</td>"; }).join("")');
+  L.push('        + "<td><b>"+esc2(STACK_TOTALS[i])+"</b></td></tr>";');
+  L.push('    }).join("");');
+  L.push('    return;');
   L.push('  }');
+  L.push('  var cols = METRIC_DATA[CUR_METRIC]; if(!cols) return;');
+  // 折线表的表头 = 横轴名 + 各曲线名(单曲线时曲线名 = 当前指标名, 故需重建而非只改数值)
+  L.push('  var lb = METRIC_LABEL[CUR_METRIC]||CUR_METRIC;');
+  L.push('  th.innerHTML = "<tr><th>"+esc2(LINE_X_NAME)+"</th>"');
+  L.push('    + LINE_TPL.map(function(t){ return "<th>"+esc2(IS_MULTI ? t.name : lb)+"</th>"; }).join("") + "</tr>";');
+  L.push('  tb.innerHTML = LINE_LABELS.map(function(xl,i){');
+  L.push('    return "<tr><td class=\\"k\\">"+esc2(xl)+"</td>"');
+  L.push('      + cols.map(function(c){ return "<td>"+esc2(c[i]!=null?c[i]:"")+"</td>"; }).join("") + "</tr>";');
+  L.push('  }).join("");');
+  L.push('}');
+  // buildStackSeries / buildLineSeries: 两种图形的 series 构造器(与平台侧逐字对应)
+  L.push('function buildStackSeries(){');
+  L.push('  var ss = STACK_PARTS.map(function(p){');
+  L.push('    return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,');
+  L.push('      itemStyle:{color:p.color}, emphasis:{focus:"series"},');
+  L.push('      data:(STACK_DATA[p.key]||[]).slice()};');
+  L.push('  });');
+  // 总计标签只挂最后一个 series(堆叠柱 position:"top" 仅顶层可见), 与平台一致
+  L.push('  if(ss.length){ ss[ss.length-1].label = {show: STACK_LABELS.length<=24, position:"top",');
+  L.push('    color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){');
+  L.push('      var t = STACK_TOTALS[p.dataIndex]||0;');
+  L.push('      return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }');
+  L.push('  return ss;');
+  L.push('}');
+  L.push('function buildLineSeries(k){');
+  L.push('  var cols = METRIC_DATA[k]||[], lb = METRIC_LABEL[k]||k;');
+  L.push('  return LINE_TPL.map(function(t,i){');
+  L.push('    var s = JSON.parse(JSON.stringify(t));');
+  L.push('    if(!IS_MULTI) s.name = lb;');
+  L.push('    s.data = (cols[i]||[]).slice();');
+  L.push('    return s;');
+  L.push('  });');
   L.push('}');
   L.push('function applyMetric(k){');
-  L.push('  if(!METRIC_DATA[k]) return;');
-  L.push('  CUR_METRIC = k;');
-  L.push('  var lb = METRIC_LABEL[k]||k, cols = METRIC_DATA[k];');
+  // 堆叠柱与折线的数据源不同: 前者查 STACK_PARTS 是否可用, 后者查 METRIC_DATA
+  L.push('  var toStack = (k===STACK_KEY);');
+  L.push('  if(toStack ? !STACK_PARTS.length : !METRIC_DATA[k]) return;');
+  L.push('  var wasStack = CUR_IS_STACK;');
+  L.push('  CUR_METRIC = k; CUR_IS_STACK = toStack;');
+  L.push('  var lb = METRIC_LABEL[k]||k;');
   L.push('  if(ch){');
-  // 增量补丁: 每条 series 只给 data(+单曲线时给 name), 其余样式字段一律不动
-  L.push('    var ns = OPT.series.map(function(s,i){');
-  L.push('      var patch = {data: (cols[i]||[]).slice()};');
-  L.push('      if(!IS_MULTI){ patch.name = lb; s.name = lb; }');
-  L.push('      s.data = patch.data.slice();');
-  L.push('      return patch;');
-  L.push('    });');
-  L.push('    OPT.yAxis.name = lb;');
-  L.push('    ch.setOption({series: ns, yAxis: {name: lb}});');
+  L.push('    if(toStack !== wasStack){');
+  // ★ 类型切换: series 数量/类型/x轴长度全变 ⇒ 必须 notMerge 全量重建。
+  //   这是唯一允许 notMerge 的路径(会重置图例开关/缩放, 但结构已变, 保留旧状态反而错乱)。
+  L.push('      var nSc = toStack ? STACK_LABELS.length : LINE_LABELS.length;');
+  L.push('      var rot = toStack ? (nSc>10?30:(nSc>6?20:0)) : 0;');
+  L.push('      var zoom = toStack && nSc>16;');
+  L.push('      OPT.series = toStack ? buildStackSeries() : buildLineSeries(k);');
+  L.push('      OPT.xAxis.data = (toStack ? STACK_LABELS : LINE_LABELS).slice();');
+  L.push('      OPT.xAxis.name = toStack ? STACK_X_NAME : LINE_X_NAME;');
+  L.push('      OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};');
+  L.push('      OPT.xAxis.axisLabel.rotate = rot; OPT.xAxis.axisLabel.interval = 0;');
+  L.push('      OPT.xAxis.axisLabel.color = "#9ca0b0";');
+  L.push('      OPT.xAxis.axisLabel.formatter = function(v){ return (CUR_IS_STACK && String(v).length>22) ? String(v).slice(0,21)+"…" : v; };');
+  L.push('      OPT.yAxis.name = toStack ? "TTFT 构成(ms)" : lb;');
+  L.push('      OPT.legend = (toStack||IS_MULTI) ? {top:0,textStyle:{color:"#9ca0b0",fontSize:10}} : undefined;');
+  L.push('      OPT.grid = {left:70,right:20,top:(toStack||IS_MULTI)?36:20,bottom: zoom?76:(rot?62:40)};');
+  L.push('      OPT.tooltip.axisPointer = toStack ? {type:"shadow"} : undefined;');
+  L.push('      OPT.dataZoom = zoom ? [{type:"slider",bottom:8,height:18,borderColor:"#2e3347",');
+  L.push('        textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;');
+  L.push('      ch.setOption(OPT, true);');
+  L.push('    } else if(toStack){');
+  // 堆叠柱内部无需重绘(数据不随 metric 变) —— 但仍要走后续 UI 同步
+  L.push('    } else {');
+  // 同类型(折线→折线): 走增量补丁, 保留用户的图例开关/缩放
+  L.push('      var cols = METRIC_DATA[k];');
+  L.push('      var ns = OPT.series.map(function(s,i){');
+  L.push('        var patch = {data: (cols[i]||[]).slice()};');
+  L.push('        if(!IS_MULTI){ patch.name = lb; s.name = lb; }');
+  L.push('        s.data = patch.data.slice();');
+  L.push('        return patch;');
+  L.push('      });');
+  L.push('      OPT.yAxis.name = lb;');
+  L.push('      ch.setOption({series: ns, yAxis: {name: lb}});');
+  L.push('    }');
   L.push('    try{ ch.setOption({toolbox:{feature:{saveAsImage:{name:"敏感性_"+lb.replace(/[\\/:*?"<>|()\\s]+/g,"")}}}}); }catch(e){}');
   L.push('  }');
   L.push('  var dy = document.getElementById("dimY"); if(dy) dy.textContent = lb;');
@@ -5525,8 +5684,45 @@ function extractSensMetrics(r) {
     // compute_wait_ratio: 竞争等待占 compute 的比例(%) —— >50% ⇒ 该做并发准入控制而非加算力
     compute_net: b ? (b.computeNet || 0) : 0,
     compute_wait: b ? (b.computeWait || 0) : 0,
-    compute_wait_ratio: (b && b.compute > 0) ? 100 * (b.computeWait || 0) / b.compute : 0 };
+    compute_wait_ratio: (b && b.compute > 0) ? 100 * (b.computeWait || 0) / b.compute : 0,
+    // ---- TTFT 六分量(2026-08-26): 供「TTFT 构成」堆叠柱使用, 同时各自可作独立折线指标 ----
+    // ★ 已用 _dbg_ttft_identity.js 在 12 个场景(wc/be/race × 命中0/60/90/100% × PD分离/
+    //   多实例/长输入/低slots)逐一验证: 六项之和 == r.avgTtft, 最大相对残差 7.28e-12(浮点噪声)。
+    //   ⇒ 堆叠柱的**柱高就是 TTFT**, 不是近似。
+    // 为什么用 computeNet/computeWait 而不是合并的 compute:
+    //   compute 是**兜底残差**(prefill 墙钟 − 拉取等待), 把"真缺算力"与"算力被别人占用"
+    //   混在一起。拆开后堆叠柱能直接回答"该加卡还是该收紧准入"(见 NOTES_engine.md)。
+    // 为什么不用 fetchReal: fetchReal 是"拉取过程真实时长", race/best_effort 下与计算重叠,
+    //   计入堆叠会导致 Σ > TTFT(重复计时)。堆叠柱必须用**互不重叠**的墙钟分段 ⇒ 用 fetch。
+    ttft_queue: b ? (b.queue || 0) : 0,
+    ttft_prefillq: b ? (b.prefillQ || 0) : 0,
+    ttft_fetch: b ? (b.fetch || 0) : 0,
+    ttft_xfer: b ? (b.xfer || 0) : 0 };
 }
+
+// ======================== TTFT 构成堆叠柱(2026-08-26) ========================
+// 特殊"观察指标" ttft_stack: 纵轴不是单一数值, 而是把 TTFT 拆成 6 个互不重叠的墙钟分段
+// 画成堆叠柱 —— 回答"这个场景下时间到底花在哪", 而折线只能给出一个总数。
+// 分量顺序 = 请求生命周期时序(入队 → prefill排队 → 拉取 → 计算 → PD传输), 自下而上堆叠,
+// 与甘特图的阅读方向一致。
+// ⚠️ 复用 SENS_METRIC_LABEL 的 key: 每个分量本身也是合法的独立折线指标(可单独扫描),
+//    因此这里只是"把 6 个已有指标组合成一张堆叠图", 不额外引入数据通道。
+const TTFT_STACK_KEY = 'ttft_stack';
+const TTFT_STACK_PARTS = [
+  { key: 'ttft_queue',        label: '排队等待',     color: '#64748b',
+    tip: '请求到达 → 进入 prefill 队列前的等待。占比高 ⇒ 系统整体过载(降 qps / 加实例)' },
+  { key: 'ttft_prefillq',     label: 'Prefill排队',  color: '#8b5cf6',
+    tip: '在 prefill 队列中等待被调度(受 pPrefillSlots 准入限制)' },
+  { key: 'ttft_fetch',        label: 'L3拉取等待',   color: '#f59e0b',
+    tip: '等待 KV 从 L3(SSD/远端存储)拉取到位的**暴露**时长。race/best_effort 下与计算重叠部分不计入此项' },
+  { key: 'compute_net',       label: '纯计算',       color: '#10b981',
+    tip: '独占 GPU 时该请求的真实计算时长。与并发/带宽无关 ⇒ 占比高才是"真缺算力"' },
+  { key: 'compute_wait',      label: '算力竞争等待', color: '#ef4444',
+    tip: '算力被其他并发请求占用的时长。占比高 ⇒ 应收紧 pPrefillSlots 做准入, 加卡收益有限' },
+  { key: 'ttft_xfer',         label: 'PD KV传输',    color: '#06b6d4',
+    tip: 'PD 真分离时 P 节点 → D 节点的 KV 传输段(非真分离恒为 0)' }
+];
+function isTtftStack(metric) { return metric === TTFT_STACK_KEY; }
 
 // 各参数默认档位（选择对比参数时自动填充；可手动编辑）
 const SENS_LEVELS = {
@@ -5562,7 +5758,13 @@ const SENS_METRIC_LABEL = {
   throughput:'吞吐(tok/s)', mem_util:'显存利用率峰值(%)',
   prefill_thr:'Prefill吞吐-名义(tok/s)', prefill_comp_thr:'Prefill吞吐-GPU实算(tok/s)', prefill_cache_amp:'缓存放大倍数(×)',
   fetch_ratio:'L3拉取时间占比(%)',
-  compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)'
+  compute_net:'纯计算(ms)', compute_wait:'算力竞争等待(ms)', compute_wait_ratio:'算力竞争等待占比(%)',
+  // TTFT 六分量(2026-08-26): 既是堆叠柱的组成部分, 也可各自单独作折线纵轴
+  ttft_queue:'TTFT分量-排队等待(ms)', ttft_prefillq:'TTFT分量-Prefill排队(ms)',
+  ttft_fetch:'TTFT分量-L3拉取等待(ms)', ttft_xfer:'TTFT分量-PD KV传输(ms)',
+  // ★ 特殊指标: 值不是单一数字而是 6 分量堆叠柱(见 TTFT_STACK_PARTS)。
+  //   放在最后 —— 导出页 ←/→ 键按此顺序遍历, 结构特殊的放末尾不打断折线指标的连续浏览。
+  ttft_stack:'TTFT构成(堆叠柱)'
 };
 function sensParamUnit(param, v) {
   if (param === 'gpu_preset') return SENS_GPU_LABEL[v] || String(v);  // 非数值维度, 直接查表
@@ -5722,6 +5924,12 @@ function runSensitivity() {
     // 每个 rec 本来就带齐 20 个指标(见 extractSensMetrics), 不额外花任何计算。
     let curveRecs = [];
     let palette = ['#6c63ff', '#f59e0b', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#84cc16'];
+
+    // ===== 先把多维结果**拉平**成"曲线列表" =====
+    // 无论折线还是堆叠柱, 底层数据都是"若干条曲线 × 若干横轴档位"。此处统一拉平,
+    // 后面两种图形共用同一份 flatCurves ⇒ curveRecs 与场景标签只需维护一处。
+    // flatCurves[i] = { recs: 全指标记录数组, name: 该曲线的维度组合名(不含横轴) }
+    let flatCurves = [];
     if (compareParam || hasPf) {
       let cmpLoop = compareParam ? compareVals.length : 1;
       let pfLoop = hasPf ? shapeList.length : 1;
@@ -5733,19 +5941,103 @@ function runSensitivity() {
           let nameParts = [];
           if (compareParam) nameParts.push(cmpLabel(compareVals[ci]));
           if (hasPf) nameParts.push(shapeLabelOf(shapeList[pi]));
-          curveRecs.push(data);
-          series.push({
-            name: nameParts.join(' · '), type: 'line', smooth: true,
-            data: data.map(rec => +metricOf(rec).toFixed(1)),
-            lineStyle: { color: palette[ci % palette.length], width: 2 },
-            itemStyle: { color: palette[ci % palette.length] },
-            symbol: hasPf ? shapeSymbolOf(pi, shapeList[pi]) : 'circle',
-            symbolSize: hasPf ? 7 : 6
-          });
+          flatCurves.push({ recs: data, name: nameParts.join(' · '), ci: ci, pi: pi });
         }
       }
     } else {
-      curveRecs.push(results);
+      flatCurves.push({ recs: results, name: metricLabel, ci: 0, pi: 0 });
+    }
+    flatCurves.forEach(function (fc) { curveRecs.push(fc.recs); });
+
+    // ===== 折线 series 样式模板(2026-08-26) =====
+    // 无论当前画的是折线还是堆叠柱, 都**恒定**生成一份折线样式模板并存进导出快照。
+    // 原因: 若用户在堆叠柱状态下导出, opt.series 里只有 6 个 bar —— 折线的
+    // 名称/配色/符号信息全丢, 导出页切回折线指标时就无法还原原本的图例与配色。
+    // (反向同理: 堆叠柱的 6 个分量是全局常量, 不需要模板。)
+    let lineTpl = flatCurves.map(function (fc, i) {
+      let t = {
+        name: (compareParam || hasPf) ? fc.name : metricLabel,
+        type: 'line', smooth: true,
+        lineStyle: { color: palette[fc.ci % palette.length], width: 2 },
+        itemStyle: { color: palette[fc.ci % palette.length] },
+        symbol: hasPf ? shapeSymbolOf(fc.pi, shapeList[fc.pi]) : 'circle',
+        symbolSize: hasPf ? 7 : 6
+      };
+      // 单曲线时平台会额外给面积填充与点上数值标签 —— 模板要一致, 否则导出页切到
+      // 折线指标后样式与平台不符
+      if (!(compareParam || hasPf)) {
+        t.areaStyle = { color: 'rgba(108,99,255,.1)' };
+        t.label = { show: true, color: '#9ca0b0', fontSize: 9 };
+      }
+      return t;
+    });
+    // 场景标签同样**恒定**计算(不只在 stackMode 下) —— 导出页从折线切到堆叠柱时要用。
+    // ⚠️ 生成规则必须与下方 stackScenes 完全一致, 否则两处场景名不同会让人以为是两张图。
+    let sceneLabels = [];
+    flatCurves.forEach(function (fc) {
+      (fc.recs || []).forEach(function (rec, idx) {
+        let lb = labels[idx] || String(idx);
+        sceneLabels.push(flatCurves.length > 1 ? lb + ' · ' + fc.name : lb);
+      });
+    });
+
+    // ===== 分支 A: TTFT 构成堆叠柱(2026-08-26) =====
+    // 与折线的根本差异: 折线用「颜色」表达维度组合, 而堆叠柱的颜色通道必须让给 6 个分量。
+    // ⇒ 把「横轴档位 × 维度组合」**拉平成 x 轴上的场景**, 每根柱子 = 一个具体场景。
+    //   这正好对应"用柱状图看各种场景下的 TTFT 构成": 场景横向排开, 分量纵向堆叠。
+    // 场景数 = 档位数 × 曲线数, 可能很多 ⇒ 超过阈值时自动开 dataZoom(见下)。
+    let stackMode = isTtftStack(metric);
+    let stackScenes = [];     // [{label, rec}] 与 x 轴一一对应
+    if (stackMode) {
+      // 场景列表直接复用上面恒定算好的 sceneLabels(同序), 保证平台与导出页场景名一致
+      let flatRecs = [];
+      flatCurves.forEach(function (fc) { (fc.recs || []).forEach(function (rec) { flatRecs.push(rec); }); });
+      stackScenes = sceneLabels.map(function (lb, i) { return { label: lb, rec: flatRecs[i] }; });
+      // 每个分量一个 series, 全部 stack 到同一组 ⇒ 柱高 = Σ分量 = TTFT(已验证加性恒等)
+      TTFT_STACK_PARTS.forEach(function (part) {
+        series.push({
+          name: part.label, type: 'bar', stack: 'ttft',
+          // barMaxWidth 防止场景很少时柱子胖得离谱; 不设 barWidth 让 echarts 自适应
+          barMaxWidth: 48,
+          itemStyle: { color: part.color },
+          emphasis: { focus: 'series' },
+          data: stackScenes.map(function (sc) {
+            let v = (sc.rec && sc.rec[part.key] != null && isFinite(sc.rec[part.key])) ? sc.rec[part.key] : 0;
+            return +v.toFixed(1);
+          })
+        });
+      });
+      // 顶部总计标签: 挂在**最后一个** series 上(堆叠柱的 position:'top' 只在顶层可见)。
+      // ⚠️ 不能挂在第一个 —— 那样标签会画在最底层分段的顶部, 落在柱子中间。
+      // 值用 Σ 而非 series 自身 value, 否则显示的是最后一个分量而非总高。
+      let totals = stackScenes.map(function (sc) {
+        return TTFT_STACK_PARTS.reduce(function (a, p) {
+          let v = (sc.rec && isFinite(sc.rec[p.key])) ? sc.rec[p.key] : 0; return a + v;
+        }, 0);
+      });
+      let lastSer = series[series.length - 1];
+      lastSer.label = {
+        show: stackScenes.length <= 24,   // 场景过多时标签会糊成一片 ⇒ 自动隐藏, 靠 tooltip 看
+        position: 'top', color: '#e4e4e7', fontSize: 9, fontWeight: 600,
+        formatter: function (p) {
+          let t = totals[p.dataIndex] || 0;
+          return t >= 10000 ? (t / 1000).toFixed(1) + 's' : t.toFixed(0);
+        }
+      };
+      // 供 tooltip / 导出复用
+      stackScenes._totals = totals;
+    } else if (compareParam || hasPf) {
+      flatCurves.forEach(function (fc) {
+        series.push({
+          name: fc.name, type: 'line', smooth: true,
+          data: fc.recs.map(rec => +metricOf(rec).toFixed(1)),
+          lineStyle: { color: palette[fc.ci % palette.length], width: 2 },
+          itemStyle: { color: palette[fc.ci % palette.length] },
+          symbol: hasPf ? shapeSymbolOf(fc.pi, shapeList[fc.pi]) : 'circle',
+          symbolSize: hasPf ? 7 : 6
+        });
+      });
+    } else {
       series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(rec => +metricOf(rec).toFixed(1)),
         lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
         itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
@@ -5761,12 +6053,43 @@ function runSensitivity() {
       if (sym === 'pin') return '<svg '+W+'><path d="M5 1C3 1 1.6 2.4 1.6 4.3C1.6 6.3 5 9 5 9S8.4 6.3 8.4 4.3C8.4 2.4 7 1 5 1Z" fill="'+color+'"/></svg>';
       return '<svg '+W+'><circle cx="5" cy="5" r="4" fill="'+color+'"/></svg>';
     }
+    // 堆叠柱的 x 轴用「场景」标签, 且轴名要说明它是组合维度而非单一参数
+    let stackLabels = sceneLabels;
+    let xData = stackMode ? stackLabels : labels;
+    let xName = stackMode
+      ? (flatCurves.length > 1 ? paramLabel + ' × 场景' : paramLabel)
+      : paramLabel;
+    // 场景数多时标签会互相压盖 ⇒ 旋转 + 开区域缩放。阈值按经验取: >6 转 20°, >10 转 30°
+    let nSc = stackMode ? stackLabels.length : labels.length;
+    let xRotate = stackMode ? (nSc > 10 ? 30 : (nSc > 6 ? 20 : 0)) : 0;
+    let needZoom = stackMode && nSc > 16;
     let opt = {
       tooltip: {
         trigger: 'axis',
+        // 堆叠柱模式下 axisPointer 用阴影更贴合柱状图(默认的十字线在柱图上不易对位)
+        axisPointer: stackMode ? { type: 'shadow' } : undefined,
         formatter: function(params) {
           if (!params || !params.length) return '';
           let html = '<div style="font-weight:600;margin-bottom:4px">' + (params[0].axisValueLabel || params[0].name) + '</div>';
+          if (stackMode) {
+            // 堆叠柱: 显示 分量 / 绝对值 / 占比, 末行给总计 —— 占比是"时间花在哪"的核心读数。
+            // 分母用当前柱的 Σ(而非全局最大值), 因此每根柱的百分比各自归一到 100%。
+            let tot = params.reduce(function (a, p) { return a + (+p.value || 0); }, 0);
+            params.forEach(function(p) {
+              let v = +p.value || 0;
+              let pct = tot > 0 ? (100 * v / tot) : 0;
+              html += '<div style="display:flex;align-items:center;line-height:18px">'
+                + '<span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:'
+                + p.color + ';margin-right:6px;flex:none"></span>'
+                + '<span style="color:#9ca0b0;margin-right:10px">' + p.seriesName + '</span>'
+                + '<span style="margin-left:auto"><b style="color:#e4e4e7">' + v.toFixed(1) + '</b>'
+                + '<span style="color:#9ca0b0"> ms · ' + pct.toFixed(1) + '%</span></span></div>';
+            });
+            html += '<div style="border-top:1px solid #2e3347;margin-top:4px;padding-top:4px;'
+              + 'display:flex;line-height:18px"><span style="color:#9ca0b0;margin-right:10px">TTFT 合计</span>'
+              + '<span style="margin-left:auto;font-weight:600;color:#e4e4e7">' + tot.toFixed(1) + ' ms</span></div>';
+            return html;
+          }
           params.forEach(function(p) {
             let sym = (series[p.seriesIndex] && series[p.seriesIndex].symbol) || 'circle';
             html += '<div style="display:flex;align-items:center;line-height:18px">' + symbolMarker(sym, p.color) + '<span style="color:#9ca0b0;margin-right:8px">' + p.seriesName + '</span><span style="margin-left:auto;color:#9ca0b0">' + p.value + '</span></div>';
@@ -5774,15 +6097,40 @@ function runSensitivity() {
           return html;
         }
       },
-      legend: (compareParam || hasPf) ? { top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } } : undefined,
-      grid: { left: 70, right: 20, top: (compareParam || hasPf) ? 36 : 20, bottom: 40 },
-      xAxis: { type: 'category', data: labels, name: paramLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
-      yAxis: { type: 'value', name: metricLabel, nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
+      // 堆叠柱恒有图例(6 个分量必须能对上颜色, 且可点击隐藏某分量单看其余)
+      legend: (stackMode || compareParam || hasPf) ? { top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } } : undefined,
+      grid: { left: 70, right: 20, top: (stackMode || compareParam || hasPf) ? 36 : 20,
+        // 旋转标签/缩放条需要更多底部空间, 否则场景名被裁掉
+        bottom: needZoom ? 76 : (xRotate ? 62 : 40) },
+      xAxis: { type: 'category', data: xData, name: xName, nameTextStyle: { color: '#9ca0b0' },
+        axisLabel: { color: '#9ca0b0', rotate: xRotate, interval: 0,
+          // 场景名可能很长("400GB/s · 32k tok · race"), 超长截断避免挤爆画布
+          formatter: function (v) { return (stackMode && String(v).length > 22) ? String(v).slice(0, 21) + '…' : v; } } },
+      yAxis: { type: 'value', name: stackMode ? 'TTFT 构成(ms)' : metricLabel,
+        nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
+      dataZoom: needZoom ? [{ type: 'slider', bottom: 8, height: 18, borderColor: '#2e3347',
+        textStyle: { color: '#9ca0b0', fontSize: 9 }, fillerColor: 'rgba(108,99,255,.18)',
+        // 默认只展示前 16 根柱, 其余拖动查看 —— 一屏 40 根柱等于什么都看不清
+        startValue: 0, endValue: 15 }] : undefined,
       series: series
     };
     ch.setOption(opt);
     let desc;
-    if (compareParam && hasPf) desc = '四维敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> × 形状「'+shapeLabel+'」('+shapeList.map(shapeLabelOf).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>（共同随机数法，固定其他参数与种子）';
+    if (stackMode) {
+      // 堆叠柱的方法说明与折线完全不同: 要讲清"柱高=TTFT(加性恒等)"和"分量互不重叠"
+      let scDesc = flatCurves.length > 1
+        ? '横轴为「<code>' + paramLabel + '</code> × '
+          + [compareParam ? SENS_PARAM_LABEL[compareParam] : null, hasPf ? shapeLabel : null]
+            .filter(Boolean).join(' × ') + '」拉平后的 <b>' + nSc + '</b> 个场景'
+        : '横轴为 <code>' + paramLabel + '</code> 的 <b>' + nSc + '</b> 个档位';
+      desc = 'TTFT 构成堆叠柱：' + scDesc + '，每根柱子自下而上依次堆叠 '
+        + TTFT_STACK_PARTS.map(p => p.label).join(' → ')
+        + '。<b>柱高 = TTFT</b>（六分量为互不重叠的墙钟分段，已验证 Σ 分量恒等于平均 TTFT）。'
+        + '<br>读图：<code>排队等待</code>占主体 ⇒ 系统过载（降 qps / 加实例）；'
+        + '<code>算力竞争等待</code>占主体 ⇒ 收紧 <code>Prefill并发准入</code> 而非加卡；'
+        + '<code>纯计算</code>占主体 ⇒ 真缺算力；<code>L3拉取等待</code>占主体 ⇒ 提带宽/换预取策略。';
+    }
+    else if (compareParam && hasPf) desc = '四维敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code> × 形状「'+shapeLabel+'」('+shapeList.map(shapeLabelOf).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>（共同随机数法，固定其他参数与种子）';
     else if (compareParam) desc = '三参数敏感性：横轴 <code>'+paramLabel+'</code> × 颜色 <code>'+SENS_PARAM_LABEL[compareParam]+'</code>（'+compareVals.map(v=>sensParamUnit(compareParam,v)).join(', ')+'），纵轴 <code>'+metricLabel+'</code>';
     else if (hasPf) desc = '双维敏感性：横轴 <code>'+paramLabel+'</code> × 形状「'+shapeLabel+'」('+shapeList.map(shapeLabelOf).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>';
     else desc = '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>';
@@ -5802,6 +6150,17 @@ function runSensitivity() {
       // ⚠️ 与 series 同序; 单曲线时长度为 1。位图导出不用它。
       curveRecs: curveRecs,
       isMulti: !!(compareParam || hasPf),
+      // ---- 堆叠柱信息(2026-08-26) ----
+      // stackMode: 当前是否堆叠柱。导出 HTML 需据此决定初始渲染类型, 且切换指标时
+      //   要能在「堆叠柱 ↔ 折线」之间来回变(图表 type/stack/x轴 都要换) ⇒ 必须存下场景标签。
+      // stackLabels: 拉平后的场景名(与堆叠柱 x 轴一一对应); 折线模式下的 x 轴仍是 labels。
+      //   两套 x 轴标签都要带上, 否则导出页从堆叠柱切到折线时横轴会错位。
+      stackMode: stackMode,
+      stackLabels: stackLabels,
+      // lineTpl: 折线样式模板(恒定生成), 使导出页从堆叠柱切回折线时能还原原配色/符号/图例
+      lineTpl: lineTpl,
+      // 堆叠分量定义快照: 导出页据此重建 6 个 bar series(颜色与顺序必须与平台一致)
+      stackParts: TTFT_STACK_PARTS.map(function (p) { return { key: p.key, label: p.label, color: p.color }; }),
       descHtml: desc, strategyName: baseStrategy.name,
       dsl: baseStrategy.dsl || '', seed: gi('pSeed'),
       // 全参数快照: 导出的 HTML 附带它, 别人拿到图能复现同一次扫描
