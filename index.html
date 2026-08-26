@@ -487,7 +487,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <span style="font-size:.73rem;color:var(--text-dim)">导出当前图表：</span>
       <button class="btn btn-sm" id="btnSensExportPng" disabled onclick="exportSensImage('png')" title="PNG 无损位图, 2× 像素比(高清, 贴进文档/PPT 缩放后不发虚)。背景为深色以匹配平台配色。">🖼 PNG</button>
       <button class="btn btn-sm" id="btnSensExportJpg" disabled onclick="exportSensImage('jpeg')" title="JPG 有损压缩, 体积约为 PNG 的 1/3, 适合邮件/IM 分享。&#10;注: JPEG 无透明通道, 已显式填充深色背景(否则透明区会压成纯黑)。">🖼 JPG</button>
-      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★ 可在页内**切换纵轴指标**(20 项全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;附带: ①数据表(随指标同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③全参数快照(可粘回本平台「导入参数」复现同一次扫描)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
+      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★ 可在页内**切换纵轴指标**(全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;★ 可**按维度筛选**: 曲线/柱子太多时, 固定某维度(如 GPU 只看 H20)单独研究另一维度的影响。&#10;附带: ①数据表(随指标与筛选同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③全参数快照(可粘回本平台「导入参数」复现同一次扫描)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
       <span id="sensExportNote" style="font-size:.72rem;color:var(--accent2)"></span>
     </div>
     <div class="formula-box" id="formulaSensitivity"></div>
@@ -5463,6 +5463,18 @@ function buildSensHtml() {
   L.push('.chip{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:.71rem;cursor:pointer}');
   L.push('.chip:hover{border-color:var(--accent);color:var(--text)}');
   L.push('.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}');
+  // 维度筛选区: 每个维度一行(标签 + 档位 chip 组 + 全选/反选)
+  L.push('.fbar{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}');
+  L.push('.frow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px}');
+  L.push('.frow>b{font-size:.73rem;color:var(--text);min-width:78px;font-weight:600}');
+  // 档位 chip 用方角以区别于上方圆角的「指标」chip —— 两组 chip 语义不同, 视觉需可分辨
+  L.push('.fc{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:5px;padding:2px 9px;font-size:.71rem;cursor:pointer;font-variant-numeric:tabular-nums}');
+  L.push('.fc:hover{border-color:var(--accent2);color:var(--text)}');
+  L.push('.fc.on{background:rgba(52,211,153,.16);border-color:var(--accent2);color:var(--accent2);font-weight:600}');
+  L.push('.fmini{background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:5px;padding:2px 7px;font-size:.68rem;cursor:pointer}');
+  L.push('.fmini:hover{border-color:var(--accent);color:var(--text)}');
+  L.push('.fnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}');
+  L.push('.fwarn{color:#f59e0b}');
   L.push('</style></head><body><div class="wrap">');
   L.push('<h1>参数<span>敏感性</span>分析</h1>');
   L.push('<p class="sub">' + dimsHtml + '<br>基准策略 <b>' + esc(st.strategyName)
@@ -5493,6 +5505,38 @@ function buildSensHtml() {
       + '共 ' + metricKeys.length + ' 个指标 · 同一批仿真结果，切换零重算</span>');
     L.push('</div>');
   }
+  // ===== 维度筛选区(2026-08-26) =====
+  // 只在"确实有多个档位可筛"时才出现 —— 单档位维度给不出任何筛选价值, 只是噪音。
+  // 每行一个维度: 维度名 + 档位 chip 组(多选) + 全选/反选。
+  // 典型用法: 横轴 L3带宽 × 形状 GPU硬件 的图里, 把 GPU 只勾 H20 ⇒ 单独研究带宽影响。
+  let SD = st.sensDims || null;
+  let filterDims = [];
+  if (SD) {
+    // x 维度也可筛(缩小横轴范围, 例如只看 50~200GB/s 段)
+    if (SD.x && SD.x.vals.length > 1) filterDims.push({ id: 'x', d: SD.x });
+    if (SD.cmp && SD.cmp.vals.length > 1) filterDims.push({ id: 'cmp', d: SD.cmp });
+    if (SD.shape && SD.shape.vals.length > 1) filterDims.push({ id: 'shape', d: SD.shape });
+  }
+  // 至少要有一个"曲线维"(cmp/shape)才值得给筛选区 —— 只有 x 一维时图上本就只有 1 条线/1 组柱,
+  // 筛横轴不解决"线太多难区分"的问题, 反而多一排控件。
+  let hasCurveDim = filterDims.some(function (f) { return f.id !== 'x'; });
+  let hasFilter = hasCurveDim;
+  if (hasFilter) {
+    L.push('<div class="fbar" id="fbar">');
+    filterDims.forEach(function (f) {
+      L.push('<div class="frow" data-dim="' + esc(f.id) + '">');
+      L.push('<b>' + esc(f.d.label) + (f.id === 'x' ? '（横轴）' : '') + '</b>');
+      L.push(f.d.texts.map(function (t, i) {
+        return '<button class="fc on" data-dim="' + esc(f.id) + '" data-i="' + i + '">'
+          + esc(t) + '</button>';
+      }).join(''));
+      L.push('<button class="fmini" data-act="all" data-dim="' + esc(f.id) + '">全选</button>');
+      L.push('<button class="fmini" data-act="inv" data-dim="' + esc(f.id) + '">反选</button>');
+      L.push('</div>');
+    });
+    L.push('<div class="frow"><b></b><span class="fnote" id="fNote"></span></div>');
+    L.push('</div>');
+  }
   L.push('<div id="chart"></div></div>');
   L.push('<div class="card"><div class="box"><b>📐 敏感度分析方法</b><br>' + st.descHtml
     + '<br>共同随机数法：扫描时固定其他全部参数与随机种子，因此曲线差异只来自横轴（与颜色/形状）维度本身。</div></div>');
@@ -5504,7 +5548,8 @@ function buildSensHtml() {
     L.push('<pre>' + esc(st.paramsJson) + '</pre></div>');
   }
   L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放'
-    + (hasSwitch ? ' / 指标切换' : '') + '）需联网加载 echarts；离线时数据表仍完整可用</p>');
+    + (hasSwitch ? ' / 指标切换' : '') + (hasFilter ? ' / 维度筛选' : '')
+    + '）需联网加载 echarts；离线时数据表仍完整可用</p>');
   L.push('</div>');
   L.push('<script>');
   L.push('var OPT = ' + safeJson(opt) + ';');
@@ -5537,6 +5582,19 @@ function buildSensHtml() {
   L.push('var LINE_X_NAME = ' + safeJson(st.paramLabel) + ';');
   L.push('var STACK_X_NAME = ' + safeJson((st.lineTpl && st.lineTpl.length > 1)
     ? (st.paramLabel + ' × 场景') : st.paramLabel) + ';');
+  // ---- 维度筛选(2026-08-26) ----
+  // SENS_DIMS: {x, cmp, shape} 三维的档位值/标签; CURVE_COORDS[i] = 第 i 条曲线的 (ci,pi) 坐标
+  // SEL: 当前勾选状态(下标数组), 初始全选。筛选**只做减法**, 不重算仿真。
+  L.push('var SENS_DIMS = ' + safeJson(SD || {}) + ';');
+  L.push('var CURVE_COORDS = ' + safeJson(st.curveCoords || []) + ';');
+  L.push('var HAS_FILTER = ' + (hasFilter ? 'true' : 'false') + ';');
+  L.push('var SEL = {x:null,cmp:null,shape:null};');
+  L.push('(function(){');
+  L.push('  ["x","cmp","shape"].forEach(function(k){');
+  L.push('    var d = SENS_DIMS[k];');
+  L.push('    SEL[k] = d ? d.vals.map(function(_,i){ return i; }) : null;');
+  L.push('  });');
+  L.push('})();');
   // 重建 tooltip formatter: 与平台内实现等价(图例小图标随 series.symbol 变化)
   L.push('function symbolMarker(sym,color){');
   L.push('  var W=\'width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"\';');
@@ -5592,14 +5650,63 @@ function buildSensHtml() {
   // 折线表(行=档位, 列=曲线)与堆叠柱表(行=场景, 列=6分量+合计)行列数都不同,
   // 就地改数值只能应付前者。重建 thead+tbody 才能两种结构互切。
   L.push('function esc2(t){ return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }');
+  // ===== 筛后视图投影(2026-08-26) =====
+  // 筛选只做"减法": 不重算仿真, 只从已有数据里挑出勾选的曲线与横轴档位。
+  // 三个投影函数是所有绘图/建表的**唯一数据入口**, 保证图与表永远一致:
+  //   viewXIdx()    → 保留的横轴档位下标数组
+  //   viewCurves()  → 保留的曲线下标数组(按 CURVE_COORDS 的 ci/pi 是否在 SEL 里判定)
+  //   viewSceneIdx()→ 保留的堆叠柱场景下标数组(场景 = 曲线 × 档位, 两者都要过筛)
+  // ⚠️ 用**下标**判定而非解析曲线名: 名字里的 ' · ' 分隔符与档位标签可能撞车, 解析不可靠。
+  L.push('function inSel(dim, idx){');
+  L.push('  if(idx < 0) return true;');                    // 该维度不存在 ⇒ 恒通过
+  L.push('  var s = SEL[dim]; if(!s) return true;');
+  L.push('  return s.indexOf(idx) >= 0;');
+  L.push('}');
+  L.push('function viewXIdx(){');
+  // x 维度恒存在(横轴就是它) ⇒ 直接按下标查 SEL.x, 无需 inSel 的 -1 兜底
+  L.push('  var n = LINE_LABELS.length, out = [];');
+  L.push('  for(var i=0;i<n;i++) if(!SEL.x || SEL.x.indexOf(i)>=0) out.push(i);');
+  L.push('  return out;');
+  L.push('}');
+  L.push('function viewCurves(){');
+  L.push('  var out = [];');
+  L.push('  for(var i=0;i<LINE_TPL.length;i++){');
+  L.push('    var c = CURVE_COORDS[i] || {ci:-1,pi:-1};');
+  L.push('    if(inSel("cmp", c.ci) && inSel("shape", c.pi)) out.push(i);');
+  L.push('  }');
+  L.push('  return out;');
+  L.push('}');
+  // 场景下标 = 曲线序 × 档位序 的行主序展开(与平台侧 sceneLabels 生成规则一致)
+  L.push('function viewSceneIdx(){');
+  L.push('  var nPt = LINE_LABELS.length, keepC = viewCurves(), keepX = viewXIdx(), out = [];');
+  L.push('  for(var a=0;a<keepC.length;a++) for(var b=0;b<keepX.length;b++)');
+  L.push('    out.push(keepC[a]*nPt + keepX[b]);');
+  L.push('  return out;');
+  L.push('}');
+  // 筛选后若只剩 1 条曲线, 场景名里的"· 维度组合"后缀就成了每根柱重复的冗余 ⇒ 去掉,
+  // 让横轴回到干净的档位名(这正是"固定 GPU 单独看带宽"想要的效果)
+  L.push('function sceneLabelAt(i){');
+  L.push('  var lb = STACK_LABELS[i]||"";');
+  L.push('  if(viewCurves().length === 1){');
+  L.push('    var nPt = LINE_LABELS.length;');
+  L.push('    return LINE_LABELS[i % nPt] || lb;');
+  L.push('  }');
+  L.push('  return lb;');
+  L.push('}');
+  //
+  // renderTable(2026-08-26 改造): 从"就地改数值"升级为"整表重建" ——
+  // 折线表(行=档位, 列=曲线)与堆叠柱表(行=场景, 列=6分量+合计)行列数都不同,
+  // 就地改数值只能应付前者。重建 thead+tbody 才能两种结构互切。
+  // 再次改造: 行列都取**筛后视图**, 表与图始终一致(否则筛完图变了表没变, 更误导)。
   L.push('function renderTable(){');
   L.push('  var tbl = document.getElementById("tbl"); if(!tbl) return;');
   L.push('  var th = tbl.querySelector("thead"), tb = tbl.querySelector("tbody");');
   L.push('  if(!th||!tb) return;');
   L.push('  if(CUR_IS_STACK){');
+  L.push('    var sIdx = viewSceneIdx();');
   L.push('    th.innerHTML = "<tr><th>场景</th>" + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("") + "<th>TTFT合计</th></tr>";');
-  L.push('    tb.innerHTML = STACK_LABELS.map(function(lb,i){');
-  L.push('      return "<tr><td class=\\"k\\">"+esc2(lb)+"</td>"');
+  L.push('    tb.innerHTML = sIdx.map(function(i){');
+  L.push('      return "<tr><td class=\\"k\\">"+esc2(sceneLabelAt(i))+"</td>"');
   L.push('        + STACK_PARTS.map(function(p){ return "<td>"+esc2((STACK_DATA[p.key]||[])[i])+"</td>"; }).join("")');
   L.push('        + "<td><b>"+esc2(STACK_TOTALS[i])+"</b></td></tr>";');
   L.push('    }).join("");');
@@ -5608,36 +5715,46 @@ function buildSensHtml() {
   L.push('  var cols = METRIC_DATA[CUR_METRIC]; if(!cols) return;');
   // 折线表的表头 = 横轴名 + 各曲线名(单曲线时曲线名 = 当前指标名, 故需重建而非只改数值)
   L.push('  var lb = METRIC_LABEL[CUR_METRIC]||CUR_METRIC;');
+  L.push('  var keepC = viewCurves(), keepX = viewXIdx();');
   L.push('  th.innerHTML = "<tr><th>"+esc2(LINE_X_NAME)+"</th>"');
-  L.push('    + LINE_TPL.map(function(t){ return "<th>"+esc2(IS_MULTI ? t.name : lb)+"</th>"; }).join("") + "</tr>";');
-  L.push('  tb.innerHTML = LINE_LABELS.map(function(xl,i){');
-  L.push('    return "<tr><td class=\\"k\\">"+esc2(xl)+"</td>"');
-  L.push('      + cols.map(function(c){ return "<td>"+esc2(c[i]!=null?c[i]:"")+"</td>"; }).join("") + "</tr>";');
+  L.push('    + keepC.map(function(ci){ return "<th>"+esc2(IS_MULTI ? LINE_TPL[ci].name : lb)+"</th>"; }).join("") + "</tr>";');
+  L.push('  tb.innerHTML = keepX.map(function(xi){');
+  L.push('    return "<tr><td class=\\"k\\">"+esc2(LINE_LABELS[xi])+"</td>"');
+  L.push('      + keepC.map(function(ci){ var v=(cols[ci]||[])[xi]; return "<td>"+esc2(v!=null?v:"")+"</td>"; }).join("") + "</tr>";');
   L.push('  }).join("");');
   L.push('}');
   // buildStackSeries / buildLineSeries: 两种图形的 series 构造器(与平台侧逐字对应)
+  // 均已改为按筛后视图取数
   L.push('function buildStackSeries(){');
+  L.push('  var sIdx = viewSceneIdx();');
   L.push('  var ss = STACK_PARTS.map(function(p){');
+  L.push('    var src = STACK_DATA[p.key]||[];');
   L.push('    return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,');
   L.push('      itemStyle:{color:p.color}, emphasis:{focus:"series"},');
-  L.push('      data:(STACK_DATA[p.key]||[]).slice()};');
+  L.push('      data:sIdx.map(function(i){ return src[i]; })};');
   L.push('  });');
   // 总计标签只挂最后一个 series(堆叠柱 position:"top" 仅顶层可见), 与平台一致
-  L.push('  if(ss.length){ ss[ss.length-1].label = {show: STACK_LABELS.length<=24, position:"top",');
+  // ⚠️ formatter 的 dataIndex 是**筛后**下标 ⇒ 必须经 sIdx 映射回原始下标再取 TOTALS
+  L.push('  if(ss.length){ ss[ss.length-1].label = {show: sIdx.length<=24, position:"top",');
   L.push('    color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){');
-  L.push('      var t = STACK_TOTALS[p.dataIndex]||0;');
+  L.push('      var t = STACK_TOTALS[sIdx[p.dataIndex]]||0;');
   L.push('      return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }');
   L.push('  return ss;');
   L.push('}');
   L.push('function buildLineSeries(k){');
   L.push('  var cols = METRIC_DATA[k]||[], lb = METRIC_LABEL[k]||k;');
-  L.push('  return LINE_TPL.map(function(t,i){');
-  L.push('    var s = JSON.parse(JSON.stringify(t));');
+  L.push('  var keepX = viewXIdx();');
+  L.push('  return viewCurves().map(function(ci){');
+  L.push('    var s = JSON.parse(JSON.stringify(LINE_TPL[ci]));');
   L.push('    if(!IS_MULTI) s.name = lb;');
-  L.push('    s.data = (cols[i]||[]).slice();');
+  L.push('    var src = cols[ci]||[];');
+  L.push('    s.data = keepX.map(function(xi){ return src[xi]; });');
   L.push('    return s;');
   L.push('  });');
   L.push('}');
+  // 筛后 x 轴标签
+  L.push('function viewXLabels(){ return viewXIdx().map(function(i){ return LINE_LABELS[i]; }); }');
+  L.push('function viewSceneLabels(){ return viewSceneIdx().map(sceneLabelAt); }');
   L.push('function applyMetric(k){');
   // 堆叠柱与折线的数据源不同: 前者查 STACK_PARTS 是否可用, 后者查 METRIC_DATA
   L.push('  var toStack = (k===STACK_KEY);');
@@ -5649,32 +5766,20 @@ function buildSensHtml() {
   L.push('    if(toStack !== wasStack){');
   // ★ 类型切换: series 数量/类型/x轴长度全变 ⇒ 必须 notMerge 全量重建。
   //   这是唯一允许 notMerge 的路径(会重置图例开关/缩放, 但结构已变, 保留旧状态反而错乱)。
-  L.push('      var nSc = toStack ? STACK_LABELS.length : LINE_LABELS.length;');
-  L.push('      var rot = toStack ? (nSc>10?30:(nSc>6?20:0)) : 0;');
-  L.push('      var zoom = toStack && nSc>16;');
-  L.push('      OPT.series = toStack ? buildStackSeries() : buildLineSeries(k);');
-  L.push('      OPT.xAxis.data = (toStack ? STACK_LABELS : LINE_LABELS).slice();');
-  L.push('      OPT.xAxis.name = toStack ? STACK_X_NAME : LINE_X_NAME;');
-  L.push('      OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};');
-  L.push('      OPT.xAxis.axisLabel.rotate = rot; OPT.xAxis.axisLabel.interval = 0;');
-  L.push('      OPT.xAxis.axisLabel.color = "#9ca0b0";');
-  L.push('      OPT.xAxis.axisLabel.formatter = function(v){ return (CUR_IS_STACK && String(v).length>22) ? String(v).slice(0,21)+"…" : v; };');
-  L.push('      OPT.yAxis.name = toStack ? "TTFT 构成(ms)" : lb;');
-  L.push('      OPT.legend = (toStack||IS_MULTI) ? {top:0,textStyle:{color:"#9ca0b0",fontSize:10}} : undefined;');
-  L.push('      OPT.grid = {left:70,right:20,top:(toStack||IS_MULTI)?36:20,bottom: zoom?76:(rot?62:40)};');
-  L.push('      OPT.tooltip.axisPointer = toStack ? {type:"shadow"} : undefined;');
-  L.push('      OPT.dataZoom = zoom ? [{type:"slider",bottom:8,height:18,borderColor:"#2e3347",');
-  L.push('        textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;');
-  L.push('      ch.setOption(OPT, true);');
+  //   2026-08-26: 具体重建逻辑抽到 rebuildAll(), 与「维度筛选」共用同一份 —— 否则两处
+  //   各写一遍 rotate/zoom/grid 规则, 改一处忘另一处必然漂移。
+  L.push('      rebuildAll(k);');
   L.push('    } else if(toStack){');
   // 堆叠柱内部无需重绘(数据不随 metric 变) —— 但仍要走后续 UI 同步
   L.push('    } else {');
   // 同类型(折线→折线): 走增量补丁, 保留用户的图例开关/缩放
-  L.push('      var cols = METRIC_DATA[k];');
-  L.push('      var ns = OPT.series.map(function(s,i){');
-  L.push('        var patch = {data: (cols[i]||[]).slice()};');
-  L.push('        if(!IS_MULTI){ patch.name = lb; s.name = lb; }');
-  L.push('        s.data = patch.data.slice();');
+  // ⚠️ 补丁必须按**筛后视图**取数, 否则筛选后切指标会把被筛掉的点又带回来
+  L.push('      var cols = METRIC_DATA[k], keepX = viewXIdx(), keepC = viewCurves();');
+  L.push('      var ns = keepC.map(function(ci,i){');
+  L.push('        var src = cols[ci]||[];');
+  L.push('        var patch = {data: keepX.map(function(xi){ return src[xi]; })};');
+  L.push('        if(!IS_MULTI){ patch.name = lb; if(OPT.series[i]) OPT.series[i].name = lb; }');
+  L.push('        if(OPT.series[i]) OPT.series[i].data = patch.data.slice();');
   L.push('        return patch;');
   L.push('      });');
   L.push('      OPT.yAxis.name = lb;');
@@ -5688,7 +5793,98 @@ function buildSensHtml() {
   L.push('  var chips = document.querySelectorAll(".chip[data-m]");');
   L.push('  for(var i=0;i<chips.length;i++){ chips[i].className = "chip" + (chips[i].getAttribute("data-m")===k ? " on" : ""); }');
   L.push('  renderTable();');
+  // 切指标(尤其折线↔堆叠柱)后筛选提示的口径要跟着变: 折线报"曲线 n/N", 堆叠柱报"柱 n/N"
+  L.push('  if(HAS_FILTER) updateFNote();');
   L.push('}');
+  // ===== rebuildAll: 按当前 CUR_IS_STACK + 筛选状态**全量重建** option =====
+  // 被两处调用: ①applyMetric 的类型切换分支 ②维度筛选变更。
+  // 两者都改变 series 数量/x轴长度 ⇒ 都必须 notMerge, 逻辑完全一致, 故合并成一处。
+  L.push('function rebuildAll(k){');
+  L.push('  if(!ch) return;');
+  L.push('  k = k || CUR_METRIC;');
+  L.push('  var toStack = CUR_IS_STACK, lb = METRIC_LABEL[k]||k;');
+  L.push('  var xs = toStack ? viewSceneLabels() : viewXLabels();');
+  L.push('  var nSc = xs.length;');
+  L.push('  var rot = toStack ? (nSc>10?30:(nSc>6?20:0)) : 0;');
+  L.push('  var zoom = toStack && nSc>16;');
+  L.push('  OPT.series = toStack ? buildStackSeries() : buildLineSeries(k);');
+  L.push('  OPT.xAxis.data = xs;');
+  // 筛到只剩 1 条曲线时, 堆叠柱横轴退回"纯档位轴" ⇒ 轴名也不该再写"× 场景"
+  L.push('  OPT.xAxis.name = toStack ? ((viewCurves().length>1) ? STACK_X_NAME : LINE_X_NAME) : LINE_X_NAME;');
+  L.push('  OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};');
+  L.push('  OPT.xAxis.axisLabel.rotate = rot; OPT.xAxis.axisLabel.interval = 0;');
+  L.push('  OPT.xAxis.axisLabel.color = "#9ca0b0";');
+  L.push('  OPT.xAxis.axisLabel.formatter = function(v){ return (CUR_IS_STACK && String(v).length>22) ? String(v).slice(0,21)+"…" : v; };');
+  L.push('  OPT.yAxis.name = toStack ? "TTFT 构成(ms)" : lb;');
+  // 折线筛到只剩 1 条时图例已无信息量, 但保留也无害(用户可能还想切回) ⇒ 与初始规则一致
+  L.push('  OPT.legend = (toStack||IS_MULTI) ? {top:0,textStyle:{color:"#9ca0b0",fontSize:10}} : undefined;');
+  L.push('  OPT.grid = {left:70,right:20,top:(toStack||IS_MULTI)?36:20,bottom: zoom?76:(rot?62:40)};');
+  L.push('  OPT.tooltip.axisPointer = toStack ? {type:"shadow"} : undefined;');
+  L.push('  OPT.dataZoom = zoom ? [{type:"slider",bottom:8,height:18,borderColor:"#2e3347",');
+  L.push('    textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;');
+  L.push('  ch.setOption(OPT, true);');
+  L.push('}');
+  // ===== 维度筛选交互 =====
+  L.push('function fCount(){ return {c: viewCurves().length, x: viewXIdx().length, s: viewSceneIdx().length}; }');
+  // updateFNote: 提示文案的唯一生成处 —— 被 applyFilter 与 applyMetric 共用。
+  // 口径随当前图形而变: 折线报"曲线 n/N", 堆叠柱报"柱 n/N"(柱数 = 曲线数 × 档位数)。
+  L.push('function updateFNote(){');
+  L.push('  var note = document.getElementById("fNote"); if(!note) return;');
+  L.push('  var n = fCount(), tot = LINE_TPL.length, totX = LINE_LABELS.length;');
+  L.push('  note.className = "fnote";');
+  L.push('  var parts = [];');
+  L.push('  if(CUR_IS_STACK) parts.push("柱 " + n.s + "/" + (tot*totX));');
+  L.push('  else parts.push("曲线 " + n.c + "/" + tot);');
+  L.push('  parts.push("横轴档位 " + n.x + "/" + totX);');
+  L.push('  var full = (n.c===tot && n.x===totX);');
+  L.push('  note.textContent = "显示 " + parts.join(" · ") + (full ? "（全部）" : "（已筛选）");');
+  L.push('}');
+  L.push('function applyFilter(){');
+  L.push('  var n = fCount();');
+  // 全不选(某维度勾空)时不重绘 —— 空图没有意义, 且会让人以为数据丢了。给出提示并保持原图。
+  L.push('  if(n.c === 0 || n.x === 0){');
+  L.push('    var w = document.getElementById("fNote");');
+  L.push('    if(w){ w.className = "fnote fwarn"; w.textContent = "⚠ 每个维度至少保留 1 个档位（当前选择为空，图表未变）"; }');
+  L.push('    return;');
+  L.push('  }');
+  L.push('  rebuildAll(CUR_METRIC);');
+  L.push('  renderTable();');
+  L.push('  updateFNote();');
+  L.push('}');
+  L.push('(function(){');
+  L.push('  if(!HAS_FILTER) return;');
+  L.push('  var bar = document.getElementById("fbar"); if(!bar) return;');
+  // 档位 chip: 点击切换该档位的勾选状态
+  L.push('  var fcs = document.querySelectorAll(".fc[data-dim]");');
+  L.push('  for(var i=0;i<fcs.length;i++){ (function(el){');
+  L.push('    el.addEventListener("click", function(){');
+  L.push('      var dim = el.getAttribute("data-dim"), idx = parseInt(el.getAttribute("data-i"),10);');
+  L.push('      var s = SEL[dim]; if(!s) return;');
+  L.push('      var at = s.indexOf(idx);');
+  L.push('      if(at>=0) s.splice(at,1); else { s.push(idx); s.sort(function(a,b){return a-b;}); }');
+  L.push('      el.className = "fc" + (s.indexOf(idx)>=0 ? " on" : "");');
+  L.push('      applyFilter();');
+  L.push('    });');
+  L.push('  })(fcs[i]); }');
+  // 全选 / 反选
+  L.push('  var mn = document.querySelectorAll(".fmini[data-act]");');
+  L.push('  for(var j=0;j<mn.length;j++){ (function(el){');
+  L.push('    el.addEventListener("click", function(){');
+  L.push('      var dim = el.getAttribute("data-dim"), act = el.getAttribute("data-act");');
+  L.push('      var d = SENS_DIMS[dim]; if(!d) return;');
+  L.push('      if(act==="all") SEL[dim] = d.vals.map(function(_,i){ return i; });');
+  L.push('      else { var old = SEL[dim]||[]; SEL[dim] = d.vals.map(function(_,i){ return i; }).filter(function(i){ return old.indexOf(i)<0; }); }');
+  L.push('      var cs = document.querySelectorAll(\'.fc[data-dim="\'+dim+\'"]\');');
+  L.push('      for(var q=0;q<cs.length;q++){');
+  L.push('        var ii = parseInt(cs[q].getAttribute("data-i"),10);');
+  L.push('        cs[q].className = "fc" + (SEL[dim].indexOf(ii)>=0 ? " on" : "");');
+  L.push('      }');
+  L.push('      applyFilter();');
+  L.push('    });');
+  L.push('  })(mn[j]); }');
+  // 初始提示文案(显示"全部")
+  L.push('  updateFNote();');
+  L.push('})();');
   L.push('(function(){');
   L.push('  var sel = document.getElementById("mSel");');
   L.push('  if(sel) sel.addEventListener("change", function(){ applyMetric(sel.value); });');
@@ -6085,6 +6281,37 @@ function runSensitivity() {
       });
     });
 
+    // ===== 维度结构(2026-08-26): 供导出页做「固定某维度、单独看另一维度」的筛选 =====
+    // 动机: 4 档 × 3 长度 × 3 策略 = 36 根柱/12 条线挤一张图, 根本没法比较。
+    // 导出页需要按**维度**筛选(如"只看 H20"), 而它此前只有曲线名字符串, 无维度坐标 ⇒
+    // 这里把三个维度的档位列表 + 每条曲线的维度坐标一并存进快照。
+    //
+    // 三个维度的角色(与绘图的视觉通道对应):
+    //   x     — 扫描参数(横轴), 档位 = values/labels。筛它 = 缩小横轴范围
+    //   cmp   — 对比参数(折线的颜色), 档位 = compareVals
+    //   shape — 形状维(预取策略 / GPU硬件), 档位 = shapeList
+    // ⚠️ 每条曲线的 (ci, pi) 就是它在 (cmp, shape) 上的坐标 —— 筛选时靠这两个下标判定去留,
+    //    不靠解析曲线名字符串(名字里含 '·' 分隔符, 而档位标签本身也可能含 '·', 解析不可靠)。
+    let sensDims = {
+      x: {
+        key: param, label: paramLabel,
+        // 档位原始值与显示标签一一对应; gpu_preset 维度的值是字符串 key
+        vals: values.slice(), texts: labels.slice()
+      },
+      cmp: compareParam ? {
+        key: compareParam, label: SENS_PARAM_LABEL[compareParam],
+        vals: compareVals.slice(), texts: compareVals.map(v => sensParamUnit(compareParam, v))
+      } : null,
+      shape: hasPf ? {
+        key: shapeDim, label: shapeLabel,
+        vals: shapeList.slice(), texts: shapeList.map(shapeLabelOf)
+      } : null
+    };
+    // 每条曲线的维度坐标(与 curveRecs / lineTpl 同序)
+    let curveCoords = flatCurves.map(function (fc) {
+      return { ci: sensDims.cmp ? fc.ci : -1, pi: sensDims.shape ? fc.pi : -1 };
+    });
+
     // ===== 分支 A: TTFT 构成堆叠柱(2026-08-26) =====
     // 与折线的根本差异: 折线用「颜色」表达维度组合, 而堆叠柱的颜色通道必须让给 6 个分量。
     // ⇒ 把「横轴档位 × 维度组合」**拉平成 x 轴上的场景**, 每根柱子 = 一个具体场景。
@@ -6263,6 +6490,11 @@ function runSensitivity() {
       stackLabels: stackLabels,
       // lineTpl: 折线样式模板(恒定生成), 使导出页从堆叠柱切回折线时能还原原配色/符号/图例
       lineTpl: lineTpl,
+      // ---- 维度筛选(2026-08-26) ----
+      // sensDims: 三个维度(x/cmp/shape)各自的档位值与显示标签
+      // curveCoords: 每条曲线在 (cmp, shape) 上的坐标(与 curveRecs 同序), 筛选按下标判定
+      sensDims: sensDims,
+      curveCoords: curveCoords,
       // 堆叠分量定义快照: 导出页据此重建 6 个 bar series(颜色与顺序必须与平台一致)
       stackParts: TTFT_STACK_PARTS.map(function (p) { return { key: p.key, label: p.label, color: p.color }; }),
       descHtml: desc, strategyName: baseStrategy.name,
