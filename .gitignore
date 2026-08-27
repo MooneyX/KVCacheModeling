@@ -47,6 +47,23 @@ _baseline_*.json
 _tmp_*
 _probe_*.json
 _sweep_*.json
+# 回归驱动/结果与临时产物(2026-08-27): 全量回归的输出与中间快照, 可随时重建
+_run_all_verify.py
+_pick_bad.py
+_gen_demo_export.js
+_demo_*.html
+_base_*.html
+_regr_*.json
+_regr_*.txt
+_vlist.txt
+_vres.txt
+_vb*.txt
+_bad.txt
+_mynew.html
+_o_*.txt
+_o2_*.txt
+_ob_*.txt
+_o[0-9].txt
 dbg*.js
 dbg*.log
 .workbuddy/backup/

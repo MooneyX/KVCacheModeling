@@ -453,15 +453,21 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div style="flex:2"><label style="text-transform:none;letter-spacing:0">③ 形状维度</label>
         <div style="display:flex;align-items:center;gap:10px;height:29px;flex-wrap:wrap">
-          <select id="sShapeDim" style="width:104px" title="形状维度绑定对象。&#10;预取策略: 勾选下方 3 个策略(默认, 与历史行为一致)&#10;GPU硬件: 形状=不同加速卡, 档位在右侧填写&#10;⚠️ 形状与颜色不能绑同一参数, 冲突时形状自动降级">
-            <option value="prefetch">预取策略</option><option value="gpu_preset">GPU硬件</option>
+          <select id="sShapeDim" style="width:104px" title="形状维度绑定对象(2026-08-27 开放为任意参数)。&#10;预取策略: 勾选下方 3 个策略(默认, 与历史行为一致)&#10;其他任意参数: 形状=该参数的不同档位, 档位在右侧填写&#10;⚠️ 横轴/颜色/形状必须绑不同参数, 冲突时形状自动降级为预取策略">
+            <option value="prefetch">预取策略</option>
+            <option value="gpu_preset">GPU硬件</option>
+            <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
+            <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
+            <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
+            <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
+            <option value="concurrency">并发请求数</option>
           </select>
           <span id="sShapePfBox" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
             <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfWait" checked style="margin-right:4px">wait_complete</label>
             <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfBest" checked style="margin-right:4px">best_effort</label>
             <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfRace" checked style="margin-right:4px">race</label>
           </span>
-          <input id="sShapeVals" value="h20x8,b300x8" style="width:150px;display:none" placeholder="如 h20x8,b300x8" title="GPU 预设 key 逗号分隔。可选: h20x8 h100x8 a100x8 b200x8 b300x8 a950pr8 a950dt8 klxp800x8 klxp900x32">
+          <input id="sShapeVals" value="h20x8,b300x8" style="width:150px;display:none" placeholder="如 h20x8,b300x8" title="形状维度的档位列表。&#10;GPU硬件: 预设 key 逗号分隔(h20x8 h100x8 a100x8 b200x8 b300x8 a950pr8 a950dt8 klxp800x8 klxp900x32)&#10;数值参数: 逗号列表(如 2048,8192,32768)或「起,止,步长」&#10;留空则用该参数的默认档位">
         </div>
       </div>
       <div><label>④ 观察指标(纵轴)</label><select id="sSweepMetric">
@@ -487,9 +493,12 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <span style="font-size:.73rem;color:var(--text-dim)">导出当前图表：</span>
       <button class="btn btn-sm" id="btnSensExportPng" disabled onclick="exportSensImage('png')" title="PNG 无损位图, 2× 像素比(高清, 贴进文档/PPT 缩放后不发虚)。背景为深色以匹配平台配色。">🖼 PNG</button>
       <button class="btn btn-sm" id="btnSensExportJpg" disabled onclick="exportSensImage('jpeg')" title="JPG 有损压缩, 体积约为 PNG 的 1/3, 适合邮件/IM 分享。&#10;注: JPEG 无透明通道, 已显式填充深色背景(否则透明区会压成纯黑)。">🖼 JPG</button>
-      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★ 可在页内**切换纵轴指标**(全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;★ 可**按维度筛选**: 曲线/柱子太多时, 固定某维度(如 GPU 只看 H20)单独研究另一维度的影响。&#10;附带: ①数据表(随指标与筛选同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③参数配置(按模型&#47;硬件&#47;负载&#47;策略分组展示, 中文标签 + 可读值, 非默认值高亮; 可切回原始 JSON 粘回平台「导入参数」复现)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
+      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★★ 多次扫描一并导出: 下方勾选的**全部**扫描结果打包进同一个 HTML, 页内可切换批次。&#10;★★ 参数透视(2026-08-27): 数据以**角色无关点云**存储, 打开后可任意指定哪个参数当横轴/颜色/形状, 并勾选参数值筛选 —— 「颜色=命中率 形状=输入长度」与「颜色=输入长度 形状=命中率」本是同一批数据, 无需重跑即可互换。&#10;★ 可在页内**切换纵轴指标**(全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;附带: ①数据表(随指标与筛选同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③参数配置(按模型&#47;硬件&#47;负载&#47;策略分组展示, 中文标签 + 可读值, 非默认值高亮; 可切回原始 JSON 粘回平台「导入参数」复现)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
       <span id="sensExportNote" style="font-size:.72rem;color:var(--accent2)"></span>
     </div>
+    <!-- 扫描快照列表(2026-08-27): 平台同时只展示一次扫描, 但历次结果自动攒在这里,
+         勾选后可一并导出到同一个 HTML(页内切换批次 / 参数透视) -->
+    <div id="sensSnapList" style="margin-top:8px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px"></div>
     <div class="formula-box" id="formulaSensitivity"></div>
   </div>
 </div>
@@ -5439,8 +5448,19 @@ function exportSensImage(type) {
 
 // ---- 自包含可交互 HTML ----
 // 结构: 标题 + 方法说明 + 交互图(CDN echarts) + 数据表(可一键复制 TSV) + 参数快照(可回填本平台)
-function buildSensHtml() {
+//
+// ★★ 多次扫描同页 + 参数透视(2026-08-27) ★★
+// snapList(可选): 快照数组。传入时把**全部**扫描的角色无关点云一并烧进页面, 页内可
+//   ①切换批次 ②任意重新指定横轴/颜色/形状 ③勾选参数值筛选。
+// 设计取舍: 不重写原有渲染路径 —— 初始图/表/参数区仍由"当前快照"(st)按原逻辑生成,
+//   透视能力作为**纯增量层**叠加(PIVOT_PTS + 透视面板 + applyPivot)。
+//   理由: 原路径有 20+ 个投影函数与 5 个已上线的验证脚本, 重写必然引入回归; 而透视层
+//   只需要点云 + 一个新的 series 构造器, 与原路径共用 rebuildAll/renderTable 的下游。
+function buildSensHtml(snapList) {
   let st = sensExportState;
+  // 快照列表: 未传或只有 1 条时退化为原来的单快照页(行为逐位不变)
+  let snaps = (snapList && snapList.length) ? snapList : [st];
+  let multi = snaps.length > 1;
   // 深拷贝顺带丢掉函数字段(formatter) —— 生成页里重建, 见下方 FORMATTER
   let opt = JSON.parse(JSON.stringify(st.opt));
   let esc = function (t) {
@@ -5536,14 +5556,74 @@ function buildSensHtml() {
   // 维度摘要(纯文本, 不含 HTML 标签) —— descHtml 里有 <code>, 直接复用即可
   // 「纵轴」一项在切换指标时要跟着变 ⇒ 单独拆出来给个 id, 由页内 applyMetric() 改写,
   //  否则头部写着"纵轴：平均TTFT"而图上画的是吞吐, 收图的人会被误导。
+  // 形状维标签(2026-08-27 修): 原先写死 gpu_preset ? 'GPU硬件' : '预取策略' —— 形状维
+  // 已开放为任意参数, 那样会把「形状=输入长度」错标成「预取策略」。统一查 SENS_PARAM_LABEL。
+  let shapeDimLabel = function (sd) {
+    return (sd === 'prefetch') ? '预取策略' : (SENS_PARAM_LABEL[sd] || String(sd || ''));
+  };
   let dims = [];
   dims.push('横轴：' + st.paramLabel);
   if (st.compareParam) dims.push('颜色：' + SENS_PARAM_LABEL[st.compareParam]
     + '（' + st.compareVals.join(', ') + '）');
-  if (st.hasPf) dims.push('形状：' + (st.shapeDim === 'gpu_preset' ? 'GPU硬件' : '预取策略')
+  if (st.hasPf) dims.push('形状：' + shapeDimLabel(st.shapeDim)
     + '（' + st.shapeList.join(' / ') + '）');
   let dimsHtml = dims.map(esc).join(' ｜ ')
     + ' ｜ 纵轴：<span id="dimY">' + esc(st.metricLabel) + '</span>';
+
+  // ===== 角色无关点云的跨批次合并(2026-08-27) =====
+  // 用户洞察: 「颜色=命中率/形状=输入长度」与「颜色=输入长度/形状=命中率」两次扫描的数据
+  // **本就相同**。合并后同一参数组合只存一份 ⇒ 文件更小, 且透视时可自由重新分配角色。
+  // 指纹: 参数键排序后的 JSON —— 与平台侧点级缓存 key 同思路(键序无关)。
+  // 重复点取**首次出现**的记录(同参数组合同种子的仿真结果本应逐位相同; 若不同则说明有
+  // 未纳入 params 的隐藏差异, 此时保留先到者并计数, 由 dupCount 暴露给用户而非静默平均)。
+  let pivotPts = [], pivotSeen = {}, dupCount = 0;
+  let ptFp = function (ps) {
+    let ks = Object.keys(ps || {}).sort();
+    return ks.map(function (k) { return k + '=' + ps[k]; }).join('|');
+  };
+  snaps.forEach(function (sn, si) {
+    (sn.points || []).forEach(function (p) {
+      if (!p || !p.rec) return;
+      let fp = ptFp(p.params);
+      if (pivotSeen[fp] !== undefined) { dupCount++; return; }
+      pivotSeen[fp] = pivotPts.length;
+      // 只保留数值型指标(rec 里全是标量), 并记录来源批次供"批次聚焦"用
+      pivotPts.push({ p: p.params, r: p.rec, s: si });
+    });
+  });
+  // 参数索引: 每个参数在点云里出现过的**全部取值**(升序)。
+  // 只有取值 ≥2 个的参数才有"扫描维"资格(能当横轴/颜色/形状); 单值参数仅作展示与筛选。
+  let pivotParams = {};
+  pivotPts.forEach(function (pt) {
+    Object.keys(pt.p || {}).forEach(function (k) {
+      if (!pivotParams[k]) pivotParams[k] = {};
+      pivotParams[k][pt.p[k]] = true;
+    });
+  });
+  let pivotIndex = {};
+  Object.keys(pivotParams).forEach(function (k) {
+    let vals = Object.keys(pivotParams[k]);
+    // gpu_preset 是字符串维度, 其余按数值升序 —— 混排会让档位 chip 顺序错乱
+    if (k === 'gpu_preset') vals.sort();
+    else vals = vals.map(Number).filter(function (v) { return isFinite(v); }).sort(function (a, b) { return a - b; });
+    pivotIndex[k] = {
+      label: SENS_PARAM_LABEL[k] || k,
+      vals: vals,
+      texts: vals.map(function (v) { return sensParamUnit(k, v); })
+    };
+  });
+  // 透视只在"点云非空 且 至少有一个多取值参数"时有意义
+  let pivotDims = Object.keys(pivotIndex).filter(function (k) { return pivotIndex[k].vals.length > 1; });
+  let hasPivot = pivotPts.length > 0 && pivotDims.length > 0;
+  // 批次摘要(批次选择器 / 批次聚焦快捷用)
+  let snapMeta = snaps.map(function (sn) {
+    return {
+      title: (function () { try { return sensSnapTitle(sn); } catch (e) { return sn.paramLabel + ' → ' + sn.metricLabel; } })(),
+      x: sn.param, cmp: sn.compareParam || null, shape: (sn.hasPf ? sn.shapeDim : null),
+      metric: sn.metric, at: (sn.at ? sn.at.toLocaleString('zh-CN') : ''),
+      n: (sn.points || []).length
+    };
+  });
 
   let L = [];
   L.push('<!DOCTYPE html>');
@@ -5605,6 +5685,21 @@ function buildSensHtml() {
   L.push('.fmini:hover{border-color:var(--accent);color:var(--text)}');
   L.push('.fnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}');
   L.push('.fwarn{color:#f59e0b}');
+  // 参数透视面板(2026-08-27): 与筛选区同源的视觉语言, 但用第二强调色(青)区分"重新分配角色"
+  L.push('.pvbar{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}');
+  L.push('.pvhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}');
+  L.push('.pvsw{display:flex;align-items:center;gap:6px;font-size:.76rem;color:var(--text);cursor:pointer;margin:0}');
+  L.push('.pvsw b{color:#06b6d4}');
+  L.push('.pvhint{font-size:.7rem;color:var(--text-dim)}');
+  L.push('.pvrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:7px 0}');
+  L.push('.pvrow>b{font-size:.73rem;color:var(--text);min-width:52px;font-weight:600}');
+  L.push('.pvvals{border-top:1px dashed var(--border);margin-top:8px;padding-top:6px}');
+  L.push('.pvvals .pvrow>b{min-width:92px}');
+  L.push('.pvfix{font-size:.71rem;color:var(--text-dim);background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:2px 9px}');
+  L.push('.pvnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}');
+  // 透视激活时高亮整块, 让人清楚"现在看的不是原始批次视图"
+  L.push('.pvbar.on{background:rgba(6,182,212,.05);border-radius:6px;padding:10px}');
+  L.push('.pvbar.on .fc.on{background:rgba(6,182,212,.16);border-color:#06b6d4;color:#06b6d4}');
   L.push('</style></head><body><div class="wrap">');
   L.push('<h1>参数<span>敏感性</span>分析</h1>');
   L.push('<p class="sub">' + dimsHtml + '<br>基准策略 <b>' + esc(st.strategyName)
@@ -5666,6 +5761,73 @@ function buildSensHtml() {
     });
     L.push('<div class="frow"><b></b><span class="fnote" id="fNote"></span></div>');
     L.push('</div>');
+  }
+  // ===== 参数透视面板(2026-08-27) =====
+  // 与上方「维度筛选」的区别(两者并存但语义不同):
+  //   · 维度筛选 fbar —— 在**当前批次的既有角色分配**下做减法(勾掉某档位)
+  //   · 参数透视 pbar —— **重新分配角色**(任意参数当横轴/颜色/形状)并跨批次取数
+  // 之所以做成两块而不是替换: 原路径承载着堆叠柱与场景轴等已上线能力, 且有 5 个验证脚本
+  // 覆盖; 透视是"另一种看法", 用开关切换、互不干扰最稳。
+  if (hasPivot) {
+    L.push('<div class="pvbar" id="pvbar">');
+    L.push('<div class="pvhead">');
+    L.push('<label class="pvsw"><input type="checkbox" id="pvOn"> <b>🔀 参数透视</b></label>');
+    L.push('<span class="pvhint">数据以角色无关点云存储（' + pivotPts.length + ' 个参数组合'
+      + (multi ? ' · 合并自 ' + snaps.length + ' 次扫描' : '')
+      + (dupCount ? ' · 去重 ' + dupCount + ' 个' : '') + '），可任意指定哪个参数当横轴／颜色／形状</span>');
+    L.push('</div>');
+    L.push('<div id="pvBody" style="display:none">');
+    // 角色分配下拉: 横轴必选, 颜色/形状可空
+    let optsOf = function (sel, allowNone) {
+      let o = allowNone ? ['<option value="">无</option>'] : [];
+      pivotDims.forEach(function (k) {
+        o.push('<option value="' + esc(k) + '"' + (k === sel ? ' selected' : '') + '>'
+          + esc(pivotIndex[k].label) + '</option>');
+      });
+      return o.join('');
+    };
+    // 初始角色 = 当前快照的角色(若它在 pivotDims 里), 否则取第一个可用维度
+    let iniX = (pivotDims.indexOf(st.param) >= 0) ? st.param : pivotDims[0];
+    let iniC = (st.compareParam && pivotDims.indexOf(st.compareParam) >= 0 && st.compareParam !== iniX) ? st.compareParam : '';
+    let iniS = (st.hasPf && st.shapeDim && pivotDims.indexOf(st.shapeDim) >= 0
+      && st.shapeDim !== iniX && st.shapeDim !== iniC) ? st.shapeDim : '';
+    L.push('<div class="pvrow">');
+    L.push('<b>横轴</b><select id="pvX">' + optsOf(iniX, false) + '</select>');
+    L.push('<b>颜色</b><select id="pvC">' + optsOf(iniC, true) + '</select>');
+    L.push('<b>形状</b><select id="pvS">' + optsOf(iniS, true) + '</select>');
+    L.push('<span class="pvnote" id="pvNote"></span>');
+    L.push('</div>');
+    // 批次聚焦快捷: 一键还原某次扫描的角色分配(多批次时才有意义)
+    if (multi) {
+      L.push('<div class="pvrow"><b>批次</b>');
+      snapMeta.forEach(function (m, i) {
+        L.push('<button class="fc" data-snap="' + i + '" title="' + esc(m.title + ' · ' + m.n + ' 点 · ' + m.at)
+          + '">' + esc('#' + (i + 1) + ' ' + m.title) + '</button>');
+      });
+      L.push('<span class="pvnote">点击可还原该次扫描的角色分配</span></div>');
+    }
+    // 参数值勾选区: 每个参数一行。多取值参数可勾选, 单值参数标灰仅展示。
+    L.push('<div class="pvvals" id="pvVals">');
+    Object.keys(pivotIndex).forEach(function (k) {
+      let d = pivotIndex[k];
+      let single = d.vals.length <= 1;
+      L.push('<div class="pvrow" data-pk="' + esc(k) + '">');
+      L.push('<b>' + esc(d.label) + '</b>');
+      if (single) {
+        // 单值参数: 全批次同值, 勾选无意义 ⇒ 只展示(仍需展示, 否则读者不知道这个点的完整配置)
+        L.push('<span class="pvfix">' + esc(d.texts[0] != null ? d.texts[0] : '') + '</span>');
+      } else {
+        L.push(d.vals.map(function (v, i) {
+          return '<button class="fc on" data-pk="' + esc(k) + '" data-vi="' + i + '">'
+            + esc(d.texts[i]) + '</button>';
+        }).join(''));
+        L.push('<button class="fmini" data-pact="all" data-pk="' + esc(k) + '">全选</button>');
+        L.push('<button class="fmini" data-pact="inv" data-pk="' + esc(k) + '">反选</button>');
+      }
+      L.push('</div>');
+    });
+    L.push('</div>');
+    L.push('</div></div>');
   }
   L.push('<div id="chart"></div></div>');
   L.push('<div class="card"><div class="box"><b>📐 敏感度分析方法</b><br>' + st.descHtml
@@ -5777,7 +5939,9 @@ function buildSensHtml() {
   }
   L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放'
     + (hasSwitch ? ' / 指标切换' : '') + (hasFilter ? ' / 维度筛选' : '')
-    + '）需联网加载 echarts；离线时数据表仍完整可用</p>');
+    + (hasPivot ? ' / 参数透视' : '')
+    + '）需联网加载 echarts；离线时数据表仍完整可用'
+    + (multi ? ' · 本文件含 ' + snaps.length + ' 次扫描的数据' : '') + '</p>');
   L.push('</div>');
   L.push('<script>');
   L.push('var OPT = ' + safeJson(opt) + ';');
@@ -6129,6 +6293,291 @@ function buildSensHtml() {
   L.push('    applyMetric(keys[(i+d+keys.length)%keys.length]); e.preventDefault();');
   L.push('  });');
   L.push('})();');
+  // ======================== 参数透视引擎(2026-08-27) ========================
+  // 核心思想(用户提出): 存储不区分横轴/颜色/形状, 展示时动态分配。
+  //   PIVOT_PTS[i] = {p: {参数key: 值}, r: {全指标}, s: 来源批次}
+  // 于是「颜色=命中率 形状=输入长度」与「颜色=输入长度 形状=命中率」只是同一份点云的
+  // 两种投影 —— 无需重跑, 页内下拉一换即可。
+  L.push('var PIVOT_PTS = ' + safeJson(hasPivot ? pivotPts : []) + ';');
+  L.push('var PIVOT_IDX = ' + safeJson(hasPivot ? pivotIndex : {}) + ';');
+  L.push('var PIVOT_DIMS = ' + safeJson(hasPivot ? pivotDims : []) + ';');
+  L.push('var SNAP_META = ' + safeJson(snapMeta) + ';');
+  L.push('var HAS_PIVOT = ' + (hasPivot ? 'true' : 'false') + ';');
+  L.push('var PV_ON = false;');
+  // PV_SEL[参数key] = 勾选的取值下标数组(初始全选)
+  L.push('var PV_SEL = {};');
+  L.push('var PV_ROLE = {x:null,c:null,s:null};');
+  L.push('var PV_PALETTE = ["#6c63ff","#f59e0b","#10b981","#ef4444","#06b6d4","#8b5cf6","#84cc16"];');
+  L.push('var PV_SYMBOLS = ["circle","square","triangle","diamond","roundRect","pin"];');
+  if (hasPivot) {
+    L.push('(function(){ Object.keys(PIVOT_IDX).forEach(function(k){');
+    L.push('  PV_SEL[k] = PIVOT_IDX[k].vals.map(function(_,i){ return i; }); }); })();');
+  }
+  // ---- 投影: 按当前角色分配 + 勾选状态, 从点云生成"曲线列表" ----
+  // 返回 {xs:[横轴显示标签], xv:[横轴原始值], curves:[{name,ci,pi,vals:{横轴值→rec}}]}
+  // ⚠️ 关键设计: 曲线的身份 = (颜色值, 形状值) 二元组; 未指定的角色视为单一空值。
+  //   其余参数(既非横轴也非颜色/形状)只参与**过滤**, 不参与分组 —— 若它们仍有多个取值,
+  //   同一 (x,颜色,形状) 会对应多个点, 此时取平均并计数(pvAvgN), 由提示告知用户。
+  L.push('function pvProject(){');
+  L.push('  var kx = PV_ROLE.x, kc = PV_ROLE.c, ks = PV_ROLE.s;');
+  L.push('  if(!kx || !PIVOT_IDX[kx]) return null;');
+  // 1) 过滤: 每个参数都要落在其勾选集合内(未在 PV_SEL 里的参数不过滤)
+  L.push('  var keep = [];');
+  L.push('  for(var i=0;i<PIVOT_PTS.length;i++){');
+  L.push('    var pt = PIVOT_PTS[i], ok = true;');
+  L.push('    for(var k in PV_SEL){');
+  L.push('      var idx = PIVOT_IDX[k]; if(!idx) continue;');
+  L.push('      var v = pt.p[k]; if(v===undefined) continue;');
+  // 值→下标: 用 String 比较避免 1 与 "1" 的类型差异(JSON 往返后数值可能变字符串)
+  L.push('      var vi = -1; for(var q=0;q<idx.vals.length;q++){ if(String(idx.vals[q])===String(v)){ vi=q; break; } }');
+  L.push('      if(vi>=0 && PV_SEL[k].indexOf(vi)<0){ ok=false; break; }');
+  L.push('    }');
+  L.push('    if(ok) keep.push(pt);');
+  L.push('  }');
+  L.push('  if(!keep.length) return {xs:[],xv:[],curves:[],avgN:0,n:0};');
+  // 2) 横轴取值: 只取过滤后**实际存在**的档位(升序), 不是索引表的全部
+  L.push('  var xset = {}; keep.forEach(function(pt){ if(pt.p[kx]!==undefined) xset[pt.p[kx]] = true; });');
+  L.push('  var xv = Object.keys(xset);');
+  L.push('  if(kx==="gpu_preset") xv.sort(); else xv = xv.map(Number).filter(isFinite).sort(function(a,b){return a-b;});');
+  // 3) 分组: 曲线键 = 颜色值 + "\u0001" + 形状值
+  L.push('  var groups = {}, order = [];');
+  L.push('  keep.forEach(function(pt){');
+  L.push('    var cv = kc ? pt.p[kc] : "", sv = ks ? pt.p[ks] : "";');
+  L.push('    var gk = String(cv)+"\\u0001"+String(sv);');
+  L.push('    if(!groups[gk]){ groups[gk] = {cv:cv, sv:sv, byX:{}}; order.push(gk); }');
+  L.push('    var xk = String(pt.p[kx]);');
+  L.push('    if(!groups[gk].byX[xk]) groups[gk].byX[xk] = [];');
+  L.push('    groups[gk].byX[xk].push(pt.r);');
+  L.push('  });');
+  // 4) 曲线排序: 先按颜色值再按形状值(数值升序) —— 图例顺序要可预期, 不能随 Object 键序
+  L.push('  function numOr(v){ var n = Number(v); return isFinite(n) ? n : null; }');
+  L.push('  order.sort(function(a,b){');
+  L.push('    var ga = groups[a], gb = groups[b];');
+  L.push('    var ca = numOr(ga.cv), cb = numOr(gb.cv);');
+  L.push('    if(ca!==null && cb!==null && ca!==cb) return ca-cb;');
+  L.push('    if(String(ga.cv)!==String(gb.cv)) return String(ga.cv)<String(gb.cv)?-1:1;');
+  L.push('    var sa = numOr(ga.sv), sb = numOr(gb.sv);');
+  L.push('    if(sa!==null && sb!==null && sa!==sb) return sa-sb;');
+  L.push('    return String(ga.sv)<String(gb.sv)?-1:(String(ga.sv)>String(gb.sv)?1:0);');
+  L.push('  });');
+  // 5) 颜色/形状下标: 同一颜色值共用一个色号(不同形状值不换色), 反之亦然 —— 这才是
+  //    "颜色编码某参数、形状编码另一参数"的正确语义(否则 6 条线 6 个颜色, 维度信息丢失)
+  L.push('  var cKeys = [], sKeys = [];');
+  L.push('  order.forEach(function(gk){');
+  L.push('    var g = groups[gk];');
+  L.push('    if(cKeys.indexOf(String(g.cv))<0) cKeys.push(String(g.cv));');
+  L.push('    if(sKeys.indexOf(String(g.sv))<0) sKeys.push(String(g.sv));');
+  L.push('  });');
+  L.push('  var avgN = 0;');
+  L.push('  var curves = order.map(function(gk){');
+  L.push('    var g = groups[gk];');
+  L.push('    var nm = [];');
+  L.push('    if(kc) nm.push(pvFmt(kc, g.cv));');
+  L.push('    if(ks) nm.push(pvFmt(ks, g.sv));');
+  L.push('    var data = xv.map(function(x){');
+  L.push('      var arr = g.byX[String(x)];');
+  // 缺值插 null(echarts 会断线) —— 不能填 0, 那会画出一条假的"归零"曲线
+  L.push('      if(!arr || !arr.length) return null;');
+  L.push('      if(arr.length>1) avgN++;');
+  L.push('      return arr;');
+  L.push('    });');
+  L.push('    return {name: nm.length?nm.join(" · "):(METRIC_LABEL[CUR_METRIC]||CUR_METRIC),');
+  L.push('      ci: cKeys.indexOf(String(g.cv)), pi: sKeys.indexOf(String(g.sv)), recs: data};');
+  L.push('  });');
+  L.push('  return {xs: xv.map(function(x){ return pvFmt(kx, x); }), xv: xv, curves: curves,');
+  L.push('    avgN: avgN, n: keep.length, nc: cKeys.length, ns: sKeys.length};');
+  L.push('}');
+  // pvFmt: 参数值 → 显示标签。直接查索引表里预先算好的 texts(与平台 sensParamUnit 同口径),
+  // 查不到时回退原值 —— 不在页内重写一份单位规则, 避免两处漂移。
+  L.push('function pvFmt(k, v){');
+  L.push('  var d = PIVOT_IDX[k]; if(!d) return String(v);');
+  L.push('  for(var i=0;i<d.vals.length;i++) if(String(d.vals[i])===String(v)) return d.texts[i];');
+  L.push('  return String(v);');
+  L.push('}');
+  // ---- 透视模式下的 series 构造(折线) ----
+  // 堆叠柱在透视模式下不支持: 它把"曲线×档位"拉平成场景轴, 与"动态分配角色"是两套 x 轴
+  // 语义, 混在一起会让人分不清横轴到底是什么 ⇒ 透视时若当前指标是堆叠柱, 自动落回 TTFT。
+  L.push('function pvMetricVal(recs, k){');
+  L.push('  if(recs===null) return null;');
+  L.push('  var arr = recs, sum = 0, n = 0;');
+  L.push('  for(var i=0;i<arr.length;i++){');
+  L.push('    var v = arr[i] ? arr[i][k] : null;');
+  L.push('    if(v!=null && isFinite(v)){ sum += Number(v); n++; }');
+  L.push('  }');
+  L.push('  return n ? +(sum/n).toFixed(1) : null;');
+  L.push('}');
+  L.push('function pvBuildSeries(proj, k){');
+  L.push('  var single = proj.curves.length===1 && !PV_ROLE.c && !PV_ROLE.s;');
+  L.push('  return proj.curves.map(function(cv){');
+  L.push('    var s = {name: cv.name, type:"line", smooth:true,');
+  L.push('      data: cv.recs.map(function(recs){ return pvMetricVal(recs, k); }),');
+  L.push('      lineStyle:{color: PV_PALETTE[cv.ci % PV_PALETTE.length], width:2},');
+  L.push('      itemStyle:{color: PV_PALETTE[cv.ci % PV_PALETTE.length]},');
+  L.push('      symbol: PV_ROLE.s ? PV_SYMBOLS[cv.pi % PV_SYMBOLS.length] : "circle",');
+  L.push('      symbolSize: PV_ROLE.s ? 7 : 6,');
+  // 断线处("缺该参数组合的仿真点")要显式连过去还是断开? 断开 —— 假连线会让人误以为
+  // 扫过那个档位。connectNulls 保持默认 false。
+  L.push('      connectNulls:false};');
+  L.push('    if(single){ s.areaStyle={color:"rgba(108,99,255,.1)"}; s.label={show:true,color:"#9ca0b0",fontSize:9}; }');
+  L.push('    return s;');
+  L.push('  });');
+  L.push('}');
+  // ---- 透视重绘: 图 + 表 + 提示, 与原路径共用 ch 实例 ----
+  L.push('function pvRebuild(){');
+  L.push('  var proj = pvProject();');
+  L.push('  var note = document.getElementById("pvNote");');
+  L.push('  if(!proj || !proj.curves.length || !proj.xv.length){');
+  L.push('    if(note){ note.className="pvnote fwarn"; note.textContent="⚠ 当前勾选下没有数据点，请放宽筛选"; }');
+  L.push('    return;');
+  L.push('  }');
+  // 横轴塌缩(只剩 1 档)时仍绘制(单点), 但要提示 —— 用户可能没意识到把横轴筛没了
+  L.push('  var k = CUR_METRIC;');
+  L.push('  if(k===STACK_KEY){ k = METRIC_DATA["ttft"] ? "ttft" : Object.keys(METRIC_LABEL)[0]; CUR_METRIC = k;');
+  L.push('    var sel0 = document.getElementById("mSel"); if(sel0) sel0.value = k; }');
+  L.push('  var lb = METRIC_LABEL[k]||k;');
+  L.push('  if(ch){');
+  L.push('    OPT.series = pvBuildSeries(proj, k);');
+  L.push('    OPT.xAxis.data = proj.xs;');
+  L.push('    OPT.xAxis.name = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";');
+  L.push('    OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};');
+  L.push('    OPT.xAxis.axisLabel.rotate = 0; OPT.xAxis.axisLabel.interval = 0;');
+  L.push('    OPT.xAxis.axisLabel.color = "#9ca0b0";');
+  L.push('    OPT.xAxis.axisLabel.formatter = function(v){ return v; };');
+  L.push('    OPT.yAxis.name = lb;');
+  L.push('    var multiCurve = proj.curves.length>1;');
+  L.push('    OPT.legend = multiCurve ? {top:0,textStyle:{color:"#9ca0b0",fontSize:10}} : undefined;');
+  L.push('    OPT.grid = {left:70,right:20,top:multiCurve?36:20,bottom:40};');
+  L.push('    OPT.tooltip.axisPointer = undefined;');
+  L.push('    OPT.dataZoom = undefined;');
+  L.push('    ch.setOption(OPT, true);');
+  L.push('  }');
+  L.push('  pvRenderTable(proj, k);');
+  L.push('  var dy = document.getElementById("dimY"); if(dy) dy.textContent = lb;');
+  L.push('  if(note){');
+  L.push('    note.className = "pvnote";');
+  L.push('    var msg = "曲线 " + proj.curves.length + " 条 · 横轴 " + proj.xv.length + " 档 · 命中 " + proj.n + " 点";');
+  L.push('    if(proj.xv.length<2) msg += " ⚠ 横轴只剩 1 档(无法成线)";');
+  // 非角色参数仍有多值 ⇒ 同一 (x,色,形) 落多个点, 已取平均。必须显式告知, 否则读者
+  // 会以为看到的是单一配置的曲线。
+  L.push('    if(proj.avgN) msg += " ⚠ " + proj.avgN + " 个位置有多点(已取平均)";');
+  L.push('    note.textContent = msg;');
+  L.push('  }');
+  L.push('}');
+  // 透视数据表: 行=横轴档位, 列=曲线。与图共用同一份 proj ⇒ 图表永远一致。
+  L.push('function pvRenderTable(proj, k){');
+  L.push('  var tbl = document.getElementById("tbl"); if(!tbl) return;');
+  L.push('  var th = tbl.querySelector("thead"), tb = tbl.querySelector("tbody");');
+  L.push('  if(!th||!tb) return;');
+  L.push('  var xlb = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";');
+  L.push('  th.innerHTML = "<tr><th>"+esc2(xlb)+"</th>"');
+  L.push('    + proj.curves.map(function(c){ return "<th>"+esc2(c.name)+"</th>"; }).join("") + "</tr>";');
+  L.push('  tb.innerHTML = proj.xs.map(function(x,i){');
+  L.push('    return "<tr><td class=\\"k\\">"+esc2(x)+"</td>"');
+  L.push('      + proj.curves.map(function(c){');
+  L.push('          var v = pvMetricVal(c.recs[i], k);');
+  L.push('          return "<td>"+esc2(v==null?"—":v)+"</td>"; }).join("") + "</tr>";');
+  L.push('  }).join("");');
+  L.push('}');
+  // ---- 角色分配的互斥: 三个下拉不能选同一参数 ----
+  // 撞车时**清空低优先级的那个**(而不是拒绝操作/回退高优先级的) —— 用户改下拉的意图是
+  // "我要这个参数当这个角色", 强行回退会让人以为下拉坏了。
+  // changed 参数保留(调用方标明是谁触发的), 当前裁决逻辑不依赖它, 但排错时有用。
+  L.push('function pvSyncRoles(changed){');
+  L.push('  var ex = document.getElementById("pvX"), ec2 = document.getElementById("pvC"), es = document.getElementById("pvS");');
+  L.push('  if(!ex) return;');
+  L.push('  var x = ex.value, c = ec2?ec2.value:"", s = es?es.value:"";');
+  // 优先级 横轴 > 颜色 > 形状: 低优先级的撞了高优先级的就被清空。
+  // 无论 changed 是谁都按这个固定优先级裁决 —— 按"谁刚被改"决定保留谁会产生
+  // 不可预期的连锁(改横轴把颜色顶掉、再改颜色又把横轴顶掉), 固定优先级更好预测。
+  L.push('  if(c && c===x) c = "";');
+  L.push('  if(s && (s===x || s===c)) s = "";');
+  L.push('  if(ec2 && ec2.value!==c) ec2.value = c;');
+  L.push('  if(es && es.value!==s) es.value = s;');
+  L.push('  PV_ROLE.x = x; PV_ROLE.c = c||null; PV_ROLE.s = s||null;');
+  L.push('}');
+  // ---- 透视开关: 打开时接管图表, 关闭时还原原始批次视图 ----
+  L.push('function pvToggle(on){');
+  L.push('  PV_ON = !!on;');
+  L.push('  var body = document.getElementById("pvBody"), bar = document.getElementById("pvbar");');
+  L.push('  if(body) body.style.display = PV_ON ? "" : "none";');
+  L.push('  if(bar) bar.className = "pvbar" + (PV_ON ? " on" : "");');
+  // 原「维度筛选」区在透视模式下会误导(它筛的是原批次的角色) ⇒ 直接隐藏
+  L.push('  var fb = document.getElementById("fbar"); if(fb) fb.style.display = PV_ON ? "none" : "";');
+  L.push('  if(PV_ON){ pvSyncRoles("x"); pvRebuild(); }');
+  L.push('  else { rebuildAll(CUR_METRIC); renderTable(); if(HAS_FILTER) updateFNote(); }');
+  L.push('}');
+  if (hasPivot) {
+    L.push('(function(){');
+    L.push('  var sw = document.getElementById("pvOn");');
+    L.push('  if(sw) sw.addEventListener("change", function(){ pvToggle(sw.checked); });');
+    // 角色下拉
+    L.push('  ["pvX","pvC","pvS"].forEach(function(id){');
+    L.push('    var el = document.getElementById(id); if(!el) return;');
+    L.push('    el.addEventListener("change", function(){');
+    L.push('      pvSyncRoles(id==="pvX"?"x":(id==="pvC"?"c":"s"));');
+    L.push('      if(PV_ON) pvRebuild();');
+    L.push('    });');
+    L.push('  });');
+    // 参数值 chip
+    L.push('  var vcs = document.querySelectorAll(".fc[data-pk]");');
+    L.push('  for(var i=0;i<vcs.length;i++){ (function(el){');
+    L.push('    el.addEventListener("click", function(){');
+    L.push('      var pk = el.getAttribute("data-pk"), vi = parseInt(el.getAttribute("data-vi"),10);');
+    L.push('      var s = PV_SEL[pk]; if(!s) return;');
+    L.push('      var at = s.indexOf(vi);');
+    L.push('      if(at>=0) s.splice(at,1); else { s.push(vi); s.sort(function(a,b){return a-b;}); }');
+    L.push('      el.className = "fc" + (s.indexOf(vi)>=0 ? " on" : "");');
+    L.push('      if(PV_ON) pvRebuild();');
+    L.push('    });');
+    L.push('  })(vcs[i]); }');
+    // 全选/反选
+    L.push('  var pms = document.querySelectorAll(".fmini[data-pact]");');
+    L.push('  for(var j=0;j<pms.length;j++){ (function(el){');
+    L.push('    el.addEventListener("click", function(){');
+    L.push('      var pk = el.getAttribute("data-pk"), act = el.getAttribute("data-pact");');
+    L.push('      var d = PIVOT_IDX[pk]; if(!d) return;');
+    L.push('      var all = d.vals.map(function(_,i){ return i; });');
+    L.push('      PV_SEL[pk] = (act==="all") ? all : all.filter(function(i){ return PV_SEL[pk].indexOf(i)<0; });');
+    L.push('      var cs = document.querySelectorAll(\'.fc[data-pk="\'+pk+\'"]\');');
+    L.push('      for(var q=0;q<cs.length;q++){');
+    L.push('        var ii = parseInt(cs[q].getAttribute("data-vi"),10);');
+    L.push('        cs[q].className = "fc" + (PV_SEL[pk].indexOf(ii)>=0 ? " on" : "");');
+    L.push('      }');
+    L.push('      if(PV_ON) pvRebuild();');
+    L.push('    });');
+    L.push('  })(pms[j]); }');
+    // 批次聚焦: 还原该次扫描的角色分配, 并把非角色参数收窄到该批次实际用过的取值
+    L.push('  var sbs = document.querySelectorAll(".fc[data-snap]");');
+    L.push('  for(var m=0;m<sbs.length;m++){ (function(el){');
+    L.push('    el.addEventListener("click", function(){');
+    L.push('      var si = parseInt(el.getAttribute("data-snap"),10);');
+    L.push('      var meta = SNAP_META[si]; if(!meta) return;');
+    L.push('      var ex = document.getElementById("pvX"), ec2 = document.getElementById("pvC"), es = document.getElementById("pvS");');
+    L.push('      if(ex && PIVOT_DIMS.indexOf(meta.x)>=0) ex.value = meta.x;');
+    L.push('      if(ec2) ec2.value = (meta.cmp && PIVOT_DIMS.indexOf(meta.cmp)>=0) ? meta.cmp : "";');
+    L.push('      if(es) es.value = (meta.shape && PIVOT_DIMS.indexOf(meta.shape)>=0) ? meta.shape : "";');
+    // 勾选收窄到该批次的点实际覆盖的取值 —— 否则会把其他批次的点混进来
+    L.push('      Object.keys(PIVOT_IDX).forEach(function(k){');
+    L.push('        var seen = {};');
+    L.push('        PIVOT_PTS.forEach(function(pt){ if(pt.s===si && pt.p[k]!==undefined) seen[String(pt.p[k])] = true; });');
+    L.push('        var idx = PIVOT_IDX[k], keep = [];');
+    L.push('        for(var q=0;q<idx.vals.length;q++) if(seen[String(idx.vals[q])]) keep.push(q);');
+    L.push('        if(keep.length) PV_SEL[k] = keep;');
+    L.push('      });');
+    L.push('      var cs = document.querySelectorAll(".fc[data-pk]");');
+    L.push('      for(var q2=0;q2<cs.length;q2++){');
+    L.push('        var pk2 = cs[q2].getAttribute("data-pk"), ii2 = parseInt(cs[q2].getAttribute("data-vi"),10);');
+    L.push('        cs[q2].className = "fc" + ((PV_SEL[pk2]||[]).indexOf(ii2)>=0 ? " on" : "");');
+    L.push('      }');
+    L.push('      for(var w=0;w<sbs.length;w++) sbs[w].className = "fc" + (w===si ? " on" : "");');
+    // 点批次即视为要用透视看 ⇒ 自动打开开关
+    L.push('      var sw2 = document.getElementById("pvOn");');
+    L.push('      if(sw2 && !sw2.checked){ sw2.checked = true; pvToggle(true); }');
+    L.push('      else { pvSyncRoles("x"); pvRebuild(); }');
+    L.push('    });');
+    L.push('  })(sbs[m]); }');
+    L.push('})();');
+  }
   L.push('function copyTsv(){');
   L.push('  var rs = document.querySelectorAll("#tbl tr");');
   L.push('  var out = [];');
@@ -6163,14 +6612,26 @@ function buildSensHtml() {
 function exportSensHtml() {
   if (!sensExportState) { sensExportNote('⚠ 请先运行一次敏感性分析', true); return; }
   try {
-    let html = buildSensHtml();
+    // 快照列表(2026-08-27): 勾选的**全部**扫描一并打包。
+    // 兜底: 列表为空或全不勾时退回单快照(当前图) —— 不能因为忘了勾选就导出空文件。
+    let snaps = [];
+    try { snaps = sensSnapSelected(); } catch (e) { snaps = []; }
+    if (!snaps.length) snaps = [sensExportState];
+    // 当前图对应的快照必须在列表里且**排首位** —— 导出页的初始图/参数区取自 snaps[0] 之外的
+    // st(=sensExportState), 若当前扫描没被勾选, 初始图与点云会来自不同批次, 令人困惑。
+    let curKey = (function () { try { return sensSnapKeyOf(sensExportState); } catch (e) { return null; } })();
+    let hasCur = snaps.some(function (s) { try { return sensSnapKeyOf(s) === curKey; } catch (e) { return false; } });
+    if (!hasCur) snaps = [sensExportState].concat(snaps);
+    let html = buildSensHtml(snaps);
     let url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
     triggerDownload(url, sensExportFileName('html'), true);
     // 提示里报出可切换的指标数 —— 让用户知道导出文件里带了多少东西(不只是当前那一张图)
     let nm = (function () {
       try { return Object.keys(sensExportState.curveRecs && sensExportState.curveRecs[0] && sensExportState.curveRecs[0][0] || {}).length; } catch (e) { return 0; }
     })();
+    let nPt = snaps.reduce(function (a, s) { return a + ((s.points || []).length); }, 0);
     sensExportNote('✓ 已导出可交互 HTML（' + (html.length / 1024).toFixed(0) + ' KB'
+      + (snaps.length > 1 ? '，含 ' + snaps.length + ' 次扫描共 ' + nPt + ' 个参数组合，可页内透视' : '')
       + (nm > 1 ? '，可页内切换 ' + nm + ' 个指标' : '') + '，含数据表与参数配置详情）');
   } catch (e) {
     sensExportNote('⚠ 导出失败: ' + ((e && e.message) ? e.message : e), true);
@@ -6317,6 +6778,199 @@ function sensParamUnit(param, v) {
   return v + '%';
 }
 
+// ======================== 参数落地(角色无关) 2026-08-27 ========================
+// applyParamVal: 把「某个可扫描参数 = 某个值」落到仿真输入上, 是三个视觉角色
+// (横轴 / 颜色 / 形状)**唯一共用**的落地入口。
+// 为什么必须统一: 原实现为三个角色各写一份 if 链(共 30 行近乎重复的代码), 新增一个
+// 可扫描参数要改三处 —— 漏改一处的表现是"该参数当横轴好用、当形状静默失效"(曲线全平,
+// 且引擎不报错)。收敛成一处后, 加参数只需在这里加一行。
+//
+// 两类落地通道(勿混):
+//   · 策略对象 s  —— 调度语义(准入/淘汰/预取水位/batch), 百分比参数需 /100 转小数
+//   · overrides   —— 全局负载/硬件参数, 由 runSimulation 内部套用
+function applyParamVal(s, ov, key, val) {
+  if (val == null) return;
+  switch (key) {
+    // ---- 策略对象: 阈值类均为百分比输入, 引擎内是 0~1 小数 ----
+    case 'hbm_threshold':      s.admission.hbm_threshold = val / 100; break;
+    case 'evict_threshold':    s.eviction.hbm_evict_threshold = val / 100; break;
+    case 'prefetch_threshold': s.prefetch.prefetch_threshold = val / 100; break;
+    case 'max_batch_size':     s.batching.max_batch_size = val; break;
+    // ---- overrides: 负载与硬件 ----
+    case 'prefix_hit':  ov.prefixHit = val / 100; break;
+    case 'ssd_bw':      ov.ssdBW = val; break;
+    case 'input_len':   ov.inputLen = val; break;
+    case 'qps':         ov.qps = val; break;
+    case 'concurrency': ov.nreq = val; break;   // 单批Prefill基准的 batch 规模
+    case 'gpu_preset':  ov.hwPreset = val; break; // runSimulation 内套字段并重算 a/b
+  }
+}
+
+// sortedJson: 键序无关的稳定序列化 —— 点级缓存 key 的基石。
+// ⚠️ 直接 JSON.stringify 不行: 对象字面量的键序 = 赋值顺序, 而 overrides 的赋值顺序
+// 取决于「哪个参数当横轴、哪个当颜色」⇒ 横轴与颜色互换后同一份输入会序列化成两个不同
+// 字符串({prefixHit,ssdBW} vs {ssdBW,prefixHit}), 缓存永远不命中, 角色无关化就失效了。
+function sortedJson(o) {
+  return JSON.stringify(o, function (k, v) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      let out = {};
+      Object.keys(v).sort().forEach(function (kk) { out[kk] = v[kk]; });
+      return out;
+    }
+    return v;
+  });
+}
+
+// ======================== 角色无关点云 2026-08-27 ========================
+// baseValsOf: 读出**全部可扫描参数**当前在页面上的基准值(与 SENS_PARAM_LABEL 的键一一对应)。
+// 用途: 点云的 params 必须是**完整**的参数组合 —— 只记被扫描的那 1~3 个维度不够, 因为
+// 跨批次比较时需要知道"这个点的 qps 是多少"才能判断两批次的点是否真的同一个点。
+// ⚠️ 单位口径与 sensParamUnit / SENS_LEVELS 保持一致(百分比参数记 0~100 的整数而非小数),
+//    否则透视面板显示 "0.4%" 而档位 chip 是 "40%", 两边对不上。
+function baseValsOf() {
+  let out = {};
+  try {
+    out.prefix_hit = gi('pPrefixHit');
+    out.ssd_bw = gv('pSsdBW');
+    out.input_len = gi('pInputLen');
+    out.qps = gv('pQps');
+    out.concurrency = gi('pConcurrency');
+    // 策略侧参数: 引擎内是 0~1 小数, 这里统一换算回百分比整数
+    let st = (typeof getCurrentStrategy === 'function') ? getCurrentStrategy() : null;
+    if (st) {
+      if (st.admission && st.admission.hbm_threshold != null) out.hbm_threshold = Math.round(st.admission.hbm_threshold * 100);
+      if (st.eviction && st.eviction.hbm_evict_threshold != null) out.evict_threshold = Math.round(st.eviction.hbm_evict_threshold * 100);
+      if (st.prefetch && st.prefetch.prefetch_threshold != null) out.prefetch_threshold = Math.round(st.prefetch.prefetch_threshold * 100);
+      if (st.batching && st.batching.max_batch_size != null) out.max_batch_size = st.batching.max_batch_size;
+    }
+    // GPU 预设无下拉框, 选中态记在 #hwPresets 里 .preset-tag.active 的 data-hw 上。
+    // ⚠️ 用 classList.contains 判定而非 querySelector('.active') —— 无头 harness 的 DOM stub
+    //    对复合选择器支持不全, 遍历 + contains 更稳(取不到时留空, 导出页显示"基准硬件")。
+    let hb = $('hwPresets');
+    if (hb && hb.querySelectorAll) {
+      let tags = hb.querySelectorAll('.preset-tag') || [];
+      for (let i = 0; i < tags.length; i++) {
+        let t = tags[i];
+        let act = t.classList && t.classList.contains && t.classList.contains('active');
+        if (act) { out.gpu_preset = (t.dataset && t.dataset.hw) || (t.getAttribute && t.getAttribute('data-hw')) || ''; break; }
+      }
+      if (!out.gpu_preset) delete out.gpu_preset;
+    }
+  } catch (e) {}
+  return out;
+}
+
+// buildSensPoints: 把"曲线×档位"的带角色结构摊平成**角色无关**的点云。
+// 每个点带上它的完整参数组合(基准值 + 本次扫描三个维度的实际取值), 因此:
+//   · 导出页可任意重新指定谁当横轴/颜色/形状(透视)
+//   · 跨批次可按 params 指纹去重 —— 用户指出的「扫描1与扫描2数据相同可复用」正是靠这个
+// 参数 flatCurves 由 paint 内拉平得到(含每条曲线的 ci/pi 坐标与全指标记录数组)。
+function buildSensPoints(flatCurves, values, param, compareParam, shapeDim, hasPf, shapeList, baseVals) {
+  let pts = [];
+  (flatCurves || []).forEach(function (fc) {
+    (fc.recs || []).forEach(function (rec, idx) {
+      if (!rec) return;   // 未完成/被取消的点直接跳过(不塞 null 进点云)
+      let ps = {};
+      // 先铺基准值, 再让被扫描的维度覆盖 —— 顺序不能反, 否则扫描值会被基准值盖掉
+      Object.keys(baseVals || {}).forEach(function (k) { ps[k] = baseVals[k]; });
+      ps[param] = values[idx];
+      if (compareParam) ps[compareParam] = (fc.cmpVal !== undefined) ? fc.cmpVal : null;
+      if (hasPf && shapeDim) ps[shapeDim] = (fc.shapeVal !== undefined) ? fc.shapeVal : null;
+      pts.push({ params: ps, rec: rec });
+    });
+  });
+  return pts;
+}
+
+// ======================== 扫描快照列表(多次扫描同页导出) 2026-08-27 ========================
+// 动机: 平台**同时只展示一次扫描**(sensExportState 每次 paint 被整体覆盖), 但研究时往往
+// 要把"扫 qps""扫 L3带宽""扫 GPU"几张图放一起给人看。⇒ 攒一个快照列表, 导出时打包进
+// **同一个** HTML, 页内按选择展示(见 buildSensHtml 的透视面板与批次选择器)。
+// 去重: key = 批次缓存指纹 + 当前纵轴指标 —— 同一扫描换指标算不同视图(初始图不同),
+//   但同一扫描重跑(参数没变)只更新不新增, 避免列表被重复项刷满。
+// 上限 20 条 FIFO: 单快照约 20~50KB, 20 条约 1MB 内, 浏览器与文件体积都可接受。
+let sensSnapshots = [];
+const SENS_SNAP_MAX = 20;
+function sensSnapKeyOf(st) {
+  return (st && st._cacheKey ? st._cacheKey : '') + '|' + (st ? st.metric : '');
+}
+// 快照自动命名: 「横轴 → 纵轴」+ 颜色/形状维度提示, 用户一眼能分清列表里哪条是哪次扫描
+function sensSnapTitle(st) {
+  if (!st) return '';
+  let t = st.paramLabel + ' → ' + st.metricLabel;
+  let ex = [];
+  if (st.compareParam) ex.push('色:' + (SENS_PARAM_LABEL[st.compareParam] || st.compareParam));
+  if (st.hasPf) ex.push('形:' + (st.shapeDim === 'prefetch' ? '预取策略'
+    : (SENS_PARAM_LABEL[st.shapeDim] || st.shapeDim)));
+  return t + (ex.length ? '（' + ex.join(' ') + '）' : '');
+}
+function collectSensSnapshot(st) {
+  if (!st) return;
+  let k = sensSnapKeyOf(st);
+  let at = -1;
+  for (let i = 0; i < sensSnapshots.length; i++) {
+    if (sensSnapKeyOf(sensSnapshots[i]) === k) { at = i; break; }
+  }
+  // 新快照默认勾选(用户跑了就是想看), 重跑时**保留**原勾选状态
+  if (at >= 0) { st._sel = sensSnapshots[at]._sel !== false; sensSnapshots[at] = st; }
+  else {
+    st._sel = true;
+    sensSnapshots.push(st);
+    if (sensSnapshots.length > SENS_SNAP_MAX) sensSnapshots.shift();
+  }
+  renderSensSnapList();
+}
+function sensSnapSelected() {
+  return sensSnapshots.filter(function (s) { return s._sel !== false; });
+}
+function toggleSensSnap(i) {
+  if (sensSnapshots[i]) { sensSnapshots[i]._sel = (sensSnapshots[i]._sel === false); renderSensSnapList(); }
+}
+function removeSensSnap(i) {
+  if (i >= 0 && i < sensSnapshots.length) { sensSnapshots.splice(i, 1); renderSensSnapList(); }
+}
+function clearSensSnaps() { sensSnapshots = []; renderSensSnapList(); }
+function renderSensSnapList() {
+  let box = $('sensSnapList');
+  if (!box) return;
+  if (!sensSnapshots.length) {
+    box.innerHTML = '<span style="font-size:.72rem;color:var(--text-dim)">'
+      + '尚未收集扫描结果 —— 每运行一次敏感性分析会自动收录一条，可勾选多条一并导出到同一个 HTML。</span>';
+    return;
+  }
+  let nSel = sensSnapSelected().length;
+  let L = ['<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+    + '<span style="font-size:.73rem;color:var(--text)">已收集 <b>' + sensSnapshots.length
+    + '</b> 次扫描，勾选 <b style="color:var(--accent2)">' + nSel + '</b> 条导出</span>'
+    + '<button class="btn btn-sm" onclick="selectAllSensSnaps(true)" style="padding:2px 8px;font-size:.68rem">全选</button>'
+    + '<button class="btn btn-sm" onclick="selectAllSensSnaps(false)" style="padding:2px 8px;font-size:.68rem">全不选</button>'
+    + '<button class="btn btn-sm" onclick="clearSensSnaps()" style="padding:2px 8px;font-size:.68rem;background:var(--accent4)">清空</button>'
+    + '</div>'];
+  L.push('<div style="display:flex;flex-direction:column;gap:3px">');
+  sensSnapshots.forEach(function (s, i) {
+    let on = s._sel !== false;
+    let nPt = (s.points || []).length;
+    L.push('<div style="display:flex;align-items:center;gap:8px;font-size:.72rem;'
+      + 'background:var(--surface2);border:1px solid var(--border);border-left:3px solid '
+      + (on ? 'var(--accent2)' : 'var(--border)') + ';border-radius:5px;padding:3px 8px">'
+      + '<input type="checkbox"' + (on ? ' checked' : '') + ' onchange="toggleSensSnap(' + i + ')" style="margin:0">'
+      + '<span style="color:var(--text-dim);min-width:16px">' + (i + 1) + '</span>'
+      + '<span style="color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+      + sensSnapTitle(s) + '</span>'
+      + '<span style="color:var(--text-dim)">' + nPt + ' 点</span>'
+      + '<span style="color:var(--text-dim)">' + (s.at ? s.at.toLocaleTimeString('zh-CN') : '') + '</span>'
+      + '<button class="btn btn-sm" onclick="removeSensSnap(' + i + ')" '
+      + 'style="padding:1px 6px;font-size:.66rem;background:none;border:1px solid var(--border);color:var(--text-dim)">✕</button>'
+      + '</div>');
+  });
+  L.push('</div>');
+  box.innerHTML = L.join('');
+}
+function selectAllSensSnaps(on) {
+  sensSnapshots.forEach(function (s) { s._sel = !!on; });
+  renderSensSnapList();
+}
+
 // 解析"起点,终点,步长"或显式逗号列表：恰好 3 个数且第三个≠0 → 按步长生成序列（含终点若落在步长上，上限 200 点）；
 // 否则视为显式档位列表；空/非法 → []。
 // param(可选, 2026-08-25): 传入 'gpu_preset' 时按**字符串列表**解析(该维度档位是 hwPresets 的 key,
@@ -6343,19 +6997,32 @@ function guardCompareParam() {
   let sp = $('sSweepParam').value, cp = $('sSweepCompareParam').value;
   if (cp && cp === sp) { $('sSweepCompareParam').value = ''; }
 }
-// 形状维度控件联动(2026-08-25): 切「预取策略/GPU硬件」时显示对应输入区;
-// 且当 GPU 已被横轴或颜色占用时, 形状不能再绑 GPU(否则同一变量控两个视觉通道) ⇒ 自动回退。
+// 形状维度控件联动(2026-08-25; 2026-08-27 开放为任意参数): 切换绑定对象时显示对应输入区,
+// 并做**三方互斥**(横轴/颜色/形状必须绑不同参数, 否则同一变量控两个视觉通道, 图例自相矛盾
+// 且白跑 N² 次仿真) ⇒ 冲突时形状回退为 'prefetch'(唯一不与扫描参数域重叠的选项)。
+// 档位输入框在切换参数时自动填该参数的默认档位 —— 否则会拿 GPU 的 key 去当数值参数档位。
 function toggleShapeDim() {
   let sd = $('sShapeDim') ? $('sShapeDim').value : 'prefetch';
   let sp = $('sSweepParam') ? $('sSweepParam').value : '';
   let cp = $('sSweepCompareParam') ? $('sSweepCompareParam').value : '';
-  if (sd === 'gpu_preset' && (sp === 'gpu_preset' || cp === 'gpu_preset')) {
+  // prefetch 不在扫描参数域内, 恒不冲突; 其余任意参数都要与横轴/颜色比对
+  if (sd !== 'prefetch' && (sd === sp || sd === cp)) {
     if ($('sShapeDim')) $('sShapeDim').value = 'prefetch';
     sd = 'prefetch';
   }
-  let pfBox = $('sShapePfBox'), gpuBox = $('sShapeVals');
+  let pfBox = $('sShapePfBox'), valBox = $('sShapeVals');
   if (pfBox) pfBox.style.display = (sd === 'prefetch') ? 'flex' : 'none';
-  if (gpuBox) gpuBox.style.display = (sd === 'gpu_preset') ? '' : 'none';
+  if (valBox) {
+    valBox.style.display = (sd === 'prefetch') ? 'none' : '';
+    // 切换参数后原档位对新参数无意义(GPU key ↔ 数值) ⇒ 自动换成新参数的默认档位。
+    // 用 _shapeDimAt 记住上次绑定对象, 只在**真的切换**时覆盖, 避免每次联动都擦掉用户手填的值。
+    if (sd !== 'prefetch' && valBox._shapeDimAt !== sd) {
+      let dv = SENS_LEVELS[sd] || [];
+      valBox.value = dv.join(',');
+      valBox._shapeDimAt = sd;
+    }
+    if (sd === 'prefetch') valBox._shapeDimAt = null;
+  }
 }
 document.addEventListener('change', function(e) {
   if (e.target && e.target.id === 'sSweepCompareParam') { guardCompareParam(); toggleShapeDim(); }
@@ -6427,18 +7094,22 @@ function runSensitivity() {
   }
 
   // 形状维度定案: shapeList = 取值列表, shapeLabelOf = 图例文案, shapeSymbolOf = 符号
+  // 2026-08-27: 由「只支持 prefetch/gpu_preset」开放为**任意扫描参数**。
+  // ⇒ 形状与横轴/颜色是完全对等的第三个自变量, 例如「横轴 L3带宽 × 颜色 前缀命中率 × 形状 输入长度」。
+  // 互斥: shapeDim 与 param/compareParam 撞车时降级为无形状维(不静默跑 N² 次重复仿真)。
   let shapeList = [], shapeLabel = '';
-  if (shapeDim === 'gpu_preset' && param !== 'gpu_preset' && compareParam !== 'gpu_preset') {
-    let shRaw = ($('sShapeVals') ? $('sShapeVals').value : '').trim();
-    shapeList = shRaw ? parseRangeOrList(shRaw, 'gpu_preset') : SENS_LEVELS.gpu_preset.slice();
-    if (!shapeList.length) shapeList = SENS_LEVELS.gpu_preset.slice();
-    shapeLabel = 'GPU硬件';
-  } else if (shapeDim === 'prefetch') {
+  if (shapeDim === 'prefetch') {
     shapeList = prefetchList;
     shapeLabel = '预取策略';
+  } else if (shapeDim && shapeDim !== param && shapeDim !== compareParam && SENS_PARAM_LABEL[shapeDim]) {
+    let shRaw = ($('sShapeVals') ? $('sShapeVals').value : '').trim();
+    shapeList = shRaw ? parseRangeOrList(shRaw, shapeDim) : (SENS_LEVELS[shapeDim] || []).slice();
+    if (!shapeList.length) shapeList = (SENS_LEVELS[shapeDim] || []).slice();
+    shapeLabel = SENS_PARAM_LABEL[shapeDim];
   }
   let hasPf = shapeList.length >= 1;   // 变量名保留(下游大量引用), 语义已推广为"形状维度启用"
-  function shapeLabelOf(sv) { return shapeDim === 'gpu_preset' ? (SENS_GPU_LABEL[sv] || String(sv)) : String(sv); }
+  // 形状档位的图例文案: prefetch 用策略名原文, 其余参数走统一的 sensParamUnit(带单位)
+  function shapeLabelOf(sv) { return shapeDim === 'prefetch' ? String(sv) : sensParamUnit(shapeDim, sv); }
   function shapeSymbolOf(si, sv) {
     return shapeDim === 'prefetch' ? (PF_SYMBOL[sv] || 'circle') : SHAPE_SYMBOLS[si % SHAPE_SYMBOLS.length];
   }
@@ -6482,7 +7153,12 @@ function runSensitivity() {
           let nameParts = [];
           if (compareParam) nameParts.push(cmpLabel(compareVals[ci]));
           if (hasPf) nameParts.push(shapeLabelOf(shapeList[pi]));
-          flatCurves.push({ recs: data, name: nameParts.join(' · '), ci: ci, pi: pi });
+          // cmpVal/shapeVal: 该曲线在颜色/形状维度上的**原始档位值**(不是显示标签)。
+          // 供 buildSensPoints 重建每个点的完整参数组合(角色无关点云) —— 必须用原始值,
+          // 因为显示标签带单位("8k tok"), 无法与其他批次的数值做等值比较。
+          flatCurves.push({ recs: data, name: nameParts.join(' · '), ci: ci, pi: pi,
+            cmpVal: compareParam ? compareVals[ci] : undefined,
+            shapeVal: hasPf ? shapeList[pi] : undefined });
         }
       }
     } else {
@@ -6738,6 +7414,15 @@ function runSensitivity() {
       curveCoords: curveCoords,
       // 堆叠分量定义快照: 导出页据此重建 6 个 bar series(颜色与顺序必须与平台一致)
       stackParts: TTFT_STACK_PARTS.map(function (p) { return { key: p.key, label: p.label, color: p.color }; }),
+      // ---- 角色无关点云(2026-08-27) ----
+      // points[i] = { params: {参数key: 值, ...}, rec: 全指标 }
+      // 与 curveRecs 的区别: curveRecs 是"曲线×档位"的**带角色**嵌套结构(谁当横轴写死了),
+      // points 则把每个点的**完整参数组合**摊平, 不含任何角色信息 ⇒ 导出页可任意重新分配
+      // 横轴/颜色/形状(见 buildSensHtml 的透视面板), 且跨批次可按 params 去重合并。
+      // ⚠️ params 只含"被扫描的维度"+"基准值不同于默认的关键参数", 完整基准见 paramsJson。
+      points: buildSensPoints(flatCurves, values, param, compareParam, shapeDim, hasPf, shapeList, baseValsOf()),
+      // 本次扫描的三个角色分配(导出页透视面板的初始状态)
+      roles: { x: param, cmp: compareParam || null, shape: hasPf ? shapeDim : null },
       descHtml: desc, strategyName: baseStrategy.name,
       dsl: baseStrategy.dsl || '', seed: gi('pSeed'),
       // 全参数快照: 导出的 HTML 附带它, 别人拿到图能复现同一次扫描
@@ -6745,9 +7430,15 @@ function runSensitivity() {
       // 参数元信息(2026-08-26): 让导出页能像平台一样**分组 + 中文标签 + 可读值**地展示
       // 参数, 而不是甩一坨 JSON。运行时从 DOM 抽取, 见 buildParamMeta 的设计说明。
       paramMeta: (function(){ try { return buildParamMeta(); } catch(e) { return {}; } })(),
+      // _cacheKey: 快照列表的去重依据(与 metric 合成 key)。加下划线前缀表示"内部字段",
+      // 不参与导出页的任何展示。
+      _cacheKey: cacheKey,
       at: new Date()
     };
     setSensExportEnabled(true);
+    // 自动收录进快照列表(2026-08-27): 平台仍只展示当前这一次扫描, 但列表把历次攒起来,
+    // 导出 HTML 时可勾选多条打包进同一个文件(见 collectSensSnapshot 的设计说明)。
+    try { collectSensSnapshot(sensExportState); } catch (e) {}
     if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
     // 注意: 不要清空 chartEl.innerHTML——echarts.init 已接管元素并渲染 canvas, 清空会销毁图表
   }
@@ -6763,6 +7454,18 @@ function runSensitivity() {
   formulaEl.innerHTML = '';
 
   // ===== 任务列表(与旧 setTimeout 循环同顺序 ci→pi→idx): 点级缓存命中直接填充, 未命中进 jobs =====
+  //
+  // ★★ 2026-08-27 角色无关化改造 ★★
+  // 原实现有两个问题, 都源于「把参数的视觉角色写进了数据」:
+  //   ① 三份几乎相同的 if 链(横轴/颜色/形状各一份) —— 加一个可扫描参数要改三处, 必然漂移
+  //   ② 点级缓存 key 含 param/compareParam/shapeDim **参数名** ⇒ 角色互换后 key 不同、
+  //      不命中、白重跑。而单点仿真只依赖「参数的实际值」, 与「谁当横轴/颜色/形状」无关:
+  //      扫描1(横轴 ssd_bw × 颜色 prefix_hit × 形状 input_len) 与
+  //      扫描2(横轴 ssd_bw × 颜色 input_len × 形状 prefix_hit) 的点集**完全相同**。
+  // 改法: 抽出 applyParamVal(s, ov, key, val) 做唯一的参数落地入口(三个角色共用),
+  //       key 改为 [策略s, overrides排序序列化, seed] —— 即**完整仿真输入指纹**。
+  //       ⇒ 角色互换 / 横轴与颜色互换 / 档位范围重叠, 一律命中缓存零重跑。
+  // ⚠️ 顺序要求: 必须先构造 s/overrides 再算 key(原实现是先算 key 后构造, 已重排)。
   let jobs = [], filled = 0, cancelled = false;
   for (let _ci = 0; _ci < (compareParam ? compareVals.length : 1); _ci++) {
     for (let _pi = 0; _pi < (hasPf ? shapeList.length : 1); _pi++) {
@@ -6770,43 +7473,33 @@ function runSensitivity() {
         let v = values[_idx];
         let cv = compareParam ? compareVals[_ci] : null;
         let pf = hasPf ? shapeList[_pi] : null;
-        // 点级缓存：单个参数组合(扫描值×对比值×形状值×种子)跨批次复用——改档位范围时重叠点直接命中
-        // ⚠️ key 必须含 shapeDim: 否则「形状=预取策略的 wait_complete」与「形状=GPU 的某档」
-        //    在 pf 字符串不同的情况下虽不会真撞, 但改绑定后语义已变, 显式带上更稳。
-        let pointKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name, param, v, compareParam, cv, shapeDim, pf, gi('pSeed')]);
+        let s = JSON.parse(JSON.stringify(baseStrategy));
+        let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
+        // 三个视觉角色共用同一个落地函数 —— 落地顺序 横轴 → 颜色 → 形状 与原实现一致
+        // (后写覆盖先写; 三者已做互斥判定, 正常不会撞同一字段)
+        applyParamVal(s, overrides, param, v);
+        if (compareParam) applyParamVal(s, overrides, compareParam, cv);
+        if (hasPf) {
+          // 'prefetch' 是唯一的非扫描参数维度(改策略对象的 prefetch.type), 单独分派;
+          // 其余任意参数走与横轴/颜色**完全相同**的落地路径
+          if (shapeDim === 'prefetch') s.prefetch.type = PF_TYPE[pf]; // wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
+          else applyParamVal(s, overrides, shapeDim, pf);
+        }
+        // 角色无关的点级缓存 key = 完整仿真输入指纹(全局参数 + 策略 + 参数覆盖 + 种子)。
+        // ★ paramsFp 必须在内: s/overrides 只含**被扫描的**参数, 模型/dtype/卡数等全局参数
+        //   不在其中 —— 少了它, 换个模型重跑会误命中上个模型的结果(静默给出错误曲线)。
+        // ★ overrides 用 sortedJson 序列化: 对象字面量的键序随赋值顺序变(横轴/颜色互换会导致
+        //   {prefixHit,ssdBW} vs {ssdBW,prefixHit}), 不排序则同一输入产生两个 key ⇒ 仍不命中。
+        // ★ 剔除 s.name: 它是纯展示字段(改个策略名不改任何语义), 留着会让重命名后全部失配。
+        //   s.dsl 保留 —— 那才是调度语义的权威来源。
+        let sFp = JSON.parse(JSON.stringify(s)); delete sFp.name;
+        let pointKey = sortedJson([paramsFp, sFp, overrides]);
         let hit = sensPointCache[pointKey];
         if (hit !== undefined) {
           if (hasPf) { if (compareParam) results[_ci][_pi][_idx] = hit; else results[_pi][_idx] = hit; }
           else if (compareParam) results[_ci][_idx] = hit; else results[_idx] = hit;
           filled++;
           continue;
-        }
-        let s = JSON.parse(JSON.stringify(baseStrategy));
-        let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
-        if (param === 'hbm_threshold') s.admission.hbm_threshold = v / 100;
-        if (param === 'evict_threshold') s.eviction.hbm_evict_threshold = v / 100;
-        if (param === 'prefetch_threshold') s.prefetch.prefetch_threshold = v / 100;
-        if (param === 'max_batch_size') s.batching.max_batch_size = v;
-        if (param === 'prefix_hit') overrides.prefixHit = v / 100; // 全局负载参数，经overrides注入
-        if (param === 'ssd_bw') overrides.ssdBW = v; // 硬件参数，经overrides注入
-        if (param === 'input_len') overrides.inputLen = v; // 负载参数：平均输入长度
-        if (param === 'qps') overrides.qps = v;            // 负载参数：到达率
-        if (param === 'concurrency') overrides.nreq = v;   // 负载参数：并发请求数(单批基准的 batch 规模)
-        if (param === 'gpu_preset') overrides.hwPreset = v; // 硬件预设(2026-08-25): runSimulation 内套字段并重算 a/b
-        if (compareParam === 'hbm_threshold') s.admission.hbm_threshold = cv / 100;
-        if (compareParam === 'evict_threshold') s.eviction.hbm_evict_threshold = cv / 100;
-        if (compareParam === 'prefetch_threshold') s.prefetch.prefetch_threshold = cv / 100;
-        if (compareParam === 'max_batch_size') s.batching.max_batch_size = cv;
-        if (compareParam === 'prefix_hit') overrides.prefixHit = cv / 100;
-        if (compareParam === 'ssd_bw') overrides.ssdBW = cv;
-        if (compareParam === 'input_len') overrides.inputLen = cv;
-        if (compareParam === 'qps') overrides.qps = cv;
-        if (compareParam === 'concurrency') overrides.nreq = cv;
-        if (compareParam === 'gpu_preset') overrides.hwPreset = cv;
-        // 形状维度落地(2026-08-25): 按绑定对象分派 —— 预取策略改策略对象, GPU 走 overrides
-        if (hasPf) {
-          if (shapeDim === 'prefetch') s.prefetch.type = PF_TYPE[pf]; // wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
-          else if (shapeDim === 'gpu_preset') overrides.hwPreset = pf;
         }
         jobs.push({ key: pointKey, ci: _ci, pi: _pi, idx: _idx, s: s, overrides: overrides });
       }
@@ -6962,6 +7655,10 @@ function init(){
   // 策略仿真结果区初始占位（运行入口在结果卡片内）
   let mg = $('strategyMetricsGrid');
   if (mg) mg.innerHTML = '<div style="color:var(--text-dim);padding:10px 0;grid-column:1/-1;font-size:.8rem">暂无结果 —— 点击上方「▶️ 运行当前策略」或「📋 运行全部已保存」开始仿真（同一策略×参数只跑一次，结果缓存）</div>';
+  // 扫描快照列表与形状维控件的初始态(2026-08-27): 不初始化的话空列表区没有引导文案,
+  // 且形状维档位输入框的显隐会停在 HTML 的静态默认值上
+  try { renderSensSnapList(); } catch (e) {}
+  try { toggleShapeDim(); } catch (e) {}
 }
 
 document.addEventListener('DOMContentLoaded',init);
