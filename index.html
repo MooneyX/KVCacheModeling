@@ -5624,15 +5624,6 @@ function buildSensHtml(snapList) {
   // 透视只在"点云非空 且 至少有一个多取值参数"时有意义
   let pivotDims = Object.keys(pivotIndex).filter(function (k) { return pivotIndex[k].vals.length > 1; });
   let hasPivot = pivotPts.length > 0 && pivotDims.length > 0;
-  // 批次摘要(批次选择器 / 批次聚焦快捷用)
-  let snapMeta = snaps.map(function (sn) {
-    return {
-      title: (function () { try { return sensSnapTitle(sn); } catch (e) { return sn.paramLabel + ' → ' + sn.metricLabel; } })(),
-      x: sn.param, cmp: sn.compareParam || null, shape: (sn.hasPf ? sn.shapeDim : null),
-      metric: sn.metric, at: (sn.at ? sn.at.toLocaleString('zh-CN') : ''),
-      n: (sn.points || []).length
-    };
-  });
 
   let L = [];
   L.push('<!DOCTYPE html>');
@@ -5682,39 +5673,23 @@ function buildSensHtml(snapList) {
   L.push('.chip{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:.71rem;cursor:pointer}');
   L.push('.chip:hover{border-color:var(--accent);color:var(--text)}');
   L.push('.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}');
-  // 维度筛选区: 每个维度一行(标签 + 档位 chip 组 + 全选/反选)
+  // 统一筛选面板: 角色下拉行 + 每个可调参数一行(标签 + 档位 chip 组 + 全选/反选)
   L.push('.fbar{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}');
-  L.push('.frow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px}');
-  L.push('.frow>b{font-size:.73rem;color:var(--text);min-width:78px;font-weight:600}');
   // 档位 chip 用方角以区别于上方圆角的「指标」chip —— 两组 chip 语义不同, 视觉需可分辨
   L.push('.fc{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:5px;padding:2px 9px;font-size:.71rem;cursor:pointer;font-variant-numeric:tabular-nums}');
   L.push('.fc:hover{border-color:var(--accent2);color:var(--text)}');
   L.push('.fc.on{background:rgba(52,211,153,.16);border-color:var(--accent2);color:var(--accent2);font-weight:600}');
   L.push('.fmini{background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:5px;padding:2px 7px;font-size:.68rem;cursor:pointer}');
   L.push('.fmini:hover{border-color:var(--accent);color:var(--text)}');
-  L.push('.fnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}');
   L.push('.fwarn{color:#f59e0b}');
-  // 参数透视面板(2026-08-27): 与筛选区同源的视觉语言, 但用第二强调色(青)区分"重新分配角色"
-  L.push('.pvbar{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}');
-  L.push('.pvhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}');
-  // 标题(取代原来的开关 label) —— 面板已常驻, 不再需要复选框
-  L.push('.pvttl{color:#06b6d4;font-size:.78rem;font-weight:600}');
-  L.push('.pvhint{font-size:.7rem;color:var(--text-dim)}');
+  // 统一筛选面板(2026-08-27 三次改造): 角色下拉 + 可调参数勾选都收进 fbar 这一块。
   L.push('.pvrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:7px 0}');
   L.push('.pvrow>b{font-size:.73rem;color:var(--text);min-width:52px;font-weight:600}');
-  L.push('.pvvals{border-top:1px dashed var(--border);margin-top:8px;padding-top:6px}');
-  L.push('.pvvals .pvrow>b{min-width:92px}');
-  L.push('.pvfix{font-size:.71rem;color:var(--text-dim);background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:2px 9px}');
-  // 单值参数说明条: 回答"为什么这个参数灰着不能选"(2026-08-27 用户反馈)
-  L.push('.pvtip{font-size:.71rem;color:var(--text-dim);background:rgba(6,182,212,.07);border-left:3px solid #06b6d4;border-radius:5px;padding:6px 9px;margin:6px 0 8px;line-height:1.6}');
-  L.push('.pvtip b{color:var(--text)}');
   L.push('.pvnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}');
-  // 透视激活时高亮整块, 让人清楚"现在看的不是原始批次视图"
-  L.push('.pvbar.on{background:rgba(6,182,212,.05);border-radius:6px;padding:10px}');
-  L.push('.pvbar.on .fc.on{background:rgba(6,182,212,.16);border-color:#06b6d4;color:#06b6d4}');
   // .live = 透视引擎已接管图表(用户动过面板)。加左侧色条明确区分"面板可用"与"正在生效",
   // 否则用户分不清眼前这张图是原图还是透视结果。
-  L.push('.pvbar.live{border-left:3px solid #06b6d4}');
+  L.push('.fbar.live{border-left:3px solid #06b6d4;padding-left:8px}');
+  L.push('.fbar.live .fc.on{background:rgba(6,182,212,.16);border-color:#06b6d4;color:#06b6d4}');
   L.push('</style></head><body><div class="wrap">');
   L.push('<h1>参数<span>敏感性</span>分析</h1>');
   L.push('<p class="sub">' + dimsHtml + '<br>基准策略 <b>' + esc(st.strategyName)
@@ -5745,65 +5720,28 @@ function buildSensHtml(snapList) {
       + '共 ' + metricKeys.length + ' 个指标 · 同一批仿真结果，切换零重算</span>');
     L.push('</div>');
   }
-  // ===== 维度筛选区(2026-08-26) =====
-  // 只在"确实有多个档位可筛"时才出现 —— 单档位维度给不出任何筛选价值, 只是噪音。
-  // 每行一个维度: 维度名 + 档位 chip 组(多选) + 全选/反选。
-  // 典型用法: 横轴 L3带宽 × 形状 GPU硬件 的图里, 把 GPU 只勾 H20 ⇒ 单独研究带宽影响。
-  let SD = st.sensDims || null;
-  let filterDims = [];
-  if (SD) {
-    // x 维度也可筛(缩小横轴范围, 例如只看 50~200GB/s 段)
-    if (SD.x && SD.x.vals.length > 1) filterDims.push({ id: 'x', d: SD.x });
-    if (SD.cmp && SD.cmp.vals.length > 1) filterDims.push({ id: 'cmp', d: SD.cmp });
-    if (SD.shape && SD.shape.vals.length > 1) filterDims.push({ id: 'shape', d: SD.shape });
-  }
-  // 至少要有一个"曲线维"(cmp/shape)才值得给筛选区 —— 只有 x 一维时图上本就只有 1 条线/1 组柱,
-  // 筛横轴不解决"线太多难区分"的问题, 反而多一排控件。
-  let hasCurveDim = filterDims.some(function (f) { return f.id !== 'x'; });
-  let hasFilter = hasCurveDim;
-  if (hasFilter) {
-    L.push('<div class="fbar" id="fbar">');
-    filterDims.forEach(function (f) {
-      L.push('<div class="frow" data-dim="' + esc(f.id) + '">');
-      L.push('<b>' + esc(f.d.label) + (f.id === 'x' ? '（横轴）' : '') + '</b>');
-      L.push(f.d.texts.map(function (t, i) {
-        return '<button class="fc on" data-dim="' + esc(f.id) + '" data-i="' + i + '">'
-          + esc(t) + '</button>';
-      }).join(''));
-      L.push('<button class="fmini" data-act="all" data-dim="' + esc(f.id) + '">全选</button>');
-      L.push('<button class="fmini" data-act="inv" data-dim="' + esc(f.id) + '">反选</button>');
-      L.push('</div>');
-    });
-    L.push('<div class="frow"><b></b><span class="fnote" id="fNote"></span></div>');
-    L.push('</div>');
-  }
-  // ===== 参数透视面板(2026-08-27) =====
-  // 与上方「维度筛选」的区别(两者并存但语义不同):
-  //   · 维度筛选 fbar —— 在**当前批次的既有角色分配**下做减法(勾掉某档位)
-  //   · 参数透视 pbar —— **重新分配角色**(任意参数当横轴/颜色/形状)并跨批次取数
+  // ===== 统一筛选面板(2026-08-27 三次改造) =====
+  // 沿革: ①最初是「维度筛选」fbar(按原批次的横轴/颜色/形状角色做减法);
+  //   ②后来加了独立的「参数透视」pvbar(角色无关点云 + 重新分配角色), 两块并存;
+  //   ③现在按用户要求合并 —— **拆掉 pvbar 整块卡片**, 只在绿色 fbar 里放:
+  //     · 第一行: 横轴/颜色/形状 角色下拉 + 状态提示 + 「↺ 恢复原图」
+  //     · 其后每行: 一个**可调参数**(本文件数据里取值 ≥2 个)的档位勾选 chips
+  //   单值参数**完全不显示**(用户明确: 无法调节的参数不显示);
+  //   批次聚焦 chips 也一并移除(等价操作 = 勾选该批次对应的参数取值)。
   //
-  // ★★ 2026-08-27 二次改造: 去掉「参数透视」开关, 面板**常驻展开**直接列出全部参数。
-  // 动机(用户): 开关是一道无谓的门 —— 收图的人打开文件先看到一个折叠的复选框,
-  //   根本不知道里面有能力。默认摊开才能"一眼看到有哪些参数可调"。
-  // 但不能简单地"默认开启透视", 因为透视渲染有两处与原图不同:
-  //   ① 堆叠柱(ttft_stack)在透视下退回折线 —— 会丢掉一张信息量最大的图
-  //   ② 原图是平台 opt 的逐字快照("导出的就是你看到的那张图"是既有承诺)
-  // ⇒ 采用**懒激活**: 面板可见但引擎待命, 初始仍渲染原图; 用户**一旦动了面板**
-  //   (改角色下拉 / 勾档位 / 点批次)才切到透视, 并出现「↺ 恢复原图」按钮可退回。
-  //   这样既满足"默认列出全部参数", 又不牺牲任何既有能力。
+  // 旧「维度筛选」(SENS_DIMS/data-dim chips)整体下线 —— 它的能力(固定某维度档位
+  // 看另一维度)是透视勾选的子集: 透视面板里勾掉同一些档位即可达到同样效果,
+  // 且还能跨批次。页内投影函数(viewXIdx/viewCurves 等)保留 —— 原图渲染仍走它们
+  // (SEL 恒为 null ⇒ 恒等投影), 只是不再有 UI 去改 SEL。
+  //
+  // 懒激活保留: 面板可见但引擎待命, 初始渲染平台原图(堆叠柱能力不丢);
+  // 用户一旦动了面板(改角色/勾档位/全选反选)才 pvEnter() 接管, 出现「恢复原图」。
+  let pivHint = pivotPts.length + ' 个参数组合'
+    + (multi ? ' · 合并自 ' + snaps.length + ' 次扫描' : '')
+    + (dupCount ? ' · 去重 ' + dupCount + ' 个' : '');
   if (hasPivot) {
-    L.push('<div class="pvbar on" id="pvbar">');
-    L.push('<div class="pvhead">');
-    L.push('<b class="pvttl">🔀 参数透视</b>');
-    L.push('<span class="pvhint">' + pivotPts.length + ' 个参数组合'
-      + (multi ? ' · 合并自 ' + snaps.length + ' 次扫描' : '')
-      + (dupCount ? ' · 去重 ' + dupCount + ' 个' : '')
-      + ' —— 数据以角色无关点云存储，可任意指定哪个参数当横轴／颜色／形状</span>');
-    // 恢复原图: 只在已进入透视后出现(初始隐藏)。它是"② 原图承诺"的兜底。
-    L.push('<button class="fmini" id="pvReset" style="display:none;margin-left:auto">↺ 恢复原图</button>');
-    L.push('</div>');
-    L.push('<div id="pvBody">');
-    // 角色分配下拉: 横轴必选, 颜色/形状可空
+    L.push('<div class="fbar" id="fbar">');
+    // 角色分配下拉: 横轴必选, 颜色/形状可空。选项只含可调参数(pivotDims)。
     let optsOf = function (sel, allowNone) {
       let o = allowNone ? ['<option value="">无</option>'] : [];
       pivotDims.forEach(function (k) {
@@ -5821,50 +5759,26 @@ function buildSensHtml(snapList) {
     L.push('<b>横轴</b><select id="pvX">' + optsOf(iniX, false) + '</select>');
     L.push('<b>颜色</b><select id="pvC">' + optsOf(iniC, true) + '</select>');
     L.push('<b>形状</b><select id="pvS">' + optsOf(iniS, true) + '</select>');
-    L.push('<span class="pvnote" id="pvNote"></span>');
+    // 「恢复原图」只在已接管时有意义(初始隐藏)
+    L.push('<button class="fmini" id="pvReset" style="display:none">↺ 恢复原图</button>');
+    L.push('<span class="pvnote" id="pvNote">' + esc(pivHint) + ' —— 改动任一项即按所选角色重绘</span>');
     L.push('</div>');
-    // 批次聚焦快捷: 一键还原某次扫描的角色分配(多批次时才有意义)
-    if (multi) {
-      L.push('<div class="pvrow"><b>批次</b>');
-      snapMeta.forEach(function (m, i) {
-        L.push('<button class="fc" data-snap="' + i + '" title="' + esc(m.title + ' · ' + m.n + ' 点 · ' + m.at)
-          + '">' + esc('#' + (i + 1) + ' ' + m.title) + '</button>');
-      });
-      L.push('<span class="pvnote">点击可还原该次扫描的角色分配</span></div>');
-    }
-    // 参数值勾选区: 每个参数一行。多取值参数可勾选, 单值参数标灰仅展示。
-    // ★ 2026-08-27 补提示: 用户反馈"为什么无法选择输入长度" —— 根因是该参数在本次
-    //   导出的批次里**只有一个取值**(如两次扫描只改了 pInputLen 却分别单独导出)。
-    //   原先只是静静地标灰, 读者无从知道"要怎样才能选" ⇒ 现在显式说明单值原因与解法。
-    L.push('<div class="pvvals" id="pvVals">');
-    let nSingle = Object.keys(pivotIndex).filter(function (k) { return pivotIndex[k].vals.length <= 1; }).length;
-    if (nSingle) {
-      L.push('<div class="pvtip">ⓘ 灰色参数在本文件的数据里只有<b>一个取值</b>，故不可勾选、也不能当横轴／颜色／形状。'
-        + '若想让某个参数可选：在平台里<b>用不同取值各跑一次扫描</b>，然后在「已收集扫描」列表中<b>同时勾选这些批次</b>再导出'
-        + (multi ? '（本文件已含 ' + snaps.length + ' 次扫描）' : '（本文件仅含 1 次扫描）') + '。</div>');
-    }
-    Object.keys(pivotIndex).forEach(function (k) {
+    // 可调参数勾选区: 每行一个参数。**只列多值参数**(pivotDims 即取值 ≥2 的参数集)
+    L.push('<div id="pvVals">');
+    pivotDims.forEach(function (k) {
       let d = pivotIndex[k];
-      let single = d.vals.length <= 1;
       L.push('<div class="pvrow" data-pk="' + esc(k) + '">');
       L.push('<b>' + esc(d.label) + '</b>');
-      if (single) {
-        // 单值参数: 全批次同值, 勾选无意义 ⇒ 只展示(仍需展示, 否则读者不知道这个点的完整配置)
-        // title 里说明为何不可选, 避免被误认为功能失效
-        L.push('<span class="pvfix" title="本文件数据中该参数只有这一个取值 —— 想让它可选, 需用不同取值各跑一次扫描并一并导出">'
-          + esc(d.texts[0] != null ? d.texts[0] : '') + '</span>');
-      } else {
-        L.push(d.vals.map(function (v, i) {
-          return '<button class="fc on" data-pk="' + esc(k) + '" data-vi="' + i + '">'
-            + esc(d.texts[i]) + '</button>';
-        }).join(''));
-        L.push('<button class="fmini" data-pact="all" data-pk="' + esc(k) + '">全选</button>');
-        L.push('<button class="fmini" data-pact="inv" data-pk="' + esc(k) + '">反选</button>');
-      }
+      L.push(d.vals.map(function (v, i) {
+        return '<button class="fc on" data-pk="' + esc(k) + '" data-vi="' + i + '">'
+          + esc(d.texts[i]) + '</button>';
+      }).join(''));
+      L.push('<button class="fmini" data-pact="all" data-pk="' + esc(k) + '">全选</button>');
+      L.push('<button class="fmini" data-pact="inv" data-pk="' + esc(k) + '">反选</button>');
       L.push('</div>');
     });
     L.push('</div>');
-    L.push('</div></div>');
+    L.push('</div>');
   }
   L.push('<div id="chart"></div></div>');
   L.push('<div class="card"><div class="box"><b>📐 敏感度分析方法</b><br>' + st.descHtml
@@ -5975,8 +5889,8 @@ function buildSensHtml(snapList) {
     L.push('</div>');
   }
   L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放'
-    + (hasSwitch ? ' / 指标切换' : '') + (hasFilter ? ' / 维度筛选' : '')
-    + (hasPivot ? ' / 参数透视' : '')
+    + (hasSwitch ? ' / 指标切换' : '')
+    + (hasPivot ? ' / 参数筛选与角色切换' : '')
     + '）需联网加载 echarts；离线时数据表仍完整可用'
     + (multi ? ' · 本文件含 ' + snaps.length + ' 次扫描的数据' : '') + '</p>');
   L.push('</div>');
@@ -6011,19 +5925,12 @@ function buildSensHtml(snapList) {
   L.push('var LINE_X_NAME = ' + safeJson(st.paramLabel) + ';');
   L.push('var STACK_X_NAME = ' + safeJson((st.lineTpl && st.lineTpl.length > 1)
     ? (st.paramLabel + ' × 场景') : st.paramLabel) + ';');
-  // ---- 维度筛选(2026-08-26) ----
-  // SENS_DIMS: {x, cmp, shape} 三维的档位值/标签; CURVE_COORDS[i] = 第 i 条曲线的 (ci,pi) 坐标
-  // SEL: 当前勾选状态(下标数组), 初始全选。筛选**只做减法**, 不重算仿真。
-  L.push('var SENS_DIMS = ' + safeJson(SD || {}) + ';');
+  // ---- 原图投影(2026-08-27 简化) ----
+  // CURVE_COORDS[i] = 第 i 条曲线的 (ci,pi) 坐标。SEL 是旧「维度筛选」的勾选状态,
+  // 该 UI 已下线(能力被透视勾选覆盖) ⇒ SEL 恒为 null, viewXIdx/viewCurves 退化为
+  // 恒等投影(全部保留)。投影函数本身保留 —— 原图渲染(折线/堆叠柱/数据表)仍走它们。
   L.push('var CURVE_COORDS = ' + safeJson(st.curveCoords || []) + ';');
-  L.push('var HAS_FILTER = ' + (hasFilter ? 'true' : 'false') + ';');
   L.push('var SEL = {x:null,cmp:null,shape:null};');
-  L.push('(function(){');
-  L.push('  ["x","cmp","shape"].forEach(function(k){');
-  L.push('    var d = SENS_DIMS[k];');
-  L.push('    SEL[k] = d ? d.vals.map(function(_,i){ return i; }) : null;');
-  L.push('  });');
-  L.push('})();');
   // 重建 tooltip formatter: 与平台内实现等价(图例小图标随 series.symbol 变化)
   L.push('function symbolMarker(sym,color){');
   L.push('  var W=\'width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"\';');
@@ -6222,11 +6129,9 @@ function buildSensHtml(snapList) {
   L.push('  var chips = document.querySelectorAll(".chip[data-m]");');
   L.push('  for(var i=0;i<chips.length;i++){ chips[i].className = "chip" + (chips[i].getAttribute("data-m")===k ? " on" : ""); }');
   L.push('  renderTable();');
-  // 切指标(尤其折线↔堆叠柱)后筛选提示的口径要跟着变: 折线报"曲线 n/N", 堆叠柱报"柱 n/N"
-  L.push('  if(HAS_FILTER) updateFNote();');
   L.push('}');
-  // ===== rebuildAll: 按当前 CUR_IS_STACK + 筛选状态**全量重建** option =====
-  // 被两处调用: ①applyMetric 的类型切换分支 ②维度筛选变更。
+  // ===== rebuildAll: 按当前 CUR_IS_STACK **全量重建** option =====
+  // 被两处调用: ①applyMetric 的类型切换分支 ②透视退出时还原原图。
   // 两者都改变 series 数量/x轴长度 ⇒ 都必须 notMerge, 逻辑完全一致, 故合并成一处。
   L.push('function rebuildAll(k){');
   L.push('  if(!ch) return;');
@@ -6253,67 +6158,6 @@ function buildSensHtml(snapList) {
   L.push('    textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;');
   L.push('  ch.setOption(OPT, true);');
   L.push('}');
-  // ===== 维度筛选交互 =====
-  L.push('function fCount(){ return {c: viewCurves().length, x: viewXIdx().length, s: viewSceneIdx().length}; }');
-  // updateFNote: 提示文案的唯一生成处 —— 被 applyFilter 与 applyMetric 共用。
-  // 口径随当前图形而变: 折线报"曲线 n/N", 堆叠柱报"柱 n/N"(柱数 = 曲线数 × 档位数)。
-  L.push('function updateFNote(){');
-  L.push('  var note = document.getElementById("fNote"); if(!note) return;');
-  L.push('  var n = fCount(), tot = LINE_TPL.length, totX = LINE_LABELS.length;');
-  L.push('  note.className = "fnote";');
-  L.push('  var parts = [];');
-  L.push('  if(CUR_IS_STACK) parts.push("柱 " + n.s + "/" + (tot*totX));');
-  L.push('  else parts.push("曲线 " + n.c + "/" + tot);');
-  L.push('  parts.push("横轴档位 " + n.x + "/" + totX);');
-  L.push('  var full = (n.c===tot && n.x===totX);');
-  L.push('  note.textContent = "显示 " + parts.join(" · ") + (full ? "（全部）" : "（已筛选）");');
-  L.push('}');
-  L.push('function applyFilter(){');
-  L.push('  var n = fCount();');
-  // 全不选(某维度勾空)时不重绘 —— 空图没有意义, 且会让人以为数据丢了。给出提示并保持原图。
-  L.push('  if(n.c === 0 || n.x === 0){');
-  L.push('    var w = document.getElementById("fNote");');
-  L.push('    if(w){ w.className = "fnote fwarn"; w.textContent = "⚠ 每个维度至少保留 1 个档位（当前选择为空，图表未变）"; }');
-  L.push('    return;');
-  L.push('  }');
-  L.push('  rebuildAll(CUR_METRIC);');
-  L.push('  renderTable();');
-  L.push('  updateFNote();');
-  L.push('}');
-  L.push('(function(){');
-  L.push('  if(!HAS_FILTER) return;');
-  L.push('  var bar = document.getElementById("fbar"); if(!bar) return;');
-  // 档位 chip: 点击切换该档位的勾选状态
-  L.push('  var fcs = document.querySelectorAll(".fc[data-dim]");');
-  L.push('  for(var i=0;i<fcs.length;i++){ (function(el){');
-  L.push('    el.addEventListener("click", function(){');
-  L.push('      var dim = el.getAttribute("data-dim"), idx = parseInt(el.getAttribute("data-i"),10);');
-  L.push('      var s = SEL[dim]; if(!s) return;');
-  L.push('      var at = s.indexOf(idx);');
-  L.push('      if(at>=0) s.splice(at,1); else { s.push(idx); s.sort(function(a,b){return a-b;}); }');
-  L.push('      el.className = "fc" + (s.indexOf(idx)>=0 ? " on" : "");');
-  L.push('      applyFilter();');
-  L.push('    });');
-  L.push('  })(fcs[i]); }');
-  // 全选 / 反选
-  L.push('  var mn = document.querySelectorAll(".fmini[data-act]");');
-  L.push('  for(var j=0;j<mn.length;j++){ (function(el){');
-  L.push('    el.addEventListener("click", function(){');
-  L.push('      var dim = el.getAttribute("data-dim"), act = el.getAttribute("data-act");');
-  L.push('      var d = SENS_DIMS[dim]; if(!d) return;');
-  L.push('      if(act==="all") SEL[dim] = d.vals.map(function(_,i){ return i; });');
-  L.push('      else { var old = SEL[dim]||[]; SEL[dim] = d.vals.map(function(_,i){ return i; }).filter(function(i){ return old.indexOf(i)<0; }); }');
-  L.push('      var cs = document.querySelectorAll(\'.fc[data-dim="\'+dim+\'"]\');');
-  L.push('      for(var q=0;q<cs.length;q++){');
-  L.push('        var ii = parseInt(cs[q].getAttribute("data-i"),10);');
-  L.push('        cs[q].className = "fc" + (SEL[dim].indexOf(ii)>=0 ? " on" : "");');
-  L.push('      }');
-  L.push('      applyFilter();');
-  L.push('    });');
-  L.push('  })(mn[j]); }');
-  // 初始提示文案(显示"全部")
-  L.push('  updateFNote();');
-  L.push('})();');
   L.push('(function(){');
   L.push('  var sel = document.getElementById("mSel");');
   L.push('  if(sel) sel.addEventListener("change", function(){ applyMetric(sel.value); });');
@@ -6338,8 +6182,9 @@ function buildSensHtml(snapList) {
   L.push('var PIVOT_PTS = ' + safeJson(hasPivot ? pivotPts : []) + ';');
   L.push('var PIVOT_IDX = ' + safeJson(hasPivot ? pivotIndex : {}) + ';');
   L.push('var PIVOT_DIMS = ' + safeJson(hasPivot ? pivotDims : []) + ';');
-  L.push('var SNAP_META = ' + safeJson(snapMeta) + ';');
   L.push('var HAS_PIVOT = ' + (hasPivot ? 'true' : 'false') + ';');
+  // 面板待机时的提示文案(含点云规模信息) —— pvToggle(false) 退回原图时也恢复成它
+  L.push('var PV_HINT = ' + safeJson(pivHint + ' —— 改动任一项即按所选角色重绘') + ';');
   L.push('var PV_ON = false;');
   // PV_SEL[参数key] = 勾选的取值下标数组(初始全选)
   L.push('var PV_SEL = {};');
@@ -6535,25 +6380,23 @@ function buildSensHtml(snapList) {
   L.push('  if(es && es.value!==s) es.value = s;');
   L.push('  PV_ROLE.x = x; PV_ROLE.c = c||null; PV_ROLE.s = s||null;');
   L.push('}');
-  // ---- 透视的进入/退出(2026-08-27 改为懒激活, 无开关) ----
-  // pvToggle(on) 语义保留(内部与验证脚本都在用), 但触发方式变了:
-  //   · 面板**常驻可见**, 不再由复选框控制显隐
-  //   · on=true  ⇒ 接管图表(隐藏原 fbar, 显示「恢复原图」)
-  //   · on=false ⇒ 交还给原路径(rebuildAll 重画平台那张图, 恢复 fbar)
+  // ---- 透视的进入/退出(懒激活, 无开关) ----
+  // pvToggle(on) 语义保留(内部与验证脚本都在用):
+  //   · on=true  ⇒ 接管图表(fbar 加 .live 色条, 显示「恢复原图」)
+  //   · on=false ⇒ 交还给原路径(rebuildAll 重画平台那张图)
+  //   fbar 始终可见 —— 它就是面板本体(2026-08-27 三次改造后不再有独立 pvbar)。
   L.push('function pvToggle(on){');
   L.push('  PV_ON = !!on;');
-  L.push('  var bar = document.getElementById("pvbar");');
-  L.push('  if(bar) bar.className = "pvbar on" + (PV_ON ? " live" : "");');
-  // 原「维度筛选」区在透视模式下会误导(它筛的是原批次的角色) ⇒ 接管时隐藏
-  L.push('  var fb = document.getElementById("fbar"); if(fb) fb.style.display = PV_ON ? "none" : "";');
+  L.push('  var bar = document.getElementById("fbar");');
+  L.push('  if(bar) bar.className = "fbar" + (PV_ON ? " live" : "");');
   // 「恢复原图」只在已接管时有意义
   L.push('  var rb = document.getElementById("pvReset"); if(rb) rb.style.display = PV_ON ? "" : "none";');
   L.push('  if(PV_ON){ pvSyncRoles("x"); pvRebuild(); }');
   L.push('  else {');
-  L.push('    rebuildAll(CUR_METRIC); renderTable(); if(HAS_FILTER) updateFNote();');
+  L.push('    rebuildAll(CUR_METRIC); renderTable();');
   // 退回原图后清掉透视提示, 免得停留在上一次的"曲线 n 条"读数上引起误解
   L.push('    var nt = document.getElementById("pvNote");');
-  L.push('    if(nt){ nt.className = "pvnote"; nt.textContent = "面板可用 —— 改动任一项即按新角色重绘"; }');
+  L.push('    if(nt){ nt.className = "pvnote"; nt.textContent = PV_HINT; }');
   L.push('  }');
   L.push('}');
   // pvEnter: 懒激活入口 —— 面板任一交互都先调它。已激活则只重绘。
@@ -6599,38 +6442,6 @@ function buildSensHtml(snapList) {
     L.push('      pvEnter();');
     L.push('    });');
     L.push('  })(pms[j]); }');
-    // 批次聚焦: 还原该次扫描的角色分配, 并把非角色参数收窄到该批次实际用过的取值
-    L.push('  var sbs = document.querySelectorAll(".fc[data-snap]");');
-    L.push('  for(var m=0;m<sbs.length;m++){ (function(el){');
-    L.push('    el.addEventListener("click", function(){');
-    L.push('      var si = parseInt(el.getAttribute("data-snap"),10);');
-    L.push('      var meta = SNAP_META[si]; if(!meta) return;');
-    L.push('      var ex = document.getElementById("pvX"), ec2 = document.getElementById("pvC"), es = document.getElementById("pvS");');
-    L.push('      if(ex && PIVOT_DIMS.indexOf(meta.x)>=0) ex.value = meta.x;');
-    L.push('      if(ec2) ec2.value = (meta.cmp && PIVOT_DIMS.indexOf(meta.cmp)>=0) ? meta.cmp : "";');
-    L.push('      if(es) es.value = (meta.shape && PIVOT_DIMS.indexOf(meta.shape)>=0) ? meta.shape : "";');
-    // 勾选收窄到该批次的点实际覆盖的取值 —— 否则会把其他批次的点混进来
-    L.push('      Object.keys(PIVOT_IDX).forEach(function(k){');
-    L.push('        var seen = {};');
-    L.push('        PIVOT_PTS.forEach(function(pt){ if(pt.s===si && pt.p[k]!==undefined) seen[String(pt.p[k])] = true; });');
-    L.push('        var idx = PIVOT_IDX[k], keep = [];');
-    L.push('        for(var q=0;q<idx.vals.length;q++) if(seen[String(idx.vals[q])]) keep.push(q);');
-    L.push('        if(keep.length) PV_SEL[k] = keep;');
-    L.push('      });');
-    L.push('      var cs = document.querySelectorAll(".fc[data-pk]");');
-    L.push('      for(var q2=0;q2<cs.length;q2++){');
-    L.push('        var pk2 = cs[q2].getAttribute("data-pk"), ii2 = parseInt(cs[q2].getAttribute("data-vi"),10);');
-    L.push('        cs[q2].className = "fc" + ((PV_SEL[pk2]||[]).indexOf(ii2)>=0 ? " on" : "");');
-    L.push('      }');
-    L.push('      for(var w=0;w<sbs.length;w++) sbs[w].className = "fc" + (w===si ? " on" : "");');
-    // 点批次即视为要用透视看 ⇒ 懒激活(角色已在上面按该批次设好, 这里只需进入并重绘)
-    L.push('      pvSyncRoles("x"); pvEnter();');
-    L.push('    });');
-    L.push('  })(sbs[m]); }');
-    // 初始提示: 面板已摊开但引擎待命 —— 明确告知"改动任一项才会重绘", 否则用户
-    // 会疑惑"参数都列出来了但图没反应"
-    L.push('  var n0 = document.getElementById("pvNote");');
-    L.push('  if(n0) n0.textContent = "面板可用 —— 改动任一项即按新角色重绘";');
     L.push('})();');
   }
   L.push('function copyTsv(){');
