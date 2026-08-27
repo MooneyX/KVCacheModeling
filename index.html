@@ -5624,6 +5624,37 @@ function buildSensHtml(snapList) {
   // 透视只在"点云非空 且 至少有一个多取值参数"时有意义
   let pivotDims = Object.keys(pivotIndex).filter(function (k) { return pivotIndex[k].vals.length > 1; });
   let hasPivot = pivotPts.length > 0 && pivotDims.length > 0;
+  // 批次摘要(批次快捷选择用): 标题 + 该批次的角色分配, 供页内一键还原
+  let snapMeta = snaps.map(function (sn) {
+    return {
+      title: (function () { try { return sensSnapTitle(sn); } catch (e) { return sn.paramLabel + ' → ' + sn.metricLabel; } })(),
+      x: sn.param, cmp: sn.compareParam || null, shape: (sn.hasPf ? sn.shapeDim : null),
+      metric: sn.metric, at: (sn.at ? sn.at.toLocaleString('zh-CN') : ''),
+      n: (sn.points || []).length
+    };
+  });
+  // ★ 批次 chip 的可分辨标签: 两批次扫描配置相同时标题会撞车(真实案例: L3 图 A/B
+  //   仅 pInputLen 不同, 两个 chip 文字一模一样, 用户无法分辨)。
+  //   追加"区分参数" —— 在本批次内取值唯一、且跨批次有差异的参数(扫描维自然排除:
+  //   它在批次内就是多值)。例: 「输入长度=32k tok」vs「输入长度=128k tok」。
+  snapMeta.forEach(function (m, i) {
+    let sig = [];
+    Object.keys(pivotIndex).forEach(function (k) {
+      let mine = {}, all = {};
+      pivotPts.forEach(function (pt) {
+        if (pt.p[k] === undefined) return;
+        all[String(pt.p[k])] = true;
+        if (pt.s === i) mine[String(pt.p[k])] = true;
+      });
+      let mv = Object.keys(mine);
+      if (mv.length === 1 && Object.keys(all).length > 1) {
+        let d = pivotIndex[k], vi = -1;
+        for (let q = 0; q < d.vals.length; q++) if (String(d.vals[q]) === mv[0]) { vi = q; break; }
+        sig.push(d.label + '=' + (vi >= 0 ? d.texts[vi] : mv[0]));
+      }
+    });
+    m.sig = sig;
+  });
 
   let L = [];
   L.push('<!DOCTYPE html>');
@@ -5763,6 +5794,20 @@ function buildSensHtml(snapList) {
     L.push('<button class="fmini" id="pvReset" style="display:none">↺ 恢复原图</button>');
     L.push('<span class="pvnote" id="pvNote">' + esc(pivHint) + ' —— 改动任一项即按所选角色重绘</span>');
     L.push('</div>');
+    // 批次快捷选择(2026-08-27 应用户要求加回): 一键把"角色分配 + 全部参数勾选"
+    // 还原到某次扫描 —— 等价于手工勾该批次的所有参数值, 但一步到位。
+    // 只在多批次时出现(单批次无选择意义)。
+    if (multi) {
+      L.push('<div class="pvrow"><b>批次</b>');
+      snapMeta.forEach(function (m, i) {
+        // 标签 = 序号 + 标题 + 区分参数(标题撞车时的可分辨信息)
+        let label = '#' + (i + 1) + ' ' + m.title
+          + (m.sig && m.sig.length ? '（' + m.sig.join(' ') + '）' : '');
+        L.push('<button class="fc" data-snap="' + i + '" title="' + esc(m.title + ' · ' + m.n + ' 点 · ' + m.at)
+          + '">' + esc(label) + '</button>');
+      });
+      L.push('<span class="pvnote">点击即选中该批次的全部参数配置</span></div>');
+    }
     // 可调参数勾选区: 每行一个参数。**只列多值参数**(pivotDims 即取值 ≥2 的参数集)
     L.push('<div id="pvVals">');
     pivotDims.forEach(function (k) {
@@ -6183,6 +6228,7 @@ function buildSensHtml(snapList) {
   L.push('var PIVOT_IDX = ' + safeJson(hasPivot ? pivotIndex : {}) + ';');
   L.push('var PIVOT_DIMS = ' + safeJson(hasPivot ? pivotDims : []) + ';');
   L.push('var HAS_PIVOT = ' + (hasPivot ? 'true' : 'false') + ';');
+  L.push('var SNAP_META = ' + safeJson(snapMeta) + ';');
   // 面板待机时的提示文案(含点云规模信息) —— pvToggle(false) 退回原图时也恢复成它
   L.push('var PV_HINT = ' + safeJson(pivHint + ' —— 改动任一项即按所选角色重绘') + ';');
   L.push('var PV_ON = false;');
@@ -6442,6 +6488,34 @@ function buildSensHtml(snapList) {
     L.push('      pvEnter();');
     L.push('    });');
     L.push('  })(pms[j]); }');
+    // 批次快捷选择: 一键还原该次扫描的"角色分配 + 参数勾选"(2026-08-27 加回)
+    // 勾选收窄到该批次的点实际覆盖的取值 —— 否则会把其他批次的点混进来取平均
+    L.push('  var sbs = document.querySelectorAll(".fc[data-snap]");');
+    L.push('  for(var m=0;m<sbs.length;m++){ (function(el){');
+    L.push('    el.addEventListener("click", function(){');
+    L.push('      var si = parseInt(el.getAttribute("data-snap"),10);');
+    L.push('      var meta = SNAP_META[si]; if(!meta) return;');
+    L.push('      var ex = document.getElementById("pvX"), ec2 = document.getElementById("pvC"), es = document.getElementById("pvS");');
+    L.push('      if(ex && PIVOT_DIMS.indexOf(meta.x)>=0) ex.value = meta.x;');
+    L.push('      if(ec2) ec2.value = (meta.cmp && PIVOT_DIMS.indexOf(meta.cmp)>=0) ? meta.cmp : "";');
+    L.push('      if(es) es.value = (meta.shape && PIVOT_DIMS.indexOf(meta.shape)>=0) ? meta.shape : "";');
+    L.push('      Object.keys(PIVOT_IDX).forEach(function(k){');
+    L.push('        var seen = {};');
+    L.push('        PIVOT_PTS.forEach(function(pt){ if(pt.s===si && pt.p[k]!==undefined) seen[String(pt.p[k])] = true; });');
+    L.push('        var idx = PIVOT_IDX[k], keep = [];');
+    L.push('        for(var q=0;q<idx.vals.length;q++) if(seen[String(idx.vals[q])]) keep.push(q);');
+    L.push('        if(keep.length) PV_SEL[k] = keep;');
+    L.push('      });');
+    L.push('      var cs = document.querySelectorAll(".fc[data-pk]");');
+    L.push('      for(var q2=0;q2<cs.length;q2++){');
+    L.push('        var pk2 = cs[q2].getAttribute("data-pk"), ii2 = parseInt(cs[q2].getAttribute("data-vi"),10);');
+    L.push('        cs[q2].className = "fc" + ((PV_SEL[pk2]||[]).indexOf(ii2)>=0 ? " on" : "");');
+    L.push('      }');
+    L.push('      for(var w=0;w<sbs.length;w++) sbs[w].className = "fc" + (w===si ? " on" : "");');
+    // 点批次即视为要用透视看 ⇒ 懒激活(角色已在上面按该批次设好, 这里只需进入并重绘)
+    L.push('      pvSyncRoles("x"); pvEnter();');
+    L.push('    });');
+    L.push('  })(sbs[m]); }');
     L.push('})();');
   }
   L.push('function copyTsv(){');
