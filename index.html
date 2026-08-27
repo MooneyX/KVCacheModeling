@@ -7521,11 +7521,20 @@ function runSensitivity() {
     if (keys.length >= 20) delete sensCache[keys[0]]; // FIFO 淘汰最旧
     paint(results);
   }
-  let worker = null, blobUrl = null, doneJobs = 0;
+  let workers = [], blobUrl = null, doneJobs = 0;
   function restoreBtn() { if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; } }
-  function killWorker() { if (worker) { try { worker.terminate(); } catch(e) {} worker = null; } if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch(e) {} blobUrl = null; } }
+  // killWorker: 关掉**全部** Worker(池化后不再是单个)。
+  // ⚠️ Blob URL 只在全部 Worker 都终止后释放 —— 提前 revoke 会让还未完成 importScripts
+  //    的 Worker 加载失败(表现为随机 onerror, 且只在慢机器上出现)。
+  function killWorker() {
+    workers.forEach(function (w) { try { w.terminate(); } catch (e) {} });
+    workers = [];
+    if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch(e) {} blobUrl = null; }
+  }
   function showProg() {
-    chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中' + (worker ? '(后台 Worker, 页面可操作)' : '') + '... ' + filled + '/' + totalRuns
+    let nw = workers.length;
+    chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中'
+      + (nw ? '(后台 ' + nw + ' 个 Worker 并行, 页面可操作)' : '') + '... ' + filled + '/' + totalRuns
       + ' <span style="cursor:pointer;color:var(--accent4);text-decoration:underline" id="sensCancelBtn">✕ 取消</span></div>';
     let cb = document.getElementById('sensCancelBtn');
     if (cb) cb.onclick = function() {
@@ -7558,39 +7567,116 @@ function runSensitivity() {
   // JS 策略含函数钩子(不可结构化克隆, 且 Worker 内 strategyMode 恒为 dsl 会静默丢钩子) → 回退主线程
   let canWorker = (typeof Worker !== 'undefined') && (typeof Blob !== 'undefined') && (typeof URL !== 'undefined' && URL.createObjectURL)
     && strategyMode !== 'js';
+
+  // ======================== Worker 池并行扫描(2026-08-27) ========================
+  // 原实现是**单 Worker 串行**: 把整个 jobs 数组丢进去, Worker 内一个 for 循环逐点跑完。
+  // 于是无论机器有多少核, 扫描永远只用 1 个 —— 40 点的典型扫描实测 8 分钟, 7 个核全程空闲。
+  //
+  // ★ 为什么必须**动态派发**而不是静态均分:
+  //   单点耗时与参数强相关, 实测 GLM-5.1@h20x8 in=32k 下从 0.9s(命中95%) 到 26.5s(命中0%),
+  //   差 **30×**。按下标轮转均分会让"分到一堆低命中率点"的那个 Worker 成为长尾,
+  //   其余 Worker 早早空转 ⇒ 实际加速远低于核数。改为"空闲即领下一个"可自然抹平差异。
+  //
+  // ★ 并发数取 min(hardwareConcurrency - 1, jobs 数, POOL_MAX):
+  //   · 留 1 核给主线程/UI —— 全占满会让进度条与取消按钮卡顿, 体验上像"卡死了"
+  //   · 不超过任务数 —— 3 个点开 8 个 Worker 纯属浪费(每个 Worker 要编译 ~370KB 源码)
+  //   · 上限 POOL_MAX: 每个 Worker 都独立编译整份引擎源码, 内存与编译时间线性增长,
+  //     超过 8 个后编译成本开始吃掉并行收益
+  const SENS_POOL_MAX = 8;
+  function sensPoolSize(nJobs) {
+    let hc = 4;   // 取不到时的保守默认(老浏览器/无头环境)
+    try { if (navigator && navigator.hardwareConcurrency) hc = navigator.hardwareConcurrency; } catch (e) {}
+    return Math.max(1, Math.min(hc - 1, nJobs, SENS_POOL_MAX));
+  }
+
   if (canWorker) {
     try {
       // Worker 源码 = DOM 桩(与 node harness 同款) + 页面全部内联 <script>(同引擎) + 消息处理器;
       // 参数经 __PARAMS_OVERRIDE 快照注入(getParams 钩子深克隆返回), 数值与主线程逐点一致
+      // ★ Blob 只创建**一次**, 全部 Worker 共用同一个 URL —— 源码约 370KB, 每个 Worker
+      //   都重新构造 Blob 是纯浪费(浏览器还可能重复缓存同一份内容)
       blobUrl = URL.createObjectURL(new Blob([buildSensWorkerSource()], { type: 'text/javascript' }));
-      worker = new Worker(blobUrl);
+      let nPool = sensPoolSize(jobs.length);
+      for (let wi = 0; wi < nPool; wi++) workers.push(new Worker(blobUrl));
     } catch(e) { canWorker = false; killWorker(); }
   }
   showProg();
-  if (!canWorker) { runInline(0); return; }
-  worker.onmessage = function(ev) {
-    let m = ev.data;
-    if (!m) return;
-    if (m.type === 'point') {
-      if (cancelled) return;
-      storePoint(m, m.rec);
-      doneJobs++; filled++;
-      showProg();
-    } else if (m.type === 'done') {
+  if (!canWorker || !workers.length) { runInline(0); return; }
+
+  // ---- 任务队列 + 动态派发 ----
+  // nextJob 是共享游标; 每个 Worker 回传一个点后立刻领取下一个, 直到队列空。
+  // 与旧实现的协议差异: 旧版一次性 postMessage 全部 jobs, 新版每次只发一个 job。
+  // Worker 侧 handler **仍接受 jobs 数组**(见 buildSensWorkerSource), 因此:
+  //   · 单发 = 长度 1 的数组, 协议向后兼容
+  //   · _verify_worker_scan.js 的"整批扫描"用法不受影响
+  let nextJob = 0;
+  function dispatch(w) {
+    if (cancelled) return;
+    if (nextJob >= jobs.length) return;   // 队列空 ⇒ 该 Worker 就此空闲(不终止, 留给 done 统一收)
+    let job = jobs[nextJob++];
+    w._job = job;                         // 记住它在跑哪个, 便于 onerror 时把该点退回队列
+    w.postMessage({ type: 'scan', params: paramsFp, jobs: [job] });
+  }
+  function maybeFinish() {
+    // 全部点都已回传 ⇒ 收工。用 doneJobs 计数而非"Worker 都空闲", 后者在
+    // 派发竞态下可能提前为真(某 Worker 刚领到任务还没开始跑)。
+    if (doneJobs >= jobs.length && !cancelled) {
       killWorker();
-      if (!cancelled) finish();
+      finish();
+      return true;
     }
-  };
-  worker.onerror = function(e) {
-    // Worker 运行期失败 → 已回传点保留, 剩余任务回退主线程完成
-    killWorker();
-    if (!cancelled) runInline(doneJobs);
-  };
-  worker.postMessage({ type: 'scan', params: paramsFp, jobs: jobs });
+    return false;
+  }
+  workers.forEach(function (w) {
+    w.onmessage = function (ev) {
+      let m = ev.data;
+      if (!m || cancelled) return;
+      if (m.type === 'point') {
+        // storePoint 用消息里带回的 ci/pi/idx 定位, 与派发顺序无关 ⇒ 乱序回传不会错位。
+        // 这是并行化能安全落地的前提: 结果写入是按坐标寻址, 不是按到达顺序 append。
+        storePoint(m, m.rec);
+        doneJobs++; filled++;
+        showProg();
+      } else if (m.type === 'done') {
+        // 该 Worker 完成本次派发(1 个点) ⇒ 立刻领下一个
+        if (maybeFinish()) return;
+        dispatch(w);
+      }
+    };
+    w.onerror = function () {
+      // 单个 Worker 挂了: 把它正在跑的点退回队列, 由其他 Worker 接手; 池空了才回退主线程。
+      // ⚠️ 不能像旧实现那样直接 runInline(doneJobs) —— 并行下 doneJobs 与 jobs 下标
+      //    不再一一对应(乱序完成), 从 doneJobs 续跑会漏点/重跑。
+      //    改为: 用**点级缓存**判定"哪些点已真正完成"(storePoint 会写缓存), 剩下的重跑。
+      if (cancelled) return;
+      try { w.terminate(); } catch (e) {}
+      let at = workers.indexOf(w);
+      if (at >= 0) workers.splice(at, 1);
+      if (!workers.length) {
+        // 全部 Worker 都失败 ⇒ 主线程兜底跑**尚未完成**的点(按缓存判定, 与派发顺序无关)
+        killWorker();
+        let rest = jobs.filter(function (j) { return sensPointCache[j.key] === undefined; });
+        if (!rest.length) { finish(); return; }
+        jobs = rest; nextJob = 0;
+        runInline(0);
+      } else if (w._job && sensPointCache[w._job.key] === undefined) {
+        // 还有存活 Worker ⇒ 把这个未完成的点重新排到队尾, 交给下一个空闲者
+        jobs.push(w._job);
+      }
+    };
+  });
+  // 初始派发: 每个 Worker 领一个点起跑
+  workers.forEach(dispatch);
 }
 
 // Worker 源码组装(2026-08-18): DOM 桩 + 页面全部内联 <script> + 扫描消息处理器。
 // 桩与 node harness(_verify_*.js)同款, 保证 Worker/主线程/harness 三处引擎逐点一致。
+//
+// 2026-08-27 池化说明: handler **保持接受 jobs 数组**不变, 因此同一份源码同时支持两种用法:
+//   · 池化派发(现主线程用法): 每次发长度 1 的数组, 跑完回 done 再领下一个
+//   · 整批扫描(_verify_worker_scan.js 用法): 一次发全部 jobs, 内部 for 跑完
+// 好处: 协议向后兼容, 既有 Worker 验证脚本一行不用改; 且未来若想改"按批派发"(减少
+// 消息往返)只需调整主线程切片大小, Worker 侧无需再动。
 function buildSensWorkerSource() {
   let scripts = [];
   document.querySelectorAll('script').forEach(function(sc) { if (!sc.src && sc.textContent.trim()) scripts.push(sc.textContent); });
