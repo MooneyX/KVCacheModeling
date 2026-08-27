@@ -493,7 +493,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <span style="font-size:.73rem;color:var(--text-dim)">导出当前图表：</span>
       <button class="btn btn-sm" id="btnSensExportPng" disabled onclick="exportSensImage('png')" title="PNG 无损位图, 2× 像素比(高清, 贴进文档/PPT 缩放后不发虚)。背景为深色以匹配平台配色。">🖼 PNG</button>
       <button class="btn btn-sm" id="btnSensExportJpg" disabled onclick="exportSensImage('jpeg')" title="JPG 有损压缩, 体积约为 PNG 的 1/3, 适合邮件/IM 分享。&#10;注: JPEG 无透明通道, 已显式填充深色背景(否则透明区会压成纯黑)。">🖼 JPG</button>
-      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★★ 多次扫描一并导出: 下方勾选的**全部**扫描结果打包进同一个 HTML, 页内可切换批次。&#10;★★ 参数透视(2026-08-27): 数据以**角色无关点云**存储, 打开后可任意指定哪个参数当横轴/颜色/形状, 并勾选参数值筛选 —— 「颜色=命中率 形状=输入长度」与「颜色=输入长度 形状=命中率」本是同一批数据, 无需重跑即可互换。&#10;★ 可在页内**切换纵轴指标**(全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;附带: ①数据表(随指标与筛选同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③参数配置(按模型&#47;硬件&#47;负载&#47;策略分组展示, 中文标签 + 可读值, 非默认值高亮; 可切回原始 JSON 粘回平台「导入参数」复现)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
+      <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★★ 多次扫描一并导出: 下方勾选的**全部**扫描结果打包进同一个 HTML, 页内可切换批次。&#10;★★ 参数透视(2026-08-27): 打开即**摊开列出全部参数**, 可任意指定哪个参数当横轴/颜色/形状, 并勾选参数值筛选 —— 「颜色=命中率 形状=输入长度」与「颜色=输入长度 形状=命中率」本是同一批数据, 无需重跑即可互换。改动任一项才接管图表, 随时可「↺ 恢复原图」。&#10;⚠️ 某参数要可选, 需它在本文件数据里有 ≥2 个取值: 若两次扫描只改了某参数(如输入长度), 必须**同时勾选这两个批次**再导出, 否则它只有一个取值会显示为灰色固定值。&#10;★ 可在页内**切换纵轴指标**(全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;附带: ①数据表(随指标与筛选同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③参数配置(按模型&#47;硬件&#47;负载&#47;策略分组展示, 中文标签 + 可读值, 非默认值高亮; 可切回原始 JSON 粘回平台「导入参数」复现)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
       <span id="sensExportNote" style="font-size:.72rem;color:var(--accent2)"></span>
     </div>
     <!-- 扫描快照列表(2026-08-27): 平台同时只展示一次扫描, 但历次结果自动攒在这里,
@@ -5603,13 +5603,22 @@ function buildSensHtml(snapList) {
   let pivotIndex = {};
   Object.keys(pivotParams).forEach(function (k) {
     let vals = Object.keys(pivotParams[k]);
-    // gpu_preset 是字符串维度, 其余按数值升序 —— 混排会让档位 chip 顺序错乱
-    if (k === 'gpu_preset') vals.sort();
+    // ★ 非数值维度判定(2026-08-27 修): 原先只给 gpu_preset 开字符串分支, 于是
+    //   'prefetch'(取值 wait_complete/best_effort/race)被 Number() 全部过滤成空数组
+    //   ⇒ 该行标签显示原始 key、值显示**空白**。
+    //   判据改为"看实际取值能否转数值", 而不是硬编码参数名 —— 以后再加字符串维度自动生效。
+    let numeric = vals.every(function (v) { return v !== '' && isFinite(Number(v)); });
+    if (!numeric) vals.sort();
     else vals = vals.map(Number).filter(function (v) { return isFinite(v); }).sort(function (a, b) { return a - b; });
     pivotIndex[k] = {
-      label: SENS_PARAM_LABEL[k] || k,
+      // prefetch 不在 SENS_PARAM_LABEL 里(它不是可扫描参数, 是策略字段) ⇒ 单独给中文名,
+      // 否则面板上出现一行英文 key
+      label: SENS_PARAM_LABEL[k] || (k === 'prefetch' ? '预取策略' : k),
       vals: vals,
-      texts: vals.map(function (v) { return sensParamUnit(k, v); })
+      // 非数值维度直接用原值当显示文本(sensParamUnit 的默认分支会给它加 '%')
+      texts: vals.map(function (v) {
+        return (k === 'prefetch') ? String(v) : sensParamUnit(k, v);
+      })
     };
   });
   // 透视只在"点云非空 且 至少有一个多取值参数"时有意义
@@ -5688,8 +5697,8 @@ function buildSensHtml(snapList) {
   // 参数透视面板(2026-08-27): 与筛选区同源的视觉语言, 但用第二强调色(青)区分"重新分配角色"
   L.push('.pvbar{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}');
   L.push('.pvhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}');
-  L.push('.pvsw{display:flex;align-items:center;gap:6px;font-size:.76rem;color:var(--text);cursor:pointer;margin:0}');
-  L.push('.pvsw b{color:#06b6d4}');
+  // 标题(取代原来的开关 label) —— 面板已常驻, 不再需要复选框
+  L.push('.pvttl{color:#06b6d4;font-size:.78rem;font-weight:600}');
   L.push('.pvhint{font-size:.7rem;color:var(--text-dim)}');
   L.push('.pvrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:7px 0}');
   L.push('.pvrow>b{font-size:.73rem;color:var(--text);min-width:52px;font-weight:600}');
@@ -5703,6 +5712,9 @@ function buildSensHtml(snapList) {
   // 透视激活时高亮整块, 让人清楚"现在看的不是原始批次视图"
   L.push('.pvbar.on{background:rgba(6,182,212,.05);border-radius:6px;padding:10px}');
   L.push('.pvbar.on .fc.on{background:rgba(6,182,212,.16);border-color:#06b6d4;color:#06b6d4}');
+  // .live = 透视引擎已接管图表(用户动过面板)。加左侧色条明确区分"面板可用"与"正在生效",
+  // 否则用户分不清眼前这张图是原图还是透视结果。
+  L.push('.pvbar.live{border-left:3px solid #06b6d4}');
   L.push('</style></head><body><div class="wrap">');
   L.push('<h1>参数<span>敏感性</span>分析</h1>');
   L.push('<p class="sub">' + dimsHtml + '<br>基准策略 <b>' + esc(st.strategyName)
@@ -5769,17 +5781,28 @@ function buildSensHtml(snapList) {
   // 与上方「维度筛选」的区别(两者并存但语义不同):
   //   · 维度筛选 fbar —— 在**当前批次的既有角色分配**下做减法(勾掉某档位)
   //   · 参数透视 pbar —— **重新分配角色**(任意参数当横轴/颜色/形状)并跨批次取数
-  // 之所以做成两块而不是替换: 原路径承载着堆叠柱与场景轴等已上线能力, 且有 5 个验证脚本
-  // 覆盖; 透视是"另一种看法", 用开关切换、互不干扰最稳。
+  //
+  // ★★ 2026-08-27 二次改造: 去掉「参数透视」开关, 面板**常驻展开**直接列出全部参数。
+  // 动机(用户): 开关是一道无谓的门 —— 收图的人打开文件先看到一个折叠的复选框,
+  //   根本不知道里面有能力。默认摊开才能"一眼看到有哪些参数可调"。
+  // 但不能简单地"默认开启透视", 因为透视渲染有两处与原图不同:
+  //   ① 堆叠柱(ttft_stack)在透视下退回折线 —— 会丢掉一张信息量最大的图
+  //   ② 原图是平台 opt 的逐字快照("导出的就是你看到的那张图"是既有承诺)
+  // ⇒ 采用**懒激活**: 面板可见但引擎待命, 初始仍渲染原图; 用户**一旦动了面板**
+  //   (改角色下拉 / 勾档位 / 点批次)才切到透视, 并出现「↺ 恢复原图」按钮可退回。
+  //   这样既满足"默认列出全部参数", 又不牺牲任何既有能力。
   if (hasPivot) {
-    L.push('<div class="pvbar" id="pvbar">');
+    L.push('<div class="pvbar on" id="pvbar">');
     L.push('<div class="pvhead">');
-    L.push('<label class="pvsw"><input type="checkbox" id="pvOn"> <b>🔀 参数透视</b></label>');
-    L.push('<span class="pvhint">数据以角色无关点云存储（' + pivotPts.length + ' 个参数组合'
+    L.push('<b class="pvttl">🔀 参数透视</b>');
+    L.push('<span class="pvhint">' + pivotPts.length + ' 个参数组合'
       + (multi ? ' · 合并自 ' + snaps.length + ' 次扫描' : '')
-      + (dupCount ? ' · 去重 ' + dupCount + ' 个' : '') + '），可任意指定哪个参数当横轴／颜色／形状</span>');
+      + (dupCount ? ' · 去重 ' + dupCount + ' 个' : '')
+      + ' —— 数据以角色无关点云存储，可任意指定哪个参数当横轴／颜色／形状</span>');
+    // 恢复原图: 只在已进入透视后出现(初始隐藏)。它是"② 原图承诺"的兜底。
+    L.push('<button class="fmini" id="pvReset" style="display:none;margin-left:auto">↺ 恢复原图</button>');
     L.push('</div>');
-    L.push('<div id="pvBody" style="display:none">');
+    L.push('<div id="pvBody">');
     // 角色分配下拉: 横轴必选, 颜色/形状可空
     let optsOf = function (sel, allowNone) {
       let o = allowNone ? ['<option value="">无</option>'] : [];
@@ -6352,7 +6375,10 @@ function buildSensHtml(snapList) {
   // 2) 横轴取值: 只取过滤后**实际存在**的档位(升序), 不是索引表的全部
   L.push('  var xset = {}; keep.forEach(function(pt){ if(pt.p[kx]!==undefined) xset[pt.p[kx]] = true; });');
   L.push('  var xv = Object.keys(xset);');
-  L.push('  if(kx==="gpu_preset") xv.sort(); else xv = xv.map(Number).filter(isFinite).sort(function(a,b){return a-b;});');
+  // 横轴取值排序: 与平台侧 pivotIndex 用**同一判据** —— 看实际取值能否转数值,
+  // 不硬编码参数名(否则新增字符串维度时这里会把它 Number() 成空数组, 横轴直接消失)
+  L.push('  var xNum = xv.every(function(v){ return v!=="" && isFinite(Number(v)); });');
+  L.push('  if(!xNum) xv.sort(); else xv = xv.map(Number).filter(isFinite).sort(function(a,b){return a-b;});');
   // 3) 分组: 曲线键 = 颜色值 + "\u0001" + 形状值
   L.push('  var groups = {}, order = [];');
   L.push('  keep.forEach(function(pt){');
@@ -6509,27 +6535,40 @@ function buildSensHtml(snapList) {
   L.push('  if(es && es.value!==s) es.value = s;');
   L.push('  PV_ROLE.x = x; PV_ROLE.c = c||null; PV_ROLE.s = s||null;');
   L.push('}');
-  // ---- 透视开关: 打开时接管图表, 关闭时还原原始批次视图 ----
+  // ---- 透视的进入/退出(2026-08-27 改为懒激活, 无开关) ----
+  // pvToggle(on) 语义保留(内部与验证脚本都在用), 但触发方式变了:
+  //   · 面板**常驻可见**, 不再由复选框控制显隐
+  //   · on=true  ⇒ 接管图表(隐藏原 fbar, 显示「恢复原图」)
+  //   · on=false ⇒ 交还给原路径(rebuildAll 重画平台那张图, 恢复 fbar)
   L.push('function pvToggle(on){');
   L.push('  PV_ON = !!on;');
-  L.push('  var body = document.getElementById("pvBody"), bar = document.getElementById("pvbar");');
-  L.push('  if(body) body.style.display = PV_ON ? "" : "none";');
-  L.push('  if(bar) bar.className = "pvbar" + (PV_ON ? " on" : "");');
-  // 原「维度筛选」区在透视模式下会误导(它筛的是原批次的角色) ⇒ 直接隐藏
+  L.push('  var bar = document.getElementById("pvbar");');
+  L.push('  if(bar) bar.className = "pvbar on" + (PV_ON ? " live" : "");');
+  // 原「维度筛选」区在透视模式下会误导(它筛的是原批次的角色) ⇒ 接管时隐藏
   L.push('  var fb = document.getElementById("fbar"); if(fb) fb.style.display = PV_ON ? "none" : "";');
+  // 「恢复原图」只在已接管时有意义
+  L.push('  var rb = document.getElementById("pvReset"); if(rb) rb.style.display = PV_ON ? "" : "none";');
   L.push('  if(PV_ON){ pvSyncRoles("x"); pvRebuild(); }');
-  L.push('  else { rebuildAll(CUR_METRIC); renderTable(); if(HAS_FILTER) updateFNote(); }');
+  L.push('  else {');
+  L.push('    rebuildAll(CUR_METRIC); renderTable(); if(HAS_FILTER) updateFNote();');
+  // 退回原图后清掉透视提示, 免得停留在上一次的"曲线 n 条"读数上引起误解
+  L.push('    var nt = document.getElementById("pvNote");');
+  L.push('    if(nt){ nt.className = "pvnote"; nt.textContent = "面板可用 —— 改动任一项即按新角色重绘"; }');
+  L.push('  }');
   L.push('}');
+  // pvEnter: 懒激活入口 —— 面板任一交互都先调它。已激活则只重绘。
+  L.push('function pvEnter(){ if(PV_ON){ pvRebuild(); } else { pvToggle(true); } }');
   if (hasPivot) {
     L.push('(function(){');
-    L.push('  var sw = document.getElementById("pvOn");');
-    L.push('  if(sw) sw.addEventListener("change", function(){ pvToggle(sw.checked); });');
+    // 「恢复原图」按钮: 退回平台原始视图(含堆叠柱能力)
+    L.push('  var rb = document.getElementById("pvReset");');
+    L.push('  if(rb) rb.addEventListener("click", function(){ pvToggle(false); });');
     // 角色下拉
     L.push('  ["pvX","pvC","pvS"].forEach(function(id){');
     L.push('    var el = document.getElementById(id); if(!el) return;');
     L.push('    el.addEventListener("change", function(){');
     L.push('      pvSyncRoles(id==="pvX"?"x":(id==="pvC"?"c":"s"));');
-    L.push('      if(PV_ON) pvRebuild();');
+    L.push('      pvEnter();');
     L.push('    });');
     L.push('  });');
     // 参数值 chip
@@ -6541,7 +6580,7 @@ function buildSensHtml(snapList) {
     L.push('      var at = s.indexOf(vi);');
     L.push('      if(at>=0) s.splice(at,1); else { s.push(vi); s.sort(function(a,b){return a-b;}); }');
     L.push('      el.className = "fc" + (s.indexOf(vi)>=0 ? " on" : "");');
-    L.push('      if(PV_ON) pvRebuild();');
+    L.push('      pvEnter();');
     L.push('    });');
     L.push('  })(vcs[i]); }');
     // 全选/反选
@@ -6557,7 +6596,7 @@ function buildSensHtml(snapList) {
     L.push('        var ii = parseInt(cs[q].getAttribute("data-vi"),10);');
     L.push('        cs[q].className = "fc" + (PV_SEL[pk].indexOf(ii)>=0 ? " on" : "");');
     L.push('      }');
-    L.push('      if(PV_ON) pvRebuild();');
+    L.push('      pvEnter();');
     L.push('    });');
     L.push('  })(pms[j]); }');
     // 批次聚焦: 还原该次扫描的角色分配, 并把非角色参数收窄到该批次实际用过的取值
@@ -6584,12 +6623,14 @@ function buildSensHtml(snapList) {
     L.push('        cs[q2].className = "fc" + ((PV_SEL[pk2]||[]).indexOf(ii2)>=0 ? " on" : "");');
     L.push('      }');
     L.push('      for(var w=0;w<sbs.length;w++) sbs[w].className = "fc" + (w===si ? " on" : "");');
-    // 点批次即视为要用透视看 ⇒ 自动打开开关
-    L.push('      var sw2 = document.getElementById("pvOn");');
-    L.push('      if(sw2 && !sw2.checked){ sw2.checked = true; pvToggle(true); }');
-    L.push('      else { pvSyncRoles("x"); pvRebuild(); }');
+    // 点批次即视为要用透视看 ⇒ 懒激活(角色已在上面按该批次设好, 这里只需进入并重绘)
+    L.push('      pvSyncRoles("x"); pvEnter();');
     L.push('    });');
     L.push('  })(sbs[m]); }');
+    // 初始提示: 面板已摊开但引擎待命 —— 明确告知"改动任一项才会重绘", 否则用户
+    // 会疑惑"参数都列出来了但图没反应"
+    L.push('  var n0 = document.getElementById("pvNote");');
+    L.push('  if(n0) n0.textContent = "面板可用 —— 改动任一项即按新角色重绘";');
     L.push('})();');
   }
   L.push('function copyTsv(){');
