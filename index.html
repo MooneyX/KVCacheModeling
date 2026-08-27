@@ -5696,6 +5696,9 @@ function buildSensHtml(snapList) {
   L.push('.pvvals{border-top:1px dashed var(--border);margin-top:8px;padding-top:6px}');
   L.push('.pvvals .pvrow>b{min-width:92px}');
   L.push('.pvfix{font-size:.71rem;color:var(--text-dim);background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:2px 9px}');
+  // 单值参数说明条: 回答"为什么这个参数灰着不能选"(2026-08-27 用户反馈)
+  L.push('.pvtip{font-size:.71rem;color:var(--text-dim);background:rgba(6,182,212,.07);border-left:3px solid #06b6d4;border-radius:5px;padding:6px 9px;margin:6px 0 8px;line-height:1.6}');
+  L.push('.pvtip b{color:var(--text)}');
   L.push('.pvnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}');
   // 透视激活时高亮整块, 让人清楚"现在看的不是原始批次视图"
   L.push('.pvbar.on{background:rgba(6,182,212,.05);border-radius:6px;padding:10px}');
@@ -5807,7 +5810,16 @@ function buildSensHtml(snapList) {
       L.push('<span class="pvnote">点击可还原该次扫描的角色分配</span></div>');
     }
     // 参数值勾选区: 每个参数一行。多取值参数可勾选, 单值参数标灰仅展示。
+    // ★ 2026-08-27 补提示: 用户反馈"为什么无法选择输入长度" —— 根因是该参数在本次
+    //   导出的批次里**只有一个取值**(如两次扫描只改了 pInputLen 却分别单独导出)。
+    //   原先只是静静地标灰, 读者无从知道"要怎样才能选" ⇒ 现在显式说明单值原因与解法。
     L.push('<div class="pvvals" id="pvVals">');
+    let nSingle = Object.keys(pivotIndex).filter(function (k) { return pivotIndex[k].vals.length <= 1; }).length;
+    if (nSingle) {
+      L.push('<div class="pvtip">ⓘ 灰色参数在本文件的数据里只有<b>一个取值</b>，故不可勾选、也不能当横轴／颜色／形状。'
+        + '若想让某个参数可选：在平台里<b>用不同取值各跑一次扫描</b>，然后在「已收集扫描」列表中<b>同时勾选这些批次</b>再导出'
+        + (multi ? '（本文件已含 ' + snaps.length + ' 次扫描）' : '（本文件仅含 1 次扫描）') + '。</div>');
+    }
     Object.keys(pivotIndex).forEach(function (k) {
       let d = pivotIndex[k];
       let single = d.vals.length <= 1;
@@ -5815,7 +5827,9 @@ function buildSensHtml(snapList) {
       L.push('<b>' + esc(d.label) + '</b>');
       if (single) {
         // 单值参数: 全批次同值, 勾选无意义 ⇒ 只展示(仍需展示, 否则读者不知道这个点的完整配置)
-        L.push('<span class="pvfix">' + esc(d.texts[0] != null ? d.texts[0] : '') + '</span>');
+        // title 里说明为何不可选, 避免被误认为功能失效
+        L.push('<span class="pvfix" title="本文件数据中该参数只有这一个取值 —— 想让它可选, 需用不同取值各跑一次扫描并一并导出">'
+          + esc(d.texts[0] != null ? d.texts[0] : '') + '</span>');
       } else {
         L.push(d.vals.map(function (v, i) {
           return '<button class="fc on" data-pk="' + esc(k) + '" data-vi="' + i + '">'
@@ -6843,19 +6857,39 @@ function baseValsOf() {
       if (st.prefetch && st.prefetch.prefetch_threshold != null) out.prefetch_threshold = Math.round(st.prefetch.prefetch_threshold * 100);
       if (st.batching && st.batching.max_batch_size != null) out.max_batch_size = st.batching.max_batch_size;
     }
-    // GPU 预设无下拉框, 选中态记在 #hwPresets 里 .preset-tag.active 的 data-hw 上。
-    // ⚠️ 用 classList.contains 判定而非 querySelector('.active') —— 无头 harness 的 DOM stub
-    //    对复合选择器支持不全, 遍历 + contains 更稳(取不到时留空, 导出页显示"基准硬件")。
-    let hb = $('hwPresets');
-    if (hb && hb.querySelectorAll) {
-      let tags = hb.querySelectorAll('.preset-tag') || [];
-      for (let i = 0; i < tags.length; i++) {
-        let t = tags[i];
-        let act = t.classList && t.classList.contains && t.classList.contains('active');
-        if (act) { out.gpu_preset = (t.dataset && t.dataset.hw) || (t.getAttribute && t.getAttribute('data-hw')) || ''; break; }
+    // GPU 预设(2026-08-27 改判定): 它没有下拉框, 只有一排按钮。
+    // ⚠️ 原实现读 `.preset-tag.active` —— 但**导入参数不会给按钮加 active 类**(导入只写
+    //    输入框), 于是"导入参数 → 跑扫描"这条最常用的路径永远读不到 gpu_preset。
+    // ⇒ 改为**反查**: 拿当前硬件字段去比对 hwPresets, 完全吻合则认定是该预设。
+    //    这与"用户是否点过按钮"无关, 对导入路径同样有效。
+    //    比对 tflops/hbm/hbmBW/gpus 四项即可唯一确定(九款预设两两不同)。
+    try {
+      if (typeof hwPresets !== 'undefined' && hwPresets) {
+        let cur = { gpus: gi('pGpuCount'), hbm: gv('pHbm'), hbmBW: gv('pHbmBW'), tflops: gv('pTflops') };
+        for (let pk in hwPresets) {
+          let h = hwPresets[pk];
+          if (!h) continue;
+          if (Number(h.gpus) === cur.gpus && Number(h.hbm) === cur.hbm
+            && Number(h.hbmBW) === cur.hbmBW && Number(h.tflops) === cur.tflops) {
+            out.gpu_preset = pk; break;
+          }
+        }
+      }
+      // 反查不中(手改过硬件字段, 不对应任何预设) ⇒ 退回按钮 active 态; 仍取不到就留空,
+      // 导出页会把该参数整行省略(而不是显示一个错的预设名)
+      if (!out.gpu_preset) {
+        let hb = $('hwPresets');
+        if (hb && hb.querySelectorAll) {
+          let tags = hb.querySelectorAll('.preset-tag') || [];
+          for (let i = 0; i < tags.length; i++) {
+            let t = tags[i];
+            let act = t.classList && t.classList.contains && t.classList.contains('active');
+            if (act) { out.gpu_preset = (t.dataset && t.dataset.hw) || (t.getAttribute && t.getAttribute('data-hw')) || ''; break; }
+          }
+        }
       }
       if (!out.gpu_preset) delete out.gpu_preset;
-    }
+    } catch (e) { delete out.gpu_preset; }
   } catch (e) {}
   return out;
 }
