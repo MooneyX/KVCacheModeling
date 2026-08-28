@@ -6226,6 +6226,22 @@ function buildSensHtml(snapList) {
   L.push('function viewXLabels(){ return viewXIdx().map(function(i){ return LINE_LABELS[i]; }); }');
   L.push('function viewSceneLabels(){ return viewSceneIdx().map(sceneLabelAt); }');
   L.push('function applyMetric(k){');
+  // ★ 透视模式下切指标必须仍走透视渲染(2026-08-28): 原实现没有 PV_ON 分支,
+  //   透视中点指标 chip 会把图表静默画回**原始批次视图**(fbar 还亮着 live 色条,
+  //   用户以为在看透视结果)。这里拦截: 只换纵轴口径, 数据仍按当前角色/勾选投影。
+  L.push('  if(typeof PV_ON!=="undefined" && PV_ON){');
+  L.push('    var toStackP = (k===STACK_KEY);');
+  L.push('    if(toStackP ? !STACK_PARTS.length : !METRIC_DATA[k]) return;');
+  L.push('    CUR_METRIC = k; CUR_IS_STACK = toStackP;');
+  L.push('    var lbP = METRIC_LABEL[k]||k;');
+  L.push('    var selP = document.getElementById("mSel"); if(selP && selP.value!==k) selP.value = k;');
+  L.push('    var chipsP = document.querySelectorAll(".chip[data-m]");');
+  L.push('    for(var ci2=0;ci2<chipsP.length;ci2++){ chipsP[ci2].className = "chip" + (chipsP[ci2].getAttribute("data-m")===k ? " on" : ""); }');
+  L.push('    var dyP = document.getElementById("dimY"); if(dyP) dyP.textContent = lbP;');
+  L.push('    document.title = "参数敏感性 · " + X_LABEL + " → " + lbP;');
+  L.push('    pvRebuild();');
+  L.push('    return;');
+  L.push('  }');
   // 堆叠柱与折线的数据源不同: 前者查 STACK_PARTS 是否可用, 后者查 METRIC_DATA
   L.push('  var toStack = (k===STACK_KEY);');
   L.push('  if(toStack ? !STACK_PARTS.length : !METRIC_DATA[k]) return;');
@@ -6414,9 +6430,10 @@ function buildSensHtml(snapList) {
   L.push('  for(var i=0;i<d.vals.length;i++) if(String(d.vals[i])===String(v)) return d.texts[i];');
   L.push('  return String(v);');
   L.push('}');
-  // ---- 透视模式下的 series 构造(折线) ----
-  // 堆叠柱在透视模式下不支持: 它把"曲线×档位"拉平成场景轴, 与"动态分配角色"是两套 x 轴
-  // 语义, 混在一起会让人分不清横轴到底是什么 ⇒ 透视时若当前指标是堆叠柱, 自动落回 TTFT。
+  // ---- 透视模式下的 series 构造 ----
+  // 折线与堆叠柱都支持(2026-08-28): 点云的 rec 自带六分量, 且六分量之和 == TTFT
+  // (逐场景验证过恒等式); 多点平均是线性的 ⇒ 平均后恒等式仍成立, 堆叠柱高即 TTFT。
+  // 场景轴 = 曲线 × 横轴档位 拉平(曲线主序, 与原图 sceneLabels 同序), 不是另一套语义。
   L.push('function pvMetricVal(recs, k){');
   L.push('  if(recs===null) return null;');
   L.push('  var arr = recs, sum = 0, n = 0;');
@@ -6438,9 +6455,40 @@ function buildSensHtml(snapList) {
   // 断线处("缺该参数组合的仿真点")要显式连过去还是断开? 断开 —— 假连线会让人误以为
   // 扫过那个档位。connectNulls 保持默认 false。
   L.push('      connectNulls:false};');
-  L.push('    if(single){ s.areaStyle={color:"rgba(108,99,255,.1)"}; s.label={show:true,color:"#9ca0b0",fontSize:9}; }');
-  L.push('    return s;');
+    L.push('    if(single){ s.areaStyle={color:"rgba(108,99,255,.1)"}; s.label={show:true,color:"#9ca0b0",fontSize:9}; }');
+    L.push('    return s;');
+    L.push('  });');
+    L.push('}');
+  // ---- 透视模式下的堆叠柱(2026-08-28) ----
+  // 返回 {series, scenes, totals}: 场景顺序与原图一致(曲线主序 × 横轴档位);
+  // 缺点的场景(该参数组合无仿真点)全部分量为 null ⇒ 不画柱, 不假装有数据。
+  // totals 用分量之和而非直接平均 ttft —— 柱高就是分量之和, 标签必须与柱高严格一致。
+  L.push('function pvBuildStack(proj){');
+  L.push('  var scenes = [], sceneRecs = [];');
+  L.push('  proj.curves.forEach(function(c){');
+  L.push('    for(var xi=0; xi<proj.xs.length; xi++){');
+  L.push('      scenes.push(proj.curves.length>1 ? (proj.xs[xi] + " \\u00b7 " + c.name) : proj.xs[xi]);');
+  L.push('      sceneRecs.push(c.recs[xi]);');
+  L.push('    }');
   L.push('  });');
+  L.push('  var totals = sceneRecs.map(function(recs){');
+  L.push('    if(recs===null) return null;');
+  L.push('    var t = 0, any = false;');
+  L.push('    STACK_PARTS.forEach(function(p){ var v = pvMetricVal(recs, p.key); if(v!=null){ t += v; any = true; } });');
+  L.push('    return any ? +t.toFixed(1) : null;');
+  L.push('  });');
+  L.push('  var ss = STACK_PARTS.map(function(p){');
+  L.push('    return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,');
+  L.push('      itemStyle:{color:p.color}, emphasis:{focus:"series"},');
+  L.push('      data: sceneRecs.map(function(recs){ return pvMetricVal(recs, p.key); })};');
+  L.push('  });');
+  // 总计标签只挂最后一个 series(position:"top" 仅顶层可见), 与原图一致
+  L.push('  if(ss.length){ ss[ss.length-1].label = {show: scenes.length<=24, position:"top",');
+  L.push('    color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){');
+  L.push('      var t = totals[p.dataIndex];');
+  L.push('      if(t==null) return "";');
+  L.push('      return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }');
+  L.push('  return {series: ss, scenes: scenes, totals: totals};');
   L.push('}');
   // ---- 透视重绘: 图 + 表 + 提示, 与原路径共用 ch 实例 ----
   L.push('function pvRebuild(){');
@@ -6452,10 +6500,33 @@ function buildSensHtml(snapList) {
   L.push('  }');
   // 横轴塌缩(只剩 1 档)时仍绘制(单点), 但要提示 —— 用户可能没意识到把横轴筛没了
   L.push('  var k = CUR_METRIC;');
-  L.push('  if(k===STACK_KEY){ k = METRIC_DATA["ttft"] ? "ttft" : Object.keys(METRIC_LABEL)[0]; CUR_METRIC = k;');
-  L.push('    var sel0 = document.getElementById("mSel"); if(sel0) sel0.value = k; }');
+  // 堆叠柱在透视下也支持(2026-08-28): 场景 = 曲线×档位, 分量取平均(线性, 恒等式保持)。
+  // 用户场景: 切好 TTFT 构成后勾掉一款显卡 ⇒ 图应保持堆叠柱只剩另一款, 而非退回折线。
+  L.push('  var isStack = (k===STACK_KEY) && STACK_PARTS.length>0;');
   L.push('  var lb = METRIC_LABEL[k]||k;');
   L.push('  if(ch){');
+  L.push('    if(isStack){');
+  L.push('      var stv = pvBuildStack(proj);');
+  L.push('      OPT.series = stv.series;');
+  L.push('      OPT.xAxis.data = stv.scenes;');
+  L.push('      var xlab = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";');
+  // 与原图同规则: 多曲线时轴名带"× 场景", 单曲线退回纯档位轴
+  L.push('      OPT.xAxis.name = proj.curves.length>1 ? (xlab + " × 场景") : xlab;');
+  L.push('      var nSc = stv.scenes.length;');
+  // 旋转/缩放阈值与原图 rebuildAll 逐字一致 —— 同一场景数在两处长得一样
+  L.push('      var rot = nSc>10?30:(nSc>6?20:0);');
+  L.push('      var zoom = nSc>16;');
+  L.push('      OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};');
+  L.push('      OPT.xAxis.axisLabel.rotate = rot; OPT.xAxis.axisLabel.interval = 0;');
+  L.push('      OPT.xAxis.axisLabel.color = "#9ca0b0";');
+  L.push('      OPT.xAxis.axisLabel.formatter = function(v){ return (String(v).length>22) ? String(v).slice(0,21)+"…" : v; };');
+  L.push('      OPT.yAxis.name = "TTFT 构成(ms)";');
+  L.push('      OPT.legend = {top:0,textStyle:{color:"#9ca0b0",fontSize:10}};');
+  L.push('      OPT.grid = {left:70,right:20,top:36,bottom: zoom?76:(rot?62:40)};');
+  L.push('      OPT.tooltip.axisPointer = {type:"shadow"};');
+  L.push('      OPT.dataZoom = zoom ? [{type:"slider",bottom:8,height:18,borderColor:"#2e3347",');
+  L.push('        textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;');
+  L.push('    } else {');
   L.push('    OPT.series = pvBuildSeries(proj, k);');
   L.push('    OPT.xAxis.data = proj.xs;');
   L.push('    OPT.xAxis.name = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";');
@@ -6469,13 +6540,17 @@ function buildSensHtml(snapList) {
   L.push('    OPT.grid = {left:70,right:20,top:multiCurve?36:20,bottom:40};');
   L.push('    OPT.tooltip.axisPointer = undefined;');
   L.push('    OPT.dataZoom = undefined;');
+  L.push('    }');
   L.push('    ch.setOption(OPT, true);');
   L.push('  }');
   L.push('  pvRenderTable(proj, k);');
   L.push('  var dy = document.getElementById("dimY"); if(dy) dy.textContent = lb;');
   L.push('  if(note){');
   L.push('    note.className = "pvnote";');
-  L.push('    var msg = "曲线 " + proj.curves.length + " 条 · 横轴 " + proj.xv.length + " 档 · 命中 " + proj.n + " 点";');
+  // 提示口径随图形而变: 折线报"曲线 n 条", 堆叠柱报"柱 n 根"(场景数)
+  L.push('    var msg = isStack');
+  L.push('      ? ("柱 " + (proj.curves.length * proj.xv.length) + " 根(曲线 " + proj.curves.length + " × 档位 " + proj.xv.length + ") · 命中 " + proj.n + " 点")');
+  L.push('      : ("曲线 " + proj.curves.length + " 条 · 横轴 " + proj.xv.length + " 档 · 命中 " + proj.n + " 点");');
   L.push('    if(proj.xv.length<2) msg += " ⚠ 横轴只剩 1 档(无法成线)";');
   // 非角色参数仍有多值 ⇒ 同一 (x,色,形) 落多个点, 已取平均。必须显式告知, 否则读者
   // 会以为看到的是单一配置的曲线。
@@ -6483,11 +6558,27 @@ function buildSensHtml(snapList) {
   L.push('    note.textContent = msg;');
   L.push('  }');
   L.push('}');
-  // 透视数据表: 行=横轴档位, 列=曲线。与图共用同一份 proj ⇒ 图表永远一致。
+  // 透视数据表: 折线指标 → 行=横轴档位, 列=曲线; 堆叠柱 → 行=场景, 列=6分量+合计。
+  // 与图共用同一份 proj ⇒ 图表永远一致。
   L.push('function pvRenderTable(proj, k){');
   L.push('  var tbl = document.getElementById("tbl"); if(!tbl) return;');
   L.push('  var th = tbl.querySelector("thead"), tb = tbl.querySelector("tbody");');
   L.push('  if(!th||!tb) return;');
+  // 堆叠柱表: 与原图堆叠表同构(行=场景, 列=分量+合计) —— 离线时这份数字完整可用
+  L.push('  if(k===STACK_KEY){');
+  L.push('    var stv = pvBuildStack(proj);');
+  L.push('    th.innerHTML = "<tr><th>场景</th>"');
+  L.push('      + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("")');
+  L.push('      + "<th>TTFT合计</th></tr>";');
+  L.push('    tb.innerHTML = stv.scenes.map(function(sc, i){');
+  L.push('      return "<tr><td class=\\"k\\">"+esc2(sc)+"</td>"');
+  L.push('        + stv.series.map(function(s){');
+  L.push('            var v = s.data[i];');
+  L.push('            return "<td>"+esc2(v==null?"—":v)+"</td>"; }).join("")');
+  L.push('        + "<td><b>"+esc2(stv.totals[i]==null?"—":stv.totals[i])+"</b></td></tr>";');
+  L.push('    }).join("");');
+  L.push('    return;');
+  L.push('  }');
   L.push('  var xlb = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";');
   L.push('  th.innerHTML = "<tr><th>"+esc2(xlb)+"</th>"');
   L.push('    + proj.curves.map(function(c){ return "<th>"+esc2(c.name)+"</th>"; }).join("") + "</tr>";');
