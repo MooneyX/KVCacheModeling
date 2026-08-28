@@ -429,7 +429,10 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
   </div>
 
   <!-- Sensitivity Analysis -->
-  <div class="card" id="sensitivityPanel" style="display:none">
+  <!-- 2026-08-28: 面板初始即显示。原先 display:none 要靠"跑一次单次模拟"解锁(showStrategyResults),
+       但敏感性扫描与单次模拟结果**零依赖**(自包含: 自带控件/图表/导出入口) ——
+       这个门禁是初始提交的遗留, 会挡住"导入参数 → 直接扫描"的合法路径(用户实测踩到)。 -->
+  <div class="card" id="sensitivityPanel">
     <h2><span>参数敏感性</span> 分析</h2>
     <p class="subtitle">三参数敏感性：横轴「扫描参数」+ 颜色「对比参数」分档 + 纵轴「观察指标」；固定其他参数与随机种子（共同随机数法）。留空对比参数则单参数扫描。「扫描范围/对比档位」支持 <code>起点,终点,步长</code>（如 1,10,2 → 1,3,5,7,9）或显式逗号列表（空用参数默认档位）</p>
     <div class="form-row" style="margin-bottom:8px">
@@ -5185,7 +5188,7 @@ function runAllStrategies() {
 }
 function showStrategyResults(){
   $('strategyResults').style.display = 'block';
-  $('sensitivityPanel').style.display = 'block';
+  // sensitivityPanel 不再由此解锁 —— 它初始即显示(与单次模拟零依赖)
   drawStrategyMetrics();
   drawStrategyComparisonGantt();
   drawStrategyTierDemand();
@@ -5194,7 +5197,7 @@ function simError(e){
   console.error('Simulation error:', e);
   $('strategyResults').style.display = 'block';
   $('strategyMetricsGrid').innerHTML = '<div style="color:var(--accent4);padding:8px">仿真出错: '+e.message+'</div>';
-  $('sensitivityPanel').style.display = 'none';
+  // 不再隐藏 sensitivityPanel —— 单次模拟出错不该把独立的敏感性扫描入口也带走
 }
 
 function drawStrategyMetrics() {
