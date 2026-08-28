@@ -5802,6 +5802,7 @@ function buildSensHtml(snapList) {
   L.push('.fmini{background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:5px;padding:2px 7px;font-size:.68rem;cursor:pointer}');
   L.push('.fmini:hover{border-color:var(--accent);color:var(--text)}');
   L.push('.fwarn{color:#f59e0b}');
+  L.push('.fdanger{color:#ef4444}');
   // 统一筛选面板(2026-08-27 三次改造): 角色下拉 + 可调参数勾选都收进 fbar 这一块。
   L.push('.pvrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:7px 0}');
   L.push('.pvrow>b{font-size:.73rem;color:var(--text);min-width:52px;font-weight:600}');
@@ -6455,6 +6456,10 @@ function buildSensHtml(snapList) {
   // 断线处("缺该参数组合的仿真点")要显式连过去还是断开? 断开 —— 假连线会让人误以为
   // 扫过那个档位。connectNulls 保持默认 false。
   L.push('      connectNulls:false};');
+    // 被平均的曲线画虚线(2026-08-28): 该曲线至少有一个位置是多点均值,
+    // 视觉上必须与"单一配置的真实曲线"区分开
+    L.push('    var hasAvg = cv.recs.some(function(r){ return r && r.length>1; });');
+    L.push('    if(hasAvg){ s.lineStyle.type = "dashed"; s.lineStyle.width = 2.5; }');
     L.push('    if(single){ s.areaStyle={color:"rgba(108,99,255,.1)"}; s.label={show:true,color:"#9ca0b0",fontSize:9}; }');
     L.push('    return s;');
     L.push('  });');
@@ -6552,9 +6557,26 @@ function buildSensHtml(snapList) {
   L.push('      ? ("柱 " + (proj.curves.length * proj.xv.length) + " 根(曲线 " + proj.curves.length + " × 档位 " + proj.xv.length + ") · 命中 " + proj.n + " 点")');
   L.push('      : ("曲线 " + proj.curves.length + " 条 · 横轴 " + proj.xv.length + " 档 · 命中 " + proj.n + " 点");');
   L.push('    if(proj.xv.length<2) msg += " ⚠ 横轴只剩 1 档(无法成线)";');
-  // 非角色参数仍有多值 ⇒ 同一 (x,色,形) 落多个点, 已取平均。必须显式告知, 否则读者
-  // 会以为看到的是单一配置的曲线。
-  L.push('    if(proj.avgN) msg += " ⚠ " + proj.avgN + " 个位置有多点(已取平均)";');
+  // ★ 强警告(2026-08-28): 有"勾了多个值但没占到通道"的参数 ⇒ 同位置多点被平均,
+  //   平均跨负载区制时结果不对应任何真实配置。升级为红色 + 报离散度倍数,
+  //   并给出可操作的指引(自动指派已在勾选时做过, 走到这说明通道已满)。
+  //   离散度用当前指标在多点位置的 max/min; 堆叠柱用 ttft。
+  L.push('    var un2 = pvVaryingUnassigned();');
+  L.push('    if(un2.length){');
+  L.push('      var worst = 0, kk = isStack ? "ttft" : k;');
+  L.push('      proj.curves.forEach(function(c){ c.recs.forEach(function(recs){');
+  L.push('        if(!recs || recs.length<2) return;');
+  L.push('        var mn = Infinity, mx = -Infinity;');
+  L.push('        recs.forEach(function(r){ var v = r ? r[kk] : null;');
+  L.push('          if(v!=null && isFinite(v)){ if(v<mn) mn=v; if(v>mx) mx=v; } });');
+  L.push('        if(mx>0){ var rt = mn>0 ? mx/mn : Infinity; if(rt>worst) worst = rt; }');
+  L.push('      }); });');
+  L.push('      msg += " ⚠ " + un2.map(function(u){ return PIVOT_IDX[u]?PIVOT_IDX[u].label:u; }).join("/")');
+  L.push('        + " 未指派通道，多点已平均"');
+  L.push('        + (worst>1.05 ? (worst===Infinity||worst>99 ? "（相差 >99×）" : "（最大相差 "+worst.toFixed(1)+"×）") : "")');
+  L.push('        + " —— 把它指派给颜色/形状可分开画";');
+  L.push('      note.className = "pvnote fdanger";');
+  L.push('    }');
   L.push('    note.textContent = msg;');
   L.push('  }');
   L.push('}');
@@ -6606,6 +6628,38 @@ function buildSensHtml(snapList) {
   L.push('  if(es && es.value!==s) es.value = s;');
   L.push('  PV_ROLE.x = x; PV_ROLE.c = c||null; PV_ROLE.s = s||null;');
   L.push('}');
+  // ---- 差异参数的自动指派与强警告(2026-08-28) ----
+  // 背景(用户): 同时勾 32k+128k 而 input_len 未指派角色时, 图上画的是两个负载区制的
+  // 算术平均 —— 不对应任何真实配置, 分析上基本没意义。
+  // 信息无损的充要条件: 每个"有变化"的参数都必须独占一个视觉通道(横轴/颜色/形状)。
+  // 策略(软约束, 不做硬拒绝):
+  //   ① 勾选使某参数变为"有变化"且未指派 ⇒ 自动占空闲通道(先颜色后形状)
+  //   ② 通道全满仍有未指派多值参数 ⇒ 红色警告 + 离散度倍数, 被平均的曲线画虚线
+  //   ③ 不禁止平均本身(探索时有用), 但视觉上无处遁形
+  // pvVaryingUnassigned: 勾选值 >1 且未占通道的参数(只可能是可调参数, 行只给它们渲染)
+  L.push('function pvVaryingUnassigned(){');
+  L.push('  var out = [];');
+  L.push('  Object.keys(PV_SEL).forEach(function(k){');
+  L.push('    if(PIVOT_DIMS.indexOf(k)<0) return;');
+  L.push('    if(k===PV_ROLE.x||k===PV_ROLE.c||k===PV_ROLE.s) return;');
+  L.push('    if(PV_SEL[k].length>1) out.push(k);');
+  L.push('  });');
+  L.push('  return out;');
+  L.push('}');
+  // pvAutoAssign: 把未指派的有变化参数依次塞进空闲通道。只在**勾选变更**后调用;
+  // 角色下拉的 change 不调(用户改下拉是显式意图, 比如故意把颜色设为「无」)。
+  L.push('function pvAutoAssign(){');
+  L.push('  var un = pvVaryingUnassigned();');
+  L.push('  for(var i=0;i<un.length;i++){');
+  L.push('    var k = un[i], target = null;');
+  L.push('    if(!PV_ROLE.c && k!==PV_ROLE.x) target = ' + "'c'" + ';');
+  L.push('    else if(!PV_ROLE.s && k!==PV_ROLE.x && k!==PV_ROLE.c) target = ' + "'s'" + ';');
+  L.push('    if(!target) break;');
+  L.push('    PV_ROLE[target] = k;');
+  L.push('    var el = document.getElementById(target==="c"?"pvC":"pvS");');
+  L.push('    if(el) el.value = k;');
+  L.push('  }');
+  L.push('}');
   // ---- 透视的进入/退出(懒激活, 无开关) ----
   // pvToggle(on) 语义保留(内部与验证脚本都在用):
   //   · on=true  ⇒ 接管图表(fbar 加 .live 色条, 显示「恢复原图」)
@@ -6649,6 +6703,8 @@ function buildSensHtml(snapList) {
     L.push('      var at = s.indexOf(vi);');
     L.push('      if(at>=0) s.splice(at,1); else { s.push(vi); s.sort(function(a,b){return a-b;}); }');
     L.push('      el.className = "fc" + (s.indexOf(vi)>=0 ? " on" : "");');
+    // 勾选变更后: 有变化但未指派角色的参数自动占空闲通道(避免无意义的多点平均)
+    L.push('      pvAutoAssign();');
     L.push('      pvEnter();');
     L.push('    });');
     L.push('  })(vcs[i]); }');
@@ -6665,6 +6721,7 @@ function buildSensHtml(snapList) {
     L.push('        var ii = parseInt(cs[q].getAttribute("data-vi"),10);');
     L.push('        cs[q].className = "fc" + (PV_SEL[pk].indexOf(ii)>=0 ? " on" : "");');
     L.push('      }');
+    L.push('      pvAutoAssign();');
     L.push('      pvEnter();');
     L.push('    });');
     L.push('  })(pms[j]); }');
