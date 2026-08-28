@@ -267,6 +267,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>前缀命中比例(%)</label><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="width:100%" title="入组请求的前缀命中比例: 共享前缀长度 = 平均输入×此值, 命中请求跳过对应比例的前缀 prefill (h=99 → 命中请求跳过 ~99% prefill)"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">40%</span></div>
+          <div><label>L2预热命中率(%)</label><input type="range" id="pPrefixWarmL2" value="0" min="0" max="100" style="width:100%" title="双层预热(2026-08-28): 嵌套语义, ≤前缀命中比例。前缀的该比例段放入 L2(DRAM), 剩余命中段放 L3(SSD)。例: 命中95% + L2命中15% ⇒ 前缀前15%在DRAM(命中免费), 15%~95%在SSD(付拉取时间)。0(默认)=全部命中段在L3, 与原行为逐位一致。需勾选「前缀预热」生效"><span id="pPrefixWarmL2Val" style="font-size:.75rem;color:var(--accent)">0%</span></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选=decode 重复拉取: 已拉取的前缀 KV 在 decode 阶段每 pass 都重新从 L3 拉取(按 SSD 读计费)——模拟用户回复间隔较长、请求 KV cache 已被逐出 HBM/DRAM 的场景。不勾选(默认): prefill 只拉取一次, 之后驻留 HBM, decode 读 HBM(与 wait_complete'拉齐再算'语义一致)。勾选后 decode 的 L3 重读与 prefill 拉取共享同一 NVMe 总线且按需读优先: 低带宽下重读饱和会挤占后续请求的拉取, TTFT 显著上升——这正是'KV 被驱逐+带宽不足'系统不可用的信号"><input type="checkbox" id="pDecodeL3Read" style="width:auto"><label style="margin:0;font-size:.75rem" for="pDecodeL3Read">Decode 重复拉取 L3(KV 被驱逐)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="勾选(默认)=prefill 重复拉取: 每个请求独立从 L3 重新拉取完整前缀——模拟前缀在两个请求之间被逐出快层(如用户回复间隔长、热前缀集合超过快层容量)的场景。不勾选: 同组前缀的 L3 拉取只发生一次, 后续请求等待并共享该次拉取(HiCache 单飞/去重语义——前缀拉取后驻留快层, 后续请求直接命中)"><input type="checkbox" id="pFetchRepull" checked style="width:auto"><label style="margin:0;font-size:.75rem" for="pFetchRepull">Prefill 每请求重复拉取(KV 被驱逐)</label></div>
@@ -435,7 +436,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       <div><label>① 扫描参数(横轴)</label><select id="sSweepParam">
         <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
         <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
-        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
+        <option value="prefix_hit">前缀命中率</option><option value="prefix_warm_l2">L2预热命中率</option><option value="ssd_bw">L3聚合带宽</option>
         <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
         <option value="concurrency">并发请求数</option>
         <option value="gpu_preset">GPU硬件</option>
@@ -445,7 +446,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
         <option value="">无(单参数)</option>
         <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
         <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
-        <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
+        <option value="prefix_hit">前缀命中率</option><option value="prefix_warm_l2">L2预热命中率</option><option value="ssd_bw">L3聚合带宽</option>
         <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
         <option value="concurrency">并发请求数</option>
         <option value="gpu_preset">GPU硬件</option>
@@ -458,7 +459,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
             <option value="gpu_preset">GPU硬件</option>
             <option value="hbm_threshold">准入阈值(HBM)</option><option value="evict_threshold">淘汰触发阈值</option>
             <option value="prefetch_threshold">预取水位线</option><option value="max_batch_size">最大Batch Size</option>
-            <option value="prefix_hit">前缀命中率</option><option value="ssd_bw">L3聚合带宽</option>
+            <option value="prefix_hit">前缀命中率</option><option value="prefix_warm_l2">L2预热命中率</option><option value="ssd_bw">L3聚合带宽</option>
             <option value="input_len">输入长度</option><option value="qps">到达率QPS</option>
             <option value="concurrency">并发请求数</option>
           </select>
@@ -770,6 +771,8 @@ function getParams(){
     simMaxTime: gi('pSimMaxTime') || 1200,  // 仿真窗口上限(秒)：窗口 = min(排水估计, 此值)
     prefixHit: gi('pPrefixHit')/100,
     prefixWarm: !!(document.getElementById('pPrefixWarm') && document.getElementById('pPrefixWarm').checked),
+    // L2 预热命中率(2026-08-28 双层预热): 嵌套语义 ≤ prefixHit。0(默认)=全部命中段在 L3(原行为)
+    prefixWarmL2: gi('pPrefixWarmL2')/100,
     // Decode 从 L3 重读开关(2026-08-18): 勾选=已拉取前缀块 decode 期仍按 SSD 读计费(C4 前行为),
     // 模拟回复间隔长导致请求 KV 被逐出 HBM/DRAM、decode 每 pass 重新从 L3 拉取的场景
     decodeL3Read: !!(document.getElementById('pDecodeL3Read') && document.getElementById('pDecodeL3Read').checked),
@@ -1398,6 +1401,9 @@ function initParamsTab(){
   });
   $('pPrefixHit').oninput=()=>{updatePrefixHitFill();recalcAll();};
   updatePrefixHitFill();
+  // L2 预热命中率滑块(2026-08-28): 显示同步 + 嵌套约束(max 动态绑前缀命中比例)
+  let _pwl2 = $('pPrefixWarmL2');
+  if (_pwl2) _pwl2.oninput = ()=>{ updatePrefixWarmL2UI(); recalcAll(); };
   $('pAttnType').onchange=()=>{toggleMlaFields(); recalcAll();};
   toggleMlaFields();
   toggleSparseFields();   // 稀疏注意力字段初始可见性(2026-08-20)
@@ -1417,6 +1423,21 @@ function updatePrefixHitFill(){
   let pct = ((+el.value - +el.min) / (+el.max - +el.min)) * 100;
   el.style.background = 'linear-gradient(to right, var(--accent) 0%, var(--accent) ' + pct + '%, var(--border) ' + pct + '%, var(--border) 100%)';
   let val = $('pPrefixHitVal'); if (val) val.textContent = el.value + '%';
+  updatePrefixWarmL2UI();   // 嵌套约束: L2 命中率上限 = 前缀命中比例
+}
+
+// L2 预热命中率滑块 UI 同步(2026-08-28 双层预热): 显示标签 + 嵌套约束 h_l2 ≤ h_l3。
+// 上限动态绑前缀命中比例——L2 是 L3 命中段的子集, 超出无意义(UI 层防呆; 引擎侧 warmInto
+// 用 min(nTok, ...) 再兜一道)。参数导入路径经 updatePrefixHitFill 间接触发, 无需单独挂。
+function updatePrefixWarmL2UI(){
+  let el = $('pPrefixWarmL2'); if (!el) return;
+  let hit = $('pPrefixHit');
+  let cap = hit ? +hit.value : 100;
+  el.max = String(cap);
+  if (+el.value > cap) el.value = String(cap);
+  let pct = ((+el.value - +el.min) / Math.max(+el.max - +el.min, 1)) * 100;
+  el.style.background = 'linear-gradient(to right, var(--accent) 0%, var(--accent) ' + pct + '%, var(--border) ' + pct + '%, var(--border) 100%)';
+  let val = $('pPrefixWarmL2Val'); if (val) val.textContent = el.value + '%';
 }
 
 // ======================== 参数快速导入导出（2026-08-12） ========================
@@ -3185,6 +3206,10 @@ function runSimulation(strategy, overrides) {
 
   // ---------- 请求生成 ----------
   // N = 请求数（1:1 直接对应，不再 ×2）；上限256为性能保护；可通过 overrides.nreq 指定
+  // s = strategy 声明提到最前(2026-08-28): 前缀预热段(双层)的 dram 容量判定要调
+  // evictThreshold('dram')(读 s.eviction), 原声明在预热段之后 ⇒ TDZ 报错。
+  // 'ssd' 分支恰好不读 s(直接 return 0.98)才一直没暴露。
+  let s = strategy;
   let N = overrides.nreq || Math.min(p.concurrency, 256);
   let requests = [], t = 0, lambda = Math.max(p.qps, 1e-9); // qps 真实生效; 仅防 0/负导致除零(极小值→无请求到达)
   let sigma = 0.6, muL = Math.log(Math.max(p.inputLen,1)) - sigma*sigma/2;
@@ -3293,6 +3318,13 @@ function runSimulation(strategy, overrides) {
     // 并驻留，无需现场由 founder 建立——消除"founder 同时到达、sharer 必须等 founder 完成"
     // 造成的假性 miss（这正是构造"L3 带宽显著影响 TTFT"场景的前提）。
     // 开关：radix + prefixHit>0 + 前缀预热勾选时生效；SSD 容量放不下该组前缀则跳过（保底 miss 路径）。
+    // 双层预热(2026-08-28, prefixWarmL2): 嵌套语义 h_l2 ≤ h_l3 —— 前缀 [0, P×h_l2/h) 段入 dram
+    // (pwL_* 块), [P×h_l2/h, P) 段入 ssd (pw_* 块)。两组块 id 不重叠、不做真副本:
+    // findBlock 按 hbm→dram→ssd 顺序查找, dram 命中天然遮蔽 ssd 同段(与"L2 是 L3 热子集"等价)。
+    // ⚠️ L3 段必须扣掉 L2 段(l3Tok = P − l2Tok)——否则 ssdCoveredTok/fetchTime 不变, 旋钮没接线。
+    // L2 命中按"免费"口径(不进 fetchTime/不占拉取带宽; decode 侧 L2 读本就有 busyUntil 排队)。
+    // 容量回退: dram 放不下 L2 段 → L2 段并入 ssd(全量 L3, 主语义保住); ssd 放不下 → 整组跳过。
+    // prefixWarmL2=0(默认) 时 l2Tok=0 走原路径, 与原实现逐位一致(零回归保证)。
     if (p.prefixCache === 'radix' && p.prefixWarm && p.prefixHit > 0.001) {
       // 预热到指定实例(亲和关时只有 instances[0] 这一份全局池)
       function warmInto(target, gmap) {
@@ -3302,27 +3334,44 @@ function runSimulation(strategy, overrides) {
           let g = gmap[gid];
           let nTok = g.prefixTokLen;
           if (nTok <= 0) return;
+          // 双层预热: l2Tok = 组前缀的 h_l2/h 比例段(请求口径 h_l2×inputLen ⇒ 组口径 P×h_l2/h)
+          let l2Tok = 0;
+          if (p.prefixWarmL2 > 0.001) {
+            l2Tok = Math.min(nTok, Math.max(0, Math.round(nTok * p.prefixWarmL2 / Math.max(p.prefixHit, 1e-9))));
+          }
           let needBytes = nTok * kvPerTok;
           // C3 修复(2026-08-12): 注入容量口径与正常写入一致(evictThreshold=0.98),
           // 不再按 100% 填满——避免注入即满触发后续强制淘汰(prewarmed 无淘汰保护时被误伤)
           if (caps.ssd <= 0 || pools.ssd.used + needBytes * tierRatio.ssd > caps.ssd * evictThreshold('ssd')) return;
-          let nBlocksRaw = Math.ceil(nTok / p.blockSize);
-          let merge = Math.max(1, Math.ceil(nBlocksRaw / MAX_SIM_BLOCKS));
-          let nSimBlocks = Math.ceil(nBlocksRaw / merge);
-          let simBlockTokens = merge * p.blockSize;
-          let blkIds = [];
-          for (let b = 0; b < nSimBlocks; b++) {
-            let tokHere = Math.min(simBlockTokens, nTok - b * simBlockTokens);
-            if (tokHere <= 0) break;
-            // ⚠️ 块 id 必须带实例号: 亲和开启时同一组会在多个实例各热一份, id 若相同
-            // 则 findBlock 跨实例串味(它只查当前实例池, 但 id 冲突会让语义混乱)
-            // 多实例时 id 必须带实例号(共享语义下各实例也各存一份, id 不能冲突);
-            // 单实例保持原 id 格式 ⇒ 与历史逐位一致
-            let id = (instances.length > 1) ? ('pw_i' + target.id + '_' + gid + '_' + b) : ('pw_' + gid + '_' + b);
-            poolAdd('ssd', { id: id, tokens: tokHere, size: tokHere * kvPerTok, refcount: 0,
-              available: true, arriveAt: 0, shared: true, groupId: gid, reqId: -1, lastTouch: 0, prewarmed: true });
-            blkIds.push(id);
+          // dram 容量判定用 dram 自己的阈值(勿照抄 ssd 的 0.98——阈值应来自该层语义);
+          // 放不下则 L2 段并入 L3(回退单层预热, 与现状一致)
+          if (l2Tok > 0 && (caps.dram <= 0 || pools.dram.used + l2Tok * kvPerTok * tierRatio.dram > caps.dram * evictThreshold('dram'))) {
+            l2Tok = 0;
           }
+          g.l2Tok = l2Tok;   // placeRequest 的 clamp 按层优先级判定要用(见 attach 段)
+          // 分层注入: 同一段切分逻辑(merge/超级块)对两段各自适用; l2Tok=0 时 L3 段
+          // 块数/id 与原实现逐位一致
+          let blkIds = [];
+          [ ['dram', l2Tok, 'pwL_'], ['ssd', nTok - l2Tok, 'pw_'] ].forEach(seg => {
+            let tier = seg[0], segTok = seg[1], idPrefix = seg[2];
+            if (segTok <= 0) return;
+            let nBlocksRaw = Math.ceil(segTok / p.blockSize);
+            let merge = Math.max(1, Math.ceil(nBlocksRaw / MAX_SIM_BLOCKS));
+            let nSimBlocks = Math.ceil(nBlocksRaw / merge);
+            let simBlockTokens = merge * p.blockSize;
+            for (let b = 0; b < nSimBlocks; b++) {
+              let tokHere = Math.min(simBlockTokens, segTok - b * simBlockTokens);
+              if (tokHere <= 0) break;
+              // ⚠️ 块 id 必须带实例号: 亲和开启时同一组会在多个实例各热一份, id 若相同
+              // 则 findBlock 跨实例串味(它只查当前实例池, 但 id 冲突会让语义混乱)
+              // 多实例时 id 必须带实例号(共享语义下各实例也各存一份, id 不能冲突);
+              // 单实例保持原 id 格式 ⇒ 与历史逐位一致
+              let id = (instances.length > 1) ? (idPrefix + 'i' + target.id + '_' + gid + '_' + b) : (idPrefix + gid + '_' + b);
+              poolAdd(tier, { id: id, tokens: tokHere, size: tokHere * kvPerTok, refcount: 0,
+                available: true, arriveAt: 0, shared: true, groupId: gid, reqId: -1, lastTouch: 0, prewarmed: true });
+              blkIds.push(id);
+            }
+          });
           if (blkIds.length) { g.blkIds = blkIds; g.activated = true; }
         });
         usePools(prevInst);
@@ -3402,10 +3451,10 @@ function runSimulation(strategy, overrides) {
     } catch(e) { console.warn('JS strategy compile error:', e.message); }
   }
 
-  let s = strategy;
   // ---- 路由策略(S2: 轮询; S3 扩展) ----
   // 契约: 输入请求, 返回目标实例对象。只允许读**当前**可观测量(队列长度/KV 占用),
   // 不得读未来状态(否则成了"先知路由", 结论无参考价值)。
+  // (s = strategy 已前移到请求生成段开头, 2026-08-28)
   let _rrCursor = 0;
   // 实例在途负载(请求数): 路由决策的主要可观测量。
   // 用"在途请求数"而非仅 waitQueue —— 排队中 + 正在算 + 正在传 + 正在解码都占该实例资源。
@@ -3556,19 +3605,41 @@ function runSimulation(strategy, overrides) {
     });
     // 命中量不超过自身前缀长度: 组前缀 P 覆盖到最长请求, 短请求 attach 全部 P 块但
     // clamp 到自己的 inputLen×h——保证"不同长度请求命中固定比例 h"的语义
+    // 2026-08-28 双层预热(g.l2Tok>0): 分层结构确定(前段 dram + 后段 ssd), clamp 必须按
+    // 层优先级——L2 段是前缀最前段优先保留, L3 段吃剩余额度; 沿用"固定 ssd + 快层按比例
+    // 分摊"会让短请求的 L2/L3 归因偏离设定值。非双层组保持原口径(零回归)。
+    let _grp = req.groupId ? prefixGroupMap[req.groupId] : null;
     if (req.groupId && !req.isFounder && coveredTok > req.prefixTokLen) {
       coveredTok = req.prefixTokLen;
-      ssdCoveredTok = Math.min(ssdCoveredTok, req.prefixTokLen);
+      if (_grp && _grp.l2Tok > 0) {
+        let _cap = req.prefixTokLen;
+        let _kD = Math.min(dramCoveredTok, _cap);
+        let _kS = Math.min(ssdCoveredTok, _cap - _kD);
+        let _kH = Math.min(hbmCoveredTok, _cap - _kD - _kS);
+        dramCoveredTok = _kD; ssdCoveredTok = _kS; hbmCoveredTok = _kH;
+      } else {
+        ssdCoveredTok = Math.min(ssdCoveredTok, req.prefixTokLen);
+      }
     }
     // clamp 后的分层归因(2026-08-20): ssd 口径必须与 fetchTime 所用的 ssdCoveredTok 完全一致
     // (不可改, 否则动到传输时间), 故先固定 ssd, 余量按 hbm/dram 原始比例分摊——保证
     // hitL1+hitL2+hitL3 == coveredTok 恒等(守恒), 分母用 inputLen ⇒ 三层+miss = 100%。
+    // 双层预热组: clamp 已按层优先级完成, 三层直接记账(不再比例分摊)。
     let _statL3 = ssdCoveredTok;
-    let _rest = Math.max(0, coveredTok - _statL3);
-    let _rawFast = hbmCoveredTok + dramCoveredTok;
-    let _statL1 = _rawFast > 0 ? _rest * (hbmCoveredTok / _rawFast) : 0;
-    let _statL2 = _rest - _statL1;
+    let _statL1, _statL2;
+    if (_grp && _grp.l2Tok > 0) {
+      _statL2 = dramCoveredTok;
+      _statL1 = Math.max(0, coveredTok - _statL3 - _statL2);
+    } else {
+      let _rest = Math.max(0, coveredTok - _statL3);
+      let _rawFast = hbmCoveredTok + dramCoveredTok;
+      _statL1 = _rawFast > 0 ? _rest * (hbmCoveredTok / _rawFast) : 0;
+      _statL2 = _rest - _statL1;
+    }
     stats.hitTokL1 += _statL1; stats.hitTokL2 += _statL2; stats.hitTokL3 += _statL3;
+    // 双层预热(2026-08-28): 每请求实际 L2 命中量(clamp 后)——race/be 的前缀区间适配要用:
+    // L2 段[0, l2Hit) 免费可用, 拉取与 GPU 重算都只需覆盖 [l2Hit, H) 段。非双层组恒 0(零回归)。
+    req._l2HitTok = (_grp && _grp.l2Tok > 0) ? dramCoveredTok : 0;
     // S4: 每实例命中量(token 加权) —— 用于输出各实例命中率与路由亲和效果
     if (instances[req.instId || 0]) {
       instances[req.instId || 0].hitTok += coveredTok;
@@ -3748,8 +3819,11 @@ function runSimulation(strategy, overrides) {
   // 流体模式每步调用; 波次模式在波结算时调用(波次粒度)
   function progressiveActivate(q) {
     let gid = q.groupId && prefixGroupMap[q.groupId];
-    let pw = gid && gid.blkIds.length && pools.ssd.blockIndex[gid.blkIds[0]]
-      && pools.ssd.blockIndex[gid.blkIds[0]].prewarmed;
+    // 2026-08-28 双层预热: pw 判定改跨层 findBlock —— L2-only 预热(h_l2=h_l3 或 ssd 容量不足
+    // 只热了 dram 段)时 blkIds[0] 在 dram 池, 硬编码查 ssd 会取到 undefined ⇒ pw=false ⇒
+    // 预热组被当成"待 founder 建立"走进度激活, 把已注入的预热块覆盖掉(静默丢命中)
+    let _pw0 = gid && gid.blkIds.length ? findBlock(gid.blkIds[0]) : null;
+    let pw = !!(_pw0 && _pw0.blk.prewarmed);
     if (!q._race && p.prefixCache === 'radix' && q.groupId && q.groupBlkIds && gid && !pw) {
       let availN = Math.max(1, Math.min(q.groupBlkIds.length, Math.floor(q._pfDone / q._pfTotal * q.groupBlkIds.length)));
       prefixGroupMap[q.groupId].blkIds = q.groupBlkIds.slice(0, availN);
@@ -3783,8 +3857,9 @@ function runSimulation(strategy, overrides) {
     // （此前到达的组内请求按全量 prefill 处理——实测 vLLM 行为一致：组内请求同时到达时前缀
     //   完全未命中，TTFT 与 founder 相同）。hash 模式一次性激活全部；radix 渐进激活后此处兜底补齐。
     let gid = q.groupId && prefixGroupMap[q.groupId];
-    let pw = gid && gid.blkIds.length && pools.ssd.blockIndex[gid.blkIds[0]]
-      && pools.ssd.blockIndex[gid.blkIds[0]].prewarmed;
+    // 2026-08-28 双层预热: pw 判定改跨层 findBlock(同 progressiveActivate 的修正)
+    let _pw1 = gid && gid.blkIds.length ? findBlock(gid.blkIds[0]) : null;
+    let pw = !!(_pw1 && _pw1.blk.prewarmed);
     if (q.groupId && q.groupBlkIds && gid && !pw) {
       if (p.prefixCache === 'hash' && !prefixGroupMap[q.groupId].activated) {
         prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
@@ -4211,8 +4286,11 @@ function runSimulation(strategy, overrides) {
         // be: 准入即终止排队期尽力拉取——已拉量定格, 未拉前缀 + 后缀由 GPU 重算。
         // fetchTime 默认纯带宽(线性), 已拉 token 按比例折算(_fetchDone/fetchTime×H);
         // 排队期拉完(H) → _pfTotal=0 → 无需计算直接完成。
+        // 双层预热(2026-08-28): L2 段 [0, l2h) 无条件可用(免费), 拉取进度只作用于
+        // L3 段 [l2h, H) ⇒ fetchTok = l2h + 进度×(H−l2h)。l2h=0 退化为原式。
         let H = rq._pfStartPos || 0;
-        let fetchTok = H > 0 ? Math.min(H, Math.floor((rq._fetchDone || 0) / Math.max(rq.fetchTime, 1e-9) * H)) : 0;
+        let l2h = rq._l2HitTok || 0;
+        let fetchTok = H > 0 ? Math.min(H, l2h + Math.floor((rq._fetchDone || 0) / Math.max(rq.fetchTime, 1e-9) * (H - l2h))) : 0;
         rq._beFetchedTok = fetchTok;
         if (rq._ft0 !== undefined && rq._ft1 === undefined) rq._ft1 = now; // be: 准入即终止拉取, 传输过程结束
         rq._bePrefixCap = Math.max(0, H - fetchTok);
@@ -4312,8 +4390,11 @@ function runSimulation(strategy, overrides) {
         if (qq._race) {
           // race: 阶段0 GPU 从前往后计算前缀[0, H](pos=已算前缀数, 位置从0递增);
           // 相遇后阶段1 计算非复用后缀[H, L](pos=H+已算后缀数, 位置从H递增)
+          // 双层预热(2026-08-28): L2 段[0, l2h) 免费可用, GPU 从 l2h 起算(pos 偏移),
+          // 相遇区间缩为 [l2h, H)。l2h=0 时与原式逐位一致。
           let H = qq._pfStartPos || 0;
-          let pos = qq._raceMeetTok < 0 ? qq._pfDone
+          let l2h = qq._l2HitTok || 0;
+          let pos = qq._raceMeetTok < 0 ? (l2h + qq._pfDone)
             : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
           qq._tauNow = prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b(卡数不同)
           sumCost += qq._tauNow;
@@ -4327,8 +4408,10 @@ function runSimulation(strategy, overrides) {
         let pos;
         if (qq._be) {
           // be: 先算未拉前缀[0, cap)(位置从0递增, 成本低), 再算后缀[H, L](位置从H递增)
+          // 双层预热(2026-08-28): 未拉段实为 [l2h, H−pulled), 位置从 l2h 起算(L2 段 KV 已在 GPU)。
           let cap = qq._bePrefixCap || 0;
-          pos = qq._pfDone < cap ? qq._pfDone : (qq._pfStartPos || 0) + (qq._pfDone - cap);
+          let l2h = qq._l2HitTok || 0;
+          pos = qq._pfDone < cap ? (l2h + qq._pfDone) : (qq._pfStartPos || 0) + (qq._pfDone - cap);
         } else {
           // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
           pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
@@ -4370,16 +4453,18 @@ function runSimulation(strategy, overrides) {
         if (fq._race) {
           if (fq._raceMeetTok >= 0) continue;
           let H = fq._pfStartPos || 0;
+          let l2h = fq._l2HitTok || 0;
+          let Hl = H - l2h;   // 双层预热: 拉取目标只含 L3 段 [l2h, H), L2 段不占 L3 带宽
           if (coalesce && fq.groupId) {
             let gp = groupPull[fq.groupId];
             if (gp && fq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
               fq._coGp = gp;
-              fq._raceTok = gp.doneAt !== null ? H : Math.max(fq._raceTok, gp.frac * H);
+              fq._raceTok = gp.doneAt !== null ? Hl : Math.max(fq._raceTok, gp.frac * Hl);
               continue;
             }
             if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
           }
-          let rem = Math.max(0, H - fq._raceTok) * kvPerTok;
+          let rem = Math.max(0, Hl - fq._raceTok) * kvPerTok;
           if (rem > 0) fetchJobs.push({ req: fq, rem: rem, kind: 'race' });
         } else if (fq._be) {
           // be: 准入时已终止拉取(排队期尽力拉的量已定格), 剩余由 GPU 重算, 无拉取
@@ -4424,7 +4509,8 @@ function runSimulation(strategy, overrides) {
         let q2 = j.req;
         if (j.kind === 'race') {
           q2._raceTok += take / Math.max(kvPerTok, 1);
-          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._raceTok / Math.max(q2._pfStartPos || 1, 1));
+          // 双层预热: frac 分母 = L3 段长度(H − l2h), 与拉取目标同口径
+          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._raceTok / Math.max((q2._pfStartPos || 0) - (q2._l2HitTok || 0), 1));
         } else if (j.kind === 'wc') {
           q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
           if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(q2.fetchTime, 1e-9));
@@ -4529,7 +4615,8 @@ function runSimulation(strategy, overrides) {
           q._pfDone += perReqTok;
           if (q._raceMeetTok < 0) {
             // 阶段0: GPU 算前缀; 相遇判定(已算+已拉覆盖全前缀)
-            if (q._pfDone + q._raceTok >= (q._pfStartPos || 0)) {
+            // 双层预热: 相遇区间 = [l2h, H) —— L2 段免费可用, 不占"已算+已拉"的覆盖目标
+            if (q._pfDone + q._raceTok >= (q._pfStartPos || 0) - (q._l2HitTok || 0)) {
               q._raceMeetTok = q._pfDone;   // 相遇点: GPU 已算前缀 token 数
               if (q._ft1 === undefined) q._ft1 = now;  // race: 相遇即停止拉取, 传输过程结束
               if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: 相遇 ⇒ 组前缀完整
@@ -4621,7 +4708,9 @@ function runSimulation(strategy, overrides) {
           // DRAM → HBM（受预取水位线约束）
           if (pools.hbm.used / Math.max(caps.hbm, 1) >= (s.prefetch.prefetch_threshold || 0.5)) continue;
           let blk = pools.dram.blockIndex[id];
-          if (blk && blk.available && pools.hbm.used + blk.size <= caps.hbm * 0.95) {
+          // 2026-08-28: 加 !blk.prewarmed —— 双层预热后 dram 池有 L2 常驻前缀块,
+          // 搬到 HBM 会占显存且改变分层归因(历史上 dram 无 prewarmed 块, 此条件对旧行为无影响)
+          if (blk && !blk.prewarmed && blk.available && pools.hbm.used + blk.size <= caps.hbm * 0.95) {
             scheduleTransfer(blk, 'dram', 'hbm'); moved++; stats.prefetches++; dirty = true;
           }
         }
@@ -6668,6 +6757,7 @@ const SENS_LEVELS = {
   prefetch_threshold: [10,30,50,70,90],
   max_batch_size: [4,8,16,32,64,128,256],
   prefix_hit: [0,25,50,75,100],
+  prefix_warm_l2: [0,10,25,50,75],  // L2 预热命中率(嵌套 ≤ prefix_hit; 引擎侧超出会被 clamp)
   // 2026-08-18: 默认档位改为覆盖整机8卡聚合带宽 50→400GB/s 收益区间（原 1..80 停在收益饱和点之前）
   ssd_bw: [10,25,50,100,150,200,300,400],
   input_len: [2048,8192,16384,32768,65536],
@@ -6681,7 +6771,7 @@ const SENS_LEVELS = {
 const SENS_GPU_LABEL = { 'h20x8':'H20×8', 'h100x8':'H100×8', 'a100x8':'A100×8',
   'b200x8':'B200×8', 'b300x8':'B300×8', 'a950pr8':'昇腾950PR×8', 'a950dt8':'昇腾950DT×8',
   'klxp800x8':'昆仑芯P800×8', 'klxp900x32':'昆仑芯P900×32' };
-const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', ssd_bw:'L3聚合带宽', input_len:'输入长度', qps:'到达率QPS', concurrency:'并发请求数', gpu_preset:'GPU硬件'};
+const SENS_PARAM_LABEL = {hbm_threshold:'准入阈值', evict_threshold:'淘汰触发阈值', prefetch_threshold:'预取水位线', max_batch_size:'最大Batch Size', prefix_hit:'前缀命中率', prefix_warm_l2:'L2预热命中率', ssd_bw:'L3聚合带宽', input_len:'输入长度', qps:'到达率QPS', concurrency:'并发请求数', gpu_preset:'GPU硬件'};
 // 观察指标(纵轴)标签表 —— 2026-08-25 由 runSensitivity 内联字面量提升为全局常量:
 // 导出的 HTML 需要在页面内**切换指标**, 必须拿到同一份 key→中文标签映射, 否则两处各写一份
 // 早晚漂移(平台里加了指标而导出页下拉里没有)。**新增扫描指标必须同时改三处**:
@@ -6738,6 +6828,7 @@ function applyParamVal(s, ov, key, val) {
     case 'max_batch_size':     s.batching.max_batch_size = val; break;
     // ---- overrides: 负载与硬件 ----
     case 'prefix_hit':  ov.prefixHit = val / 100; break;
+    case 'prefix_warm_l2': ov.prefixWarmL2 = val / 100; break;
     case 'ssd_bw':      ov.ssdBW = val; break;
     case 'input_len':   ov.inputLen = val; break;
     case 'qps':         ov.qps = val; break;
@@ -6771,6 +6862,7 @@ function baseValsOf() {
   let out = {};
   try {
     out.prefix_hit = gi('pPrefixHit');
+    out.prefix_warm_l2 = gi('pPrefixWarmL2');
     out.ssd_bw = gv('pSsdBW');
     out.input_len = gi('pInputLen');
     out.qps = gv('pQps');
