@@ -5705,7 +5705,7 @@ function buildSensHtml(snapList) {
     pivotIndex[k] = {
       // prefetch 不在 SENS_PARAM_LABEL 里(它不是可扫描参数, 是策略字段) ⇒ 单独给中文名,
       // 否则面板上出现一行英文 key
-      label: SENS_PARAM_LABEL[k] || (k === 'prefetch' ? '预取策略' : k),
+      label: SENS_PARAM_LABEL[k] || (k === 'prefetch' ? '预取策略' : (k === 'maxPrefillTok' ? 'Prefill token预算' : k)),
       vals: vals,
       // 非数值维度直接用原值当显示文本(sensParamUnit 的默认分支会给它加 '%')
       texts: vals.map(function (v) {
@@ -5924,23 +5924,22 @@ function buildSensHtml(snapList) {
   L.push('<div class="card"><h2>📋 数据表 <button class="btn" onclick="copyTsv()">复制为 TSV（可直接粘贴到 Excel）</button>'
     + '<span id="copyNote" style="color:var(--accent2);font-size:.72rem"></span></h2>');
   L.push('<table id="tbl"><thead>' + head + '</thead><tbody>' + rows + '</tbody></table></div>');
-  if (st.paramsJson) {
-    // ===== 参数展示(2026-08-26) =====
-    // 原先只把 JSON 原文塞 <pre> 里 —— 拿到图的人根本读不懂 `"pDtype":"1"` 是什么。
-    // 现改为**按平台的分区分组 + 中文标签 + 可读值**呈现, 原始 JSON 折叠保留(复现用)。
-    let pMeta = st.paramMeta || {};
+  // ===== 参数展示(2026-08-26 初版 / 2026-08-31 批次跟随改造) =====
+  // 原先只把 JSON 原文塞 <pre> 里 —— 拿到图的人根本读不懂 `"pDtype":"1"` 是什么。
+  // 现改为**按平台的分区分组 + 中文标签 + 可读值**呈现, 原始 JSON 折叠保留(复现用)。
+  //
+  // ★ 2026-08-31: 多批次导出时, 参数区原先只渲染 st(当前快照)一份且**不随批次切换** ——
+  //   用户点「批次 #8」后看到的仍是第 1 批的参数(实测困惑)。现把**每个快照**的参数区
+  //   HTML 都在生成时各自渲染好, 烧进 SNAP_PARAMS_HTML; 点批次 chip 时整段换入 #pWrap。
+  // paramsInnerOf: 渲染一个快照的参数区内部 HTML(分组网格 + 原始JSON块), 返回 {inner, count}
+  function paramsInnerOf(sn) {
+    let pMeta = sn.paramMeta || {};
     let pData = {};
-    try { pData = JSON.parse(st.paramsJson); } catch (e) { pData = {}; }
+    try { pData = JSON.parse(sn.paramsJson); } catch (e) { pData = {}; }
     let pKeys = Object.keys(pData).filter(function (k) { return k.charAt(0) !== '_'; });
     // 有元信息才分组; 老快照(无 paramMeta)安全降级为纯 JSON
     let hasMeta = pKeys.some(function (k) { return pMeta[k]; });
-
-    L.push('<div class="card"><h2>🔧 参数配置'
-      + '<span style="font-size:.7rem;color:var(--text-dim);font-weight:400">共 ' + pKeys.length + ' 项'
-      + (hasMeta ? ' · <span style="border-left:3px solid var(--accent2);padding-left:5px">左侧色条 = 非默认值</span>' : '')
-      + '</span>'
-      + '<button class="ptog" id="pJsonTog" style="margin-left:auto">{ } 原始 JSON</button></h2>');
-
+    let B = [];
     if (hasMeta) {
       // 值渲染: select 取 option 文本(而非 "1"/"gqa"), bool 取 开/关, 数字加千分位
       let fmtVal = function (id, v) {
@@ -5987,23 +5986,23 @@ function buildSensHtml(snapList) {
         if (gIdx[sec] == null) { gIdx[sec] = groups.length; groups.push({ sec: sec, ids: [] }); }
         groups[gIdx[sec]].ids.push(k);
       });
-      L.push('<div id="pView">');
+      B.push('<div id="pView">');
       groups.forEach(function (g) {
         let nMod = g.ids.filter(function (k) { return isMod(k, pData[k]); }).length;
-        L.push('<div class="pgrp"><h3>' + esc(g.sec)
+        B.push('<div class="pgrp"><h3>' + esc(g.sec)
           + '<i>' + g.ids.length + ' 项' + (nMod ? ' · ' + nMod + ' 项已改' : '') + '</i></h3>');
-        L.push('<div class="pgrid">');
+        B.push('<div class="pgrid">');
         g.ids.forEach(function (k) {
           let m = pMeta[k] || {};
           let fv = fmtVal(k, pData[k]);
           let mod = isMod(k, pData[k]);
           // title 里带上 id 与默认值 —— 便于对照平台/回填, 又不占版面
           let tip = k + (m.def !== undefined && m.def !== '' ? '  (默认 ' + m.def + ')' : '');
-          L.push('<div class="pf' + (mod ? ' mod' : '') + '" title="' + esc(tip) + '">'
+          B.push('<div class="pf' + (mod ? ' mod' : '') + '" title="' + esc(tip) + '">'
             + '<span class="pk">' + esc(m.label || k) + '</span>'
             + '<span class="pv' + (fv.off ? ' off' : '') + '">' + esc(fv.text) + '</span></div>');
         });
-        L.push('</div></div>');
+        B.push('</div></div>');
       });
       // 多行文本(策略 DSL)单独成块 —— 用 <pre> 保留换行与缩进, 这是调度语义的核心,
       // 比任何单个数字都重要, 值得占版面
@@ -6013,17 +6012,45 @@ function buildSensHtml(snapList) {
         let nm = (m.label && m.label !== k) ? m.label
           : (k === 'sDsl' ? '📜 策略 DSL（调度语义）' : k);
         let nLine = String(pData[k]).split('\n').length;
-        L.push('<div class="pgrp"><h3>' + esc(nm) + '<i>' + nLine + ' 行'
+        B.push('<div class="pgrp"><h3>' + esc(nm) + '<i>' + nLine + ' 行'
           + (m.sec ? ' · ' + m.sec : '') + '</i></h3>');
-        L.push('<pre style="max-height:160px">' + esc(String(pData[k])) + '</pre></div>');
+        B.push('<pre style="max-height:160px">' + esc(String(pData[k])) + '</pre></div>');
       });
-      L.push('</div>');
+      B.push('</div>');
     }
     // 原始 JSON: 默认折叠(hasMeta 时), 无元信息时直接展开 —— 保证任何情况下都能复现
-    L.push('<div id="pJson"' + (hasMeta ? ' style="display:none"' : '') + '>');
-    L.push('<p style="font-size:.71rem;color:var(--text-dim);margin:0 0 6px">'
+    B.push('<div id="pJson"' + (hasMeta ? ' style="display:none"' : '') + '>');
+    B.push('<p style="font-size:.71rem;color:var(--text-dim);margin:0 0 6px">'
       + '可全选复制后粘回平台「导入参数」以复现本次扫描</p>');
-    L.push('<pre>' + esc(st.paramsJson) + '</pre></div>');
+    B.push('<pre>' + esc(sn.paramsJson) + '</pre></div>');
+    return {
+      inner: B.join('\n'),
+      count: '共 ' + pKeys.length + ' 项'
+        + (hasMeta ? ' · <span style="border-left:3px solid var(--accent2);padding-left:5px">左侧色条 = 非默认值</span>' : ''),
+      hasMeta: hasMeta
+    };
+  }
+  // 每个批次各自的参数区 HTML(无 paramsJson 的老快照给占位说明)
+  let snapParamsHtml = snaps.map(function (sn) {
+    if (!sn.paramsJson) {
+      return { html: '<p style="font-size:.75rem;color:var(--text-dim);margin:4px 0">该批次无参数配置快照（老版本平台导出）</p>',
+        count: '该批次无参数快照' };
+    }
+    let r = paramsInnerOf(sn);
+    return { html: r.inner, count: r.count };
+  });
+  let stParams = st.paramsJson ? paramsInnerOf(st) : null;
+  // 卡片渲染条件: st 或任一批次有参数快照(st 可能不在勾选列表里, 与初始图 = st.opt 同语义)
+  let anyParams = stParams || snapParamsHtml.some(function (x) { return x.html; });
+  if (anyParams) {
+    let ini = stParams || snapParamsHtml[0];
+    let iniInner = stParams ? stParams.inner : snapParamsHtml[0].html;
+    let iniCount = stParams ? stParams.count : snapParamsHtml[0].count;
+    L.push('<div class="card"><h2>🔧 参数配置'
+      + '<span id="pCount" style="font-size:.7rem;color:var(--text-dim);font-weight:400">' + iniCount + '</span>'
+      + (multi ? '<span style="font-size:.7rem;color:var(--text-dim);font-weight:400"> · 随批次切换</span>' : '')
+      + '<button class="ptog" id="pJsonTog" style="margin-left:auto">{ } 原始 JSON</button></h2>');
+    L.push('<div id="pWrap">' + iniInner + '</div>');
     L.push('</div>');
   }
   L.push('<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放'
@@ -6338,6 +6365,8 @@ function buildSensHtml(snapList) {
   L.push('var PIVOT_DIMS = ' + safeJson(hasPivot ? pivotDims : []) + ';');
   L.push('var HAS_PIVOT = ' + (hasPivot ? 'true' : 'false') + ';');
   L.push('var SNAP_META = ' + safeJson(snapMeta) + ';');
+  // 每个批次的参数区 HTML(批次切换时整段换入 #pWrap; 2026-08-31)
+  L.push('var SNAP_PARAMS_HTML = ' + safeJson(snapParamsHtml) + ';');
   // 面板待机时的提示文案(含点云规模信息) —— pvToggle(false) 退回原图时也恢复成它
   L.push('var PV_HINT = ' + safeJson(pivHint + ' —— 改动任一项即按所选角色重绘') + ';');
   L.push('var PV_ON = false;');
@@ -6752,6 +6781,8 @@ function buildSensHtml(snapList) {
     L.push('        cs[q2].className = "fc" + ((PV_SEL[pk2]||[]).indexOf(ii2)>=0 ? " on" : "");');
     L.push('      }');
     L.push('      for(var w=0;w<sbs.length;w++) sbs[w].className = "fc" + (w===si ? " on" : "");');
+    // 底部参数配置区跟随批次(2026-08-31): 换成该批次的参数快照
+    L.push('      if(typeof pvSwapParams === "function") pvSwapParams(si);');
     // 点批次即视为要用透视看 ⇒ 懒激活(角色已在上面按该批次设好, 这里只需进入并重绘)
     L.push('      pvSyncRoles("x"); pvEnter();');
     L.push('    });');
@@ -6773,11 +6804,14 @@ function buildSensHtml(snapList) {
   L.push('    try{document.execCommand("copy"); ok();}catch(e){ if(note) note.textContent="⚠ 复制失败，请手动选中表格"; } document.body.removeChild(ta); }');
   L.push('}');
   // 参数区: 「原始 JSON」折叠开关。有分组视图时默认收起 JSON, 点一下展开供复制回填。
+  // ⚠️ #pJson/#pView 必须**每次点击时重新解析** —— 批次切换会整段替换 #pWrap 的
+  //   innerHTML, 初始化时缓存的引用会变成已分离的旧节点(点了没反应)。
   L.push('(function(){');
-  L.push('  var tog = document.getElementById("pJsonTog"), box = document.getElementById("pJson"),');
-  L.push('      view = document.getElementById("pView");');
-  L.push('  if(!tog||!box) return;');
+  L.push('  var tog = document.getElementById("pJsonTog");');
+  L.push('  if(!tog) return;');
   L.push('  tog.addEventListener("click", function(){');
+  L.push('    var box = document.getElementById("pJson"), view = document.getElementById("pView");');
+  L.push('    if(!box) return;');
   L.push('    var showJson = (box.style.display === "none");');
   L.push('    box.style.display = showJson ? "" : "none";');
   // 有分组视图时二者互斥切换(避免页面被撑得很长); 无分组视图时 JSON 常显
@@ -6785,6 +6819,15 @@ function buildSensHtml(snapList) {
   L.push('    tog.textContent = showJson ? "▤ 分组视图" : "{ } 原始 JSON";');
   L.push('  });');
   L.push('})();');
+  // pvSwapParams: 批次切换时把该批次的参数区 HTML 换入 #pWrap, 并重置计数与折叠状态
+  L.push('function pvSwapParams(si){');
+  L.push('  var w = document.getElementById("pWrap");');
+  L.push('  if(!w || typeof SNAP_PARAMS_HTML==="undefined" || !SNAP_PARAMS_HTML.length) return;');
+  L.push('  var it = SNAP_PARAMS_HTML[si]; if(!it) return;');
+  L.push('  w.innerHTML = it.html;');
+  L.push('  var c = document.getElementById("pCount"); if(c) c.innerHTML = it.count;');
+  L.push('  var tog = document.getElementById("pJsonTog"); if(tog) tog.textContent = "{ } 原始 JSON";');
+  L.push('}');
   L.push('<\/script></body></html>');
   return L.join('\n');
 }
@@ -6955,6 +6998,9 @@ function sensParamUnit(param, v) {
   if (param === 'max_batch_size') return 'B=' + v;
   if (param === 'concurrency') return 'N=' + v;
   if (param === 'input_len') return v >= 1024 ? (v / 1024) + 'k tok' : v + ' tok';
+  // Prefill token 预算(2026-08-31): 它不是正式扫描维, 但整合导出里可作区分参数出现
+  // (如 P5 批次 4096/16384/65536) —— 走默认分支会被加成 '4096%'(用户实测)
+  if (param === 'maxPrefillTok') return v >= 1024 ? (v / 1024) + 'k tok' : v + ' tok';
   if (param === 'qps') return v + ' qps';
   return v + '%';
 }
