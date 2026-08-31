@@ -326,6 +326,13 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
           </select></div>
           <div><label>前缀缓存亲和</label><label style="font-weight:400;font-size:.75rem;display:flex;align-items:center;gap:4px;margin-top:4px" title="仅实例数>1 时生效。&#10;关(默认): 前缀池全局一份——所有实例共享前缀缓存(相当于有全局共享 KV 存储), 前缀命中率是**保证值**, 与历史全部结论口径一致。&#10;开: 前缀池按实例隔离——命中要求'同前缀曾被路由到同一实例'。于是前缀命中率变成**理想上限**, 实际命中由路由质量决定: hash_prefix 能保住, 随机/轮询会塌陷到约 上限÷实例数。&#10;⚠️ 开启会改变命中率语义, 历史结论不可直接对比。"><input type="checkbox" id="pPrefixAffinity" onchange="recalcAll()"> 按实例隔离前缀池</label></div>
         </div>
+        <!-- EP(专家并行)部署参数(2026-08-31): 与多实例/PD 并列的部署旋钮。详见 reports/EP多实例并行支持_修改设计_20260831.md -->
+        <div class="form-row" style="margin-top:6px">
+          <div><label>EP组大小</label><input type="number" id="pEpSize" value="1" min="1" onchange="recalcAll()" title="专家并行组大小(仅 MoE 模型生效), 1=不开 EP(默认, 与历史口径逐位一致)。&#10;物理效应: ①专家权重按 EP 域分片 ⇒ 每卡权重=dense全量/TP + 专家/EP, 释放 KV 容量;&#10;②每个 MoE 层 dispatch+combine 两次 AllToAll(NVLink), 计入 prefill a 项与 decode 通信;&#10;③EP>1 隐含 DP-attention 形态 ⇒ L2 读复制消失, PCIe 聚合带宽按 gpus×单卡 计(介质 DRAM 封顶)。&#10;约束: 1 ≤ EP ≤ 实例卡数(超出自动 clamp); 一阶段只支持实例内 EP(NVLink 域), 无跨机拓扑。"></div>
+          <div><label>MoE层数</label><input type="number" id="pMoeLayers" value="0" min="0" onchange="recalcAll()" title="MoE 层数(模型预设自动填入): 0=非MoE/全部 dense(EP 不生效)。&#10;DS-V3/V3.2=58(61层中前3层dense) · Kimi-K2=60 · GLM-5.1=75 · Qwen3-30B-A3B=48。"></div>
+          <div><label>稠密参数(B)</label><input type="number" id="pDenseB" value="0" min="0" step="0.1" onchange="recalcAll()" title="dense(非专家)参数量, 单位 B(模型预设自动填入): embed + dense 层 + 各层 attention/shared expert。&#10;0=未填 ⇒ 全部参数按 dense 处理(EP 只加通信, 无容量收益)。&#10;DS-V3=17 · Kimi-K2=12 · GLM-5.1=18 · Qwen3-30B-A3B=1.5(按官方 config 核算, 见 models 注释)。"></div>
+          <div><label>A2A系数</label><input type="number" id="pA2aFactor" value="1" min="0.1" step="0.1" onchange="recalcAll()" title="AllToAll 实现差异系数: 1=DeepEP 按 rank 去重(默认, 理想均衡); 最坏 ≈ topk(逐 expert 重复发送)。&#10;也可兼作 expert 负载倾斜的 derating 旋钮(>1 放大通信时间)。"></div>
+        </div>
       </div>
     </div>
     <button class="btn" onclick="recalcAll()" style="margin-top:12px">🔄 重新计算全部</button>
@@ -591,7 +598,9 @@ let models = {
   'Llama-3-8B':    {attn:'gqa', layers:32, kvHeads:8, headDim:128, hidden:4096, vocab:128256, paramsB:0, actB:0},
   'Qwen2.5-7B':    {attn:'gqa', layers:28, kvHeads:4, headDim:128, hidden:3584, vocab:151936, paramsB:0, actB:0},
   'Qwen3-32B':     {attn:'gqa', layers:64, kvHeads:8, headDim:128, hidden:5120, vocab:151936, paramsB:32, actB:32},
-  'Qwen3-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:151936, paramsB:30.5, actB:3.3},
+  'Qwen3-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:151936, paramsB:30.5, actB:3.3,
+    // EP 字段(2026-08-31): 48 层全 MoE ⇒ moeLayers=48; denseB = embed 0.62 + 48×GQA attn 0.019 ≈ 1.5B
+    moeLayers:48, denseB:1.5},
   // qHeads: attention query head 数（Roofline 推导 prefill 位置斜率 b 用）。
   // GQA 省略即可（hidden/headDim 自动推导等价）；MLA 必须显式——DS-V3 有 128 head 而
   // hidden/headDim=56，自动推导低估 attention 计算量 2.3×。V2-Lite 恰好 16=2048/128，可省。
@@ -600,11 +609,20 @@ let models = {
   // 腾讯混元 Hy3 (2026-07-06 GA, Apache 2.0): MoE 192专家/top-8, 80层主网络(+1层MTP),
   // GQA 64头/8KV头/headDim128, hidden 4096, interm 13312, vocab 120832, 256K 上下文, BF16/FP8
   // KV/tok(BF16) = 2×80×8×128×2 = 320KB → 256K 上下文单请求 KV 达 85.9GB(长上下文 KV 压力大)
-  'Hunyuan-Hy3':    {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:4096, vocab:120832, paramsB:295, actB:21},
+  'Hunyuan-Hy3':    {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:4096, vocab:120832, paramsB:295, actB:21,
+    // EP 字段为**估算值**(官方 config 未逐项核对, 2026-08-31): 80 层按全 MoE 处理,
+    // denseB=embed 1.0 + 80×GQA attn ~0.05 ≈ 5B。⚠️ 填错只影响 EP 容量项, 不进 a/b 主链
+    moeLayers:80, denseB:5},
   // 混元翻译旗舰 Hy-MT2-30B-A3B: MoE 30B/3B 激活（架构细节未完整公开，层数/hidden 按同级 MoE 估计）
-  'Hunyuan-MT2-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:120832, paramsB:30, actB:3},
+  'Hunyuan-MT2-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:120832, paramsB:30, actB:3,
+    moeLayers:48, denseB:1.5},  // EP 字段按同级 Qwen3-30B-A3B 估算(2026-08-31), 待官方 config 核对
   'DeepSeek-V3':   {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256, paramsB:671, actB:37, qHeads:128,
     qkNope:128, vHeadDim:128,
+    // EP 字段(2026-08-31, 官方 config 核算): 61 层 = 3 dense + **58 MoE**(first_k_dense_replace=3)。
+    // denseB 核算: embed 1.84 + 3×dense层(attn 0.19+mlp 0.40)1.75 + 58×(MLA attn 0.19 + shared expert 0.044) ≈ 17.2B
+    // ⚠️ 设计文档示例曾按 ~37B(=actB) 示意, 那是把"激活参数"当 dense —— actB 含 8 个激活专家
+    //    (58层×8×44M ≈ 20.4B), 真实 dense ≈ 17B。以 config 逐项核算值为准。
+    moeLayers:58, denseB:17,
     // 实测校准(2026-08-10, 8×H20 分散到达口径): 单请求 2048 tok prefill=444ms → a≈216μs/tok
     // (8/6 同时发送口径曾拟合 79.5, 分散到达实测修正; b=kvPerTok/aggHbmBW=1.1e-3 物理确定)
     // ⚠️ 2026-08-20: b 的口径已从吸收式改为解压式 MHA(降 3.4×), calibB 是更早期口径拟合值, 建议重新校准
@@ -618,7 +636,8 @@ let models = {
   // calibA/calibB 不继承 V3 的实测值 —— 那是稠密口径拟合的, 稀疏下由 Roofline 自动推导。
   'DeepSeek-V3.2-Exp': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256,
     paramsB:671, actB:37, qHeads:128, qkNope:128, vHeadDim:128,
-    sparse:true, sparseTopk:2048, idxHeads:64, idxHeadDim:128},
+    sparse:true, sparseTopk:2048, idxHeads:64, idxHeadDim:128,
+    moeLayers:58, denseB:17},  // EP 字段同 V3(2026-08-31): 架构相同, Indexer 仅 +~0.3B 已含在 17 的舍入内
   // ===== 1T 级开源模型(2026-08-21 新增, 用于对齐《Agentic AI 推理流量模型分析》的"1T 模型"口径) =====
   // Kimi K2 (Moonshot AI, 2025-07, Modified MIT): 真正的 1T MoE + MLA。
   // 官方 config.json 逐字段: 61 层(1 dense + 60 MoE) / hidden 7168 / kv_lora_rank 512 /
@@ -630,13 +649,17 @@ let models = {
   //   ⇒ 对存储网/L3 带宽建模而言 K2 与 DS-V3 等价, 但 prefill 更快 ⇒ 存储网占比更高
   // 参数量核算(按 config 手算, 与官方宣称对表): 激活 32.7B(官方 32B) / 总 1026B(官方 1T) ✓
   'Kimi-K2': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:163840,
-    paramsB:1000, actB:32, qHeads:64, qkNope:128, vHeadDim:128},
+    paramsB:1000, actB:32, qHeads:64, qkNope:128, vHeadDim:128,
+    // EP 字段(2026-08-31, 官方 config 核算): 61 层 = 1 dense + **60 MoE**。
+    // denseB: embed 2.35 + 1×dense层 0.5 + 60×(attn 0.10 + shared 0.044) ≈ 11.6B
+    moeLayers:60, denseB:12},
   // Kimi K2 Thinking (2025-11, Modified MIT): 架构与 K2 完全相同, 差异在 256K 上下文
   // + 原生 INT4 量化(QAT) + 思维链。Agentic 长上下文场景更贴近报告设定。
   // 权重 INT4 ⇒ 权重精度选 FP8 会高估显存 2×, 但引擎权重精度下拉最细到 FP8, 故 paramsB 保持
   // 1000 由用户按需调权重精度; KV 仍是 BF16/FP8(INT4 只量化权重不量化 KV)。
   'Kimi-K2-Thinking': {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:163840,
-    paramsB:1000, actB:32, qHeads:64, qkNope:128, vHeadDim:128},
+    paramsB:1000, actB:32, qHeads:64, qkNope:128, vHeadDim:128,
+    moeLayers:60, denseB:12},  // EP 字段同 K2(2026-08-31)
   // Ling-1T (蚂蚁 inclusionAI, 2025-10, MIT): 1T MoE 但用 **GQA** —— 与 K2 形成关键对照。
   // 官方 config: 80 层 / hidden 8192 / num_key_value_heads 8 / head_dim 128 / 64 q 头 /
   //   vocab 157184 / 256 experts top-8 + 1 shared / BF16。
@@ -645,7 +668,10 @@ let models = {
   //    做存储网/L3 建模必须看 attention 类型, 不能只看参数量。
   // 参数量核算: 激活 50.9B(官方 ~50B) / 总 1000B(官方 1T) ✓
   'Ling-1T': {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:157184,
-    paramsB:1000, actB:51},
+    paramsB:1000, actB:51,
+    // EP 字段为**估算值**(2026-08-31, 待官方 config 核对): 按 1 dense + 79 MoE;
+    // denseB = embed 2.6 + dense层 ~0.7 + 79×(GQA attn 0.067) ≈ 8.6B
+    moeLayers:79, denseB:9},
   // GLM-5.1 (智谱 AI, 2026-04, MIT): 744B-A40B MoE + MLA + DSA 稀疏注意力。
   // 官方 config.json 逐字段(三源交叉验证: HF raw / transformers 文档 / ModelScope 量化版):
   //   model_type=glm_moe_dsa / num_hidden_layers=78(前 3 层 dense + 75 层 MoE) / hidden_size=6144 /
@@ -662,7 +688,10 @@ let models = {
   // calibA/calibB 不设: 本架构无实测校准值, 由 Roofline 自动推导(见 estimatePrefillParams)。
   'GLM-5.1': {attn:'mla', layers:78, kvLora:512, ropeDim:64, hidden:6144, vocab:154880,
     paramsB:744, actB:40, qHeads:64, qkNope:192, vHeadDim:256,
-    sparse:true, sparseTopk:2048, idxHeads:32, idxHeadDim:128},
+    sparse:true, sparseTopk:2048, idxHeads:32, idxHeadDim:128,
+    // EP 字段(2026-08-31, 官方 config: 前 3 层 dense + 75 层 MoE)。
+    // denseB: embed 1.9 + 3×dense层 0.4 + 75×(MLA attn 0.155 + shared expert 0.038) ≈ 17.6B
+    moeLayers:75, denseB:18},
   'Custom':        {attn:'gqa', layers:80, kvHeads:8, headDim:128, hidden:8192, vocab:128000, paramsB:0, actB:0}
 };
 
@@ -765,6 +794,12 @@ function getParams(){
     prefillBIdx: (function(){ var el=document.getElementById('pPrefillBIdx');
       if(!el) return 0; var v=parseFloat(el.value); return isFinite(v)&&v>=0 ? v : 0; })(),
     paramsB: gv('pParamsB'), actB: gv('pActB'),
+    // EP(专家并行)部署旋钮(2026-08-31): epSize=1/moeLayers=0/denseB=0 为默认 ⇒ 与历史口径逐位一致。
+    // 无头 harness 的 DOM stub 恒 value='0' ⇒ gi||1 / gv||1 兜底后恰好是默认值(回归隔离)。
+    epSize: gi('pEpSize') || 1,
+    moeLayers: gi('pMoeLayers') || 0,
+    denseB: gv('pDenseB') || 0,
+    a2aFactor: gv('pA2aFactor') || 1,
     gpus: gi('pGpuCount'), hbmPerGpu: gv('pHbm'), hbmBW: gv('pHbmBW'),
     tflops: gv('pTflops'), tpSize: gi('pTpSize'), nvlinkBW: gv('pNvlinkBW'),
     pcieBW: gv('pPcieBW'), tierQuant: gv('pTierQuant'),
@@ -1039,6 +1074,19 @@ function estimatePrefillParams(p){
   let attnBytes = kvPerTok / chunk;                          // B/tok/pos     KV 读（chunk 内共享）
   let kvWBytes  = kvPerTok;                                  // B/tok     KV 写（纯访存，无计算）
   let tp = 2 * p.layers * 5 / chunk;                         // μs/tok    TP AllReduce 固定延迟（始终相加）
+  // EP AllToAll 分摊(2026-08-31, 设计文档 §4.2/改动3): 与 tp 项同构叠加, 独立于 tpSize
+  // (TP=1 时 AllReduce 归零但 A2A 仍在)。带宽项 = 2×L_moe×hidden×2B×factor B/tok ÷ NVLink;
+  // 固定延迟项 = 2×L_moe×5μs/chunk(dispatch+combine 两次)。EP=1/非MoE ⇒ 0(零回归锚点)。
+  let a2a = 0;
+  {
+    let epE = Math.max(1, Math.min(p.epSize || 1, p.gpus));
+    let Lm = Math.max(0, Math.min(p.moeLayers || 0, p.layers));
+    if (epE > 1 && Lm > 0) {
+      let a2aF = p.a2aFactor > 0 ? p.a2aFactor : 1;
+      a2a = 2 * Lm * p.hidden * 2 * a2aF / Math.max(p.nvlinkBW * 1e9, 1) * 1e6
+          + 2 * Lm * 5 / chunk;
+    }
+  }
 
   // ---- 稀疏注意力的 Indexer 每 token 每位置成本(2026-08-20) ----
   // DS-V3.2 Indexer(NSA 风格选择器): 每层为每个 query 对**全部**历史 KV 打分, 再取 top-k。
@@ -1064,7 +1112,7 @@ function estimatePrefillParams(p){
     let aCmp = attnFlop / peakFlops * 1e6, aMem = attnBytes / aggHbmBW * 1e6;
     let iCmp = idxFlop / peakFlops * 1e6, iMem = idxBytes / aggHbmBW * 1e6;
     let kvW = kvWBytes / aggHbmBW * 1e6;                     // KV 写无计算可 overlap → 计入
-    a = Math.max(gCmp, gMem) + kvW + tp;
+    a = Math.max(gCmp, gMem) + kvW + tp + a2a;
     b = Math.max(aCmp, aMem);
     bIdx = p.sparseAttn ? Math.max(iCmp, iMem) : 0;
     aBound = gCmp >= gMem ? '计算' : '访存';
@@ -1072,7 +1120,7 @@ function estimatePrefillParams(p){
     bIdxBound = iCmp >= iMem ? '计算' : '访存';
   } else {
     // ① MFU 模式: 只算计算时间，访存（权重读/KV读/KV写）全部视为被计算 overlap
-    a = gemmFlop / effFlops * 1e6 + tp;
+    a = gemmFlop / effFlops * 1e6 + tp + a2a;
     b = attnFlop / effFlops * 1e6;
     bIdx = p.sparseAttn ? idxFlop / effFlops * 1e6 : 0;
     aBound = bBound = bIdxBound = '计算(MFU)';
@@ -1085,7 +1133,7 @@ function estimatePrefillParams(p){
     attnIntensity: attnFlop / Math.max(attnBytes, 1e-9),
     idxIntensity: idxFlop / Math.max(idxBytes, 1e-9),
     // 分项原始量(供推导明细面板展开, 公式与计算同源)
-    parts: {gemmFlop, gemmBytes, attnFlop, attnBytes, kvWBytes, idxFlop, idxBytes, tp, chunk,
+    parts: {gemmFlop, gemmBytes, attnFlop, attnBytes, kvWBytes, idxFlop, idxBytes, tp, a2a, chunk,
       peakFlops, effFlops, aggHbmBW, act, kvPerTok},
     ridgePoint: peakFlops / aggHbmBW};
 }
@@ -1241,13 +1289,46 @@ function calcDenseParams(p){
   return p.layers * (attn + mlp) + 2 * vocab * p.hidden;
 }
 
+// ======================== EP(专家并行)与 L2 链路 helpers(2026-08-31) ========================
+// 见 reports/EP多实例并行支持_修改设计_20260831.md §3.2/§4。
+// attnTp: L2 读的"复制组内卡数"——TP 模式 = tpSize(组内每 rank 复制读同一份 KV);
+// EP>1 隐含 DP-attention 形态 ⇒ 读复制消失, 每 rank 只读自己请求的 KV ⇒ attnTp=1。
+function l2AttnTp(p){ return (p.epSize||1) > 1 ? 1 : Math.max(1, Math.min(p.tpSize||1, p.gpus||1)); }
+// L2 有效带宽 = min(PCIe单卡 × 独立读通道数 f=gpus/attnTp, DRAM介质)。
+// ⚠️ 只动带宽侧, 不动 kvPerTok 字节口径 —— GQA 的"字节高估tp× × 带宽低估gpus×"巧合
+//    依赖现状字节口径(2026-08-27 核对), 动字节会破坏 TP=8 回归。
+// TP=gpus(默认)时 f=1 ⇒ min(pcie,dram) 与旧口径逐位一致(零回归锚点)。
+function effL2LinkBW(p){ let g = Math.max(1, p.gpus||1); return Math.min(p.pcieBW * (g / l2AttnTp(p)), p.dramBW); }
+
 function calcAll(p){
   let kvPerToken = calcKvPerToken(p);
   // 参数量：覆盖值优先（MoE 必须显式给出总参数与激活参数）
   let totalParams = p.paramsB > 0 ? p.paramsB * 1e9 : calcDenseParams(p);
   let activatedParams = p.actB > 0 ? p.actB * 1e9 : totalParams;
-  // 权重使用独立精度
-  let modelWeightBytes = totalParams * p.weightDtype;
+  // ---- 权重显存: TP/EP 通式(2026-08-31, 设计文档 §4.1 + §3.1 bug 修复) ----
+  // 每卡权重 = dense 部分/TP(TP 组内分片, 组间复制 G/T 组) + 专家部分/E(EP 域分片)。
+  //   clusterW = (G/T)×denseB×wd + (G/max(T,E))×expertB×wd
+  // ⚠️ 专家分母是 max(T,E) 而非文档化简稿里的 E: EP≤TP 时专家随 TP 组分片(EP 未激活),
+  //    此时 (G/T)×(dense+expert) = G/T × 全模型 —— EP=1 且 TP=G(历史默认)逐位等于旧公式
+  //    "整模型只扣一次"; TP=1(纯 DP)时 G/T=G ⇒ 每卡全量权重, 修掉"权重只扣一次"的容量 bug。
+  // 非 MoE(moeLayers=0 或 denseB 未填) ⇒ expertParams=0, 退化为 (G/T)×全模型。
+  let G = Math.max(1, p.gpus);
+  let T = Math.max(1, Math.min(p.tpSize || 1, G));
+  let E = Math.max(1, Math.min(p.epSize || 1, G));
+  let moeL = Math.max(0, Math.min(p.moeLayers || 0, p.layers));
+  let denseParams = totalParams, expertParams = 0;
+  if (moeL > 0 && p.denseB > 0 && p.denseB * 1e9 < totalParams) {
+    denseParams = p.denseB * 1e9;
+    expertParams = totalParams - denseParams;
+  }
+  let modelWeightBytes, wd = p.weightDtype;
+  if (expertParams > 0 && E > T) {
+    modelWeightBytes = (G / T) * denseParams * wd + (G / E) * expertParams * wd;
+  } else {
+    // EP 未超出 TP(含默认 EP=1): 专家随 TP 组分片 ⇒ 等价整模型按 G/T 扣——
+    // 单表达式保证 TP=G 时与旧"totalParams×wd"逐位一致(避免 (a+b)c vs ac+bc 的 ulp 漂移)
+    modelWeightBytes = (G / T) * totalParams * wd;
+  }
   let modelWeightGB = modelWeightBytes / 1e9;
 
   let totalHbm = p.gpus * p.hbmPerGpu * 1e9;
@@ -1285,13 +1366,26 @@ function calcAll(p){
 
   // TP AllReduce 通信开销（Megatron式：每层2次AllReduce；ring有效数据 2×(TP-1)/TP × 消息）
   // 带宽项随token数线性增长；小消息延迟项每次前向固定 2×layers×5μs
+  // EP AllToAll(2026-08-31, 设计文档 §4.2): 每个 MoE 层 dispatch+combine 两次, 与 AllReduce
+  // **相互独立**(TP=1 时 AR 归零但 A2A 仍在); EP=1 时 A2A=0 ⇒ 与旧口径逐位一致(零回归锚点)。
+  // 理想专家均衡假设(§6 决策2), a2aFactor 兼作实现差异/倾斜 derating 旋钮。
   const AR_LAT = 5e-6;
   let tpSize = Math.max(1, Math.min(p.tpSize || 1, p.gpus));
+  let epSizeC = Math.max(1, Math.min(p.epSize || 1, p.gpus));
+  let moeLC = Math.max(0, Math.min(p.moeLayers || 0, p.layers));
   function commTime(tokens){
-    if (tpSize <= 1) return 0;
-    let ringFactor = 2 * (tpSize - 1) / tpSize;
-    let bytes = 2 * p.layers * tokens * p.hidden * 2 * ringFactor; // 2B激活(bf16)
-    return bytes / (p.nvlinkBW * 1e9) + 2 * p.layers * AR_LAT;
+    let t = 0;
+    if (tpSize > 1) {
+      let ringFactor = 2 * (tpSize - 1) / tpSize;
+      let bytes = 2 * p.layers * tokens * p.hidden * 2 * ringFactor; // 2B激活(bf16)
+      t += bytes / (p.nvlinkBW * 1e9) + 2 * p.layers * AR_LAT;
+    }
+    if (epSizeC > 1 && moeLC > 0) {
+      let a2aF = p.a2aFactor > 0 ? p.a2aFactor : 1;
+      let bytes = 2 * moeLC * tokens * p.hidden * 2 * a2aF;          // dispatch+combine, 2B激活
+      t += bytes / (p.nvlinkBW * 1e9) + 2 * moeLC * AR_LAT;
+    }
+    return t;
   }
 
   // Decode：带宽瓶颈，每次前向 = 读权重 + 读批次全部KV + 每请求开销 + TP通信；与算力下限取 max
@@ -1333,6 +1427,7 @@ function calcAll(p){
     totalHbm, availHbm, modelWeightBytes, modelWeightGB, overhead, decodeWeightRatio,
     maxHbmRequests, computeFlops, aggHbmBW, prefillTps, passTime, passMemTime, passCmpTime, decodeBound,
     commOverhead, commTime, tpSize, decodeTpsPerReq, decodeTpsTotal,
+    epSize: epSizeC, moeLayers: moeLC, denseParams, expertParams,
     kvGenSpeed, dramTotal, ssdTotal, totalKvDemand, totalParams, activatedParams,
     estLatency, littleConcurrency, ttftEst, tpotEst};
 }
@@ -1642,6 +1737,10 @@ function applyModel(name,el){
   $('pHidden').value=m.hidden;
   if (m.vocab) $('pVocab').value=m.vocab;
   $('pParamsB').value=m.paramsB||0; $('pActB').value=m.actB||0;
+  // EP 架构字段(2026-08-31): moeLayers/denseB 是模型属性 ⇒ 随预设填入;
+  // epSize 是**部署**旋钮 ⇒ 不动(换模型不该重置用户的部署选择)
+  if ($('pMoeLayers')) $('pMoeLayers').value = m.moeLayers||0;
+  if ($('pDenseB')) $('pDenseB').value = m.denseB||0;
   $('pQHeads').value=m.qHeads||0;   // MLA 必须显式(DS-V3=128); GQA 留 0 自动推导
   // MLA 解压式 prefill 维度(2026-08-20): 0 = 回退用 headDim
   if ($('pQkNope')) $('pQkNope').value = m.qkNope||0;
@@ -1816,7 +1915,7 @@ function updateQuickResults(){
     {l:'Decode速度/请求',v:r.decodeTpsPerReq.toFixed(0)+' tok/s',c:'accent'},
     {l:'TTFT(估计)',v:(r.ttftEst*1000).toFixed(0)+' ms',c:'accent'},
     {l:'TPOT(估计)',v:(r.tpotEst*1000).toFixed(2)+' ms/tok',c:'accent'},
-    {l:'TP通信开销/步',v:(r.commOverhead*1000).toFixed(2)+' ms',c:r.commOverhead>r.passTime*0.1?'orange':'green'},
+    {l:'TP/EP通信开销/步',v:(r.commOverhead*1000).toFixed(2)+' ms',c:r.commOverhead>r.passTime*0.1?'orange':'green'},
     {l:'稳态并发(Little定律)',v:r.littleConcurrency.toFixed(0)+' vs 请求数'+p.concurrency,c:littleOk?'green':'orange'},
   ].map(d=>'<div class="result-item"><div class="rl">'+d.l+'</div><div class="rv '+d.c+'">'+d.v+'</div></div>').join('');
   setFormula('formulaQuick',
@@ -1833,7 +1932,7 @@ function updateQuickResults(){
     '&nbsp;&nbsp;物理依据：chunked-prefill 下 flash-attention 的 C='+p.chunkSize+' 个 query 共享一次 KV 读 → attention 算术强度达 10⁴ FLOP/B 量级 ≫ ridge point，prefill 是彻底的<b>计算瓶颈</b>，访存被 overlap。（旧版把计算+访存时间相加，高估 attention 位置成本约 2.3×）<br>'+
     '• Decode(<b>结构性访存瓶颈</b>，始终 Roofline 取 max): <code>passTime = max[(权重+批次KV)/HBM带宽 + 每请求开销, 2×激活参数×B/算力] + TP通信 = '+(r.passTime*1000).toFixed(2)+' ms</code>（访存项 '+(r.passMemTime*1000).toFixed(2)+'ms vs 算力项 '+(r.passCmpTime*1000).toFixed(2)+'ms → 瓶颈在<b>'+r.decodeBound+'</b>）<br>'+
     '&nbsp;&nbsp;注：decode 每 token 读全部激活权重却只做 2×P<sub>act</sub> FLOP，算术强度仅 ~'+(2*r.activatedParams/Math.max(r.modelWeightBytes*r.decodeWeightRatio/Math.max(1,Math.min(p.maxBatch,p.concurrency)),1)).toFixed(1)+' FLOP/B ≪ ridge point → MFU 的"只算计算时间"规则<b>不适用于 decode</b>（否则 TPOT 失真 ~25×）<br>'+
-    '• TP通信(AllReduce): <code>2×L×(2(TP−1)/TP × B×hidden×2B)/NVLink + 2×L×5μs = '+(r.commOverhead*1000).toFixed(2)+' ms/步</code>（TP='+r.tpSize+'，占 passTime '+(r.commOverhead/r.passTime*100).toFixed(0)+'%）<br>'+
+    '• TP通信(AllReduce): <code>2×L×(2(TP−1)/TP × B×hidden×2B)/NVLink + 2×L×5μs</code>'+((r.epSize||1)>1&&r.moeLayers>0?' + EP通信(AllToAll): <code>2×L_moe×B×hidden×2B×系数/NVLink + 2×L_moe×5μs</code>':'')+' = <code>'+(r.commOverhead*1000).toFixed(2)+' ms/步</code>（TP='+r.tpSize+((r.epSize||1)>1?' · EP='+r.epSize+'(L_moe='+r.moeLayers+')':'')+'，占 passTime '+(r.commOverhead/r.passTime*100).toFixed(0)+'%）<br>'+
     '• Little定律: <code>稳态并发 = QPS × 估计延迟('+r.estLatency.toFixed(2)+'s) = '+r.littleConcurrency.toFixed(0)+'</code>'+(littleOk?' ✓ 与请求数基本一致':' ⚠ 稳态并发与请求数('+p.concurrency+')偏差较大，仿真中请求将排队或空转')
   );
   updateTierDemand();
@@ -1871,7 +1970,7 @@ function updateTierDemand(){
   let l3WriteBW = writeRate * fL3;
   let l2Total = l2ReadBW + l2WriteBW + l2WriteBW;               // 读 + 换出 + 预取换入
   let l3Total = l3ReadBW + l3WriteBW + l3WriteBW;
-  let l2Cfg = Math.min(p.pcieBW, p.dramBW);                   // L2 有效带宽 = min(链路PCIe/C2C, 介质DRAM)——GPU 读 L2 受二者较小者限制
+  let l2Cfg = effL2LinkBW(p);                                // L2 有效带宽 = min(PCIe/C2C单卡×f读通道, DRAM介质)——f=gpus/attnTp(EP>1 时读复制消失 attnTp=1)
   let pcieCfg = l2Cfg * 1e9, ssdCfg = p.ssdBW * 1e9;
   let uL2 = l2Total / Math.max(pcieCfg, 1) * 100;
   let uL3 = l3Total / Math.max(ssdCfg, 1) * 100;
@@ -1935,7 +2034,7 @@ function updateTierDemand(){
     '&nbsp;&nbsp;<code>= '+formatNum(decodeRate)+' × '+formatBytes(r.avgLifetimeKv)+' × f<sub>L2</sub>('+(fL2*100).toFixed(1)+'%) = '+formatRate(l2ReadBW)+'</code>（L3 同理 '+formatRate(l3ReadBW)+'，f<sub>L3</sub>='+(fL3*100).toFixed(1)+'%）<br>'+
     '③ <b>写带宽（prefill 稳态）</b>: 新KV生成速率 <code>kvGen = prefillTps×kv/tok = '+formatRate(r.kvGenSpeed)+'</code> × 驻留占比；稳态换出=生成、预取换入≈换出<br>'+
     '&nbsp;&nbsp;<code>链路总需求 = 读+换出+换入 = '+formatRate(l2Total)+' (L2) / '+formatRate(l3Total)+' (L3)</code> — 对应仿真 passTime 中 ΣKV<sub>L2</sub>/min(PCIe,DRAM) 与 ΣKV<sub>L3</sub>/NVMe 项<br>'+
-    '④ <b>对比配置</b>: L2 有效带宽 = <code>min(PCIe/C2C '+p.pcieBW+'GB/s, DRAM介质 '+p.dramBW+'GB/s) = '+l2Cfg+' GB/s</code>（GPU 读 L2 受链路与介质较小者限制；默认介质≫链路故由 PCIe 决定，利用率 '+uL2.toFixed(0)+'%）· L3 走 NVMe（<code>'+p.ssdBW+' GB/s</code>，利用率 '+uL3.toFixed(0)+'%，该值为有效带宽已含 page_size 调度开销：sglang mooncake page1≈1.05GB/s → page64≈27GB/s）<br>'+
+    '④ <b>对比配置</b>: L2 有效带宽 = <code>min(PCIe/C2C '+p.pcieBW+'GB/s×f='+(p.gpus/l2AttnTp(p))+', DRAM介质 '+p.dramBW+'GB/s) = '+l2Cfg+' GB/s</code>（GPU 读 L2 受链路与介质较小者限制；f=独立读通道数=gpus/attnTp'+(l2AttnTp(p)===1&&(p.epSize||1)>1?', EP>1 读复制消失 ⇒ f='+p.gpus:'')+'；默认介质≫链路故由 PCIe 决定，利用率 '+uL2.toFixed(0)+'%）· L3 走 NVMe（<code>'+p.ssdBW+' GB/s</code>，利用率 '+uL3.toFixed(0)+'%，该值为有效带宽已含 page_size 调度开销：sglang mooncake page1≈1.05GB/s → page64≈27GB/s）<br>'+
     '&nbsp;&nbsp;利用率 &gt;100% ⇒ 该层成为 decode 瓶颈（TPOT 上升）；容量不足 ⇒ 请求排队等待 KV 释放<br>'+
     '&nbsp;&nbsp;<b>说明</b>: 本卡片为策略无关的需求上界（规划基准）；<b>考虑调度策略的需求</b>（实测 L2/L3 带宽分位、容量峰值、瓶颈归因）在「策略仿真」结果中展示'
   );
@@ -1971,7 +2070,7 @@ function drawTierOverview(){
       ],label:{show:true,position:'right',color:'#9ca0b0',formatter:p=>p.value+' GB'}},
       {name:'读带宽(GB/s)',type:'bar',data:[
         {value:p.hbmBW*p.gpus*1000,itemStyle:{color:'rgba(248,113,113,.4)'}},
-        {value:Math.min(p.pcieBW, p.dramBW),itemStyle:{color:'rgba(251,146,60,.4)'}}, // GPU 视角有效 = min(链路,介质)
+        {value:effL2LinkBW(p),itemStyle:{color:'rgba(251,146,60,.4)'}}, // GPU 视角有效 = min(链路单卡×f,介质)
         {value:p.ssdBW,itemStyle:{color:'rgba(108,99,255,.4)'}},
       ]},
       {name:'写带宽(GB/s)',type:'bar',data:[
@@ -1989,8 +2088,8 @@ function drawTierOverview(){
   setFormula('formulaTier',
     '<b>📐 计算方式</b><br>'+
     '• <b>容量</b>: HBM = <code>'+p.gpus+'×'+p.hbmPerGpu+'='+(p.gpus*p.hbmPerGpu)+' GB</code> · DRAM & SSD 为设定值<br>'+
-    '• <b>读带宽</b>: HBM聚合 = <code>'+p.gpus+'×'+p.hbmBW+'='+(p.gpus*p.hbmBW).toFixed(1)+' TB/s</code> · L2(DRAM) 为 GPU 视角有效带宽 <code>min(PCIe/C2C '+p.pcieBW+', DRAM介质 '+p.dramBW+') = '+Math.min(p.pcieBW,p.dramBW)+' GB/s</code><br>'+
-    '• <b>跨层链路</b>: HBM↔DRAM 有效 = <code>min('+p.pcieBW+', '+p.dramBW+') = '+Math.min(p.pcieBW,p.dramBW)+' GB/s</code>（搬 1GB KV ≈ '+(1e9/(Math.min(p.pcieBW,p.dramBW)*1e9)*1000).toFixed(1)+'ms）· DRAM↔SSD 走 NVMe = <code>'+p.ssdBW+' GB/s</code>（搬 1GB ≈ '+(1e9/(p.ssdBW*1e9)*1000).toFixed(0)+'ms）<br>'+
+    '• <b>读带宽</b>: HBM聚合 = <code>'+p.gpus+'×'+p.hbmBW+'='+(p.gpus*p.hbmBW).toFixed(1)+' TB/s</code> · L2(DRAM) 为 GPU 视角有效带宽 <code>min(PCIe/C2C '+p.pcieBW+'×f='+(p.gpus/l2AttnTp(p))+', DRAM介质 '+p.dramBW+') = '+effL2LinkBW(p)+' GB/s</code>'+((p.epSize||1)>1?'（EP='+p.epSize+' ⇒ DP-attention, 读复制消失, f='+p.gpus+'）':'')+'<br>'+
+    '• <b>跨层链路</b>: HBM↔DRAM 有效 = <code>min('+p.pcieBW+'×f, '+p.dramBW+') = '+effL2LinkBW(p)+' GB/s</code>（搬 1GB KV ≈ '+(1e9/(effL2LinkBW(p)*1e9)*1000).toFixed(1)+'ms）· DRAM↔SSD 走 NVMe = <code>'+p.ssdBW+' GB/s</code>（搬 1GB ≈ '+(1e9/(p.ssdBW*1e9)*1000).toFixed(0)+'ms）<br>'+
     '• <b>下沉层量化比</b>: DRAM/SSD 中 KV 存储体积 × '+p.tierQuant+'（当前设置）<br>'+
     '• 写带宽为经验系数 70%~90%；延迟为典型值 HBM ~0.1μs · DRAM ~1μs · NVMe ~80μs'
   );
@@ -2959,8 +3058,11 @@ function runSimulation(strategy, overrides) {
     let gD = Math.max(1, p.gpus - gP);
     pdPrefillGpus = gP; pdDecodeGpus = gD;
     // P 视图: 只改卡数(TP 规模随之收缩), 其余硬件参数共用
-    pP = Object.assign({}, p, { gpus: gP, tpSize: Math.min(p.tpSize || gP, gP) });
-    let pD = Object.assign({}, p, { gpus: gD, tpSize: Math.min(p.tpSize || gD, gD) });
+    // EP clamp(2026-08-31): P/D 各自的 EP 域不超过各自卡数
+    pP = Object.assign({}, p, { gpus: gP, tpSize: Math.min(p.tpSize || gP, gP),
+      epSize: Math.min(p.epSize || 1, gP) });
+    let pD = Object.assign({}, p, { gpus: gD, tpSize: Math.min(p.tpSize || gD, gD),
+      epSize: Math.min(p.epSize || 1, gD) });
     rP = calcAll(pP); rD = calcAll(pD);
     // P 节点 a/b 重算: mfuAuto 下走 Roofline, 否则按 MFU —— 与 estimatePrefillParams 同口径
     let eP = estimatePrefillParams(pP);
@@ -2994,8 +3096,11 @@ function runSimulation(strategy, overrides) {
   //    但 curWave/prepWave/staticWaveOpen/prevDecodeL3 会被**重新赋值**, 必须走 inst.x
   function makeInstance(instId, instGpus) {
     // 该实例自己的资源视图: 从 GPU 总数切分(总量守恒), 沿用 PD 真分离的 calcAll 换卡数手法
-    let iP = instGpus === p.gpus ? p : Object.assign({}, p,
-      { gpus: instGpus, tpSize: Math.min(p.tpSize || instGpus, instGpus) });
+    // EP clamp(2026-08-31, 改动4): EP 域不能超出本实例卡数(一阶段只做实例内 EP, §6 决策1)
+    let iP = instGpus === p.gpus ? Object.assign({}, p,
+      { epSize: Math.min(p.epSize || 1, instGpus) }) : Object.assign({}, p,
+      { gpus: instGpus, tpSize: Math.min(p.tpSize || instGpus, instGpus),
+        epSize: Math.min(p.epSize || 1, instGpus) });
     let iR = instGpus === p.gpus ? r : calcAll(iP);
     // ⚠️ prefill a/b 必须按**每实例卡数**重算(2026-08-21 修 bug, 与 PD 真分离同处理):
     // a 与 b 都 ∝ 1/gpus(peakFlops 与 aggHbmBW 都随卡数线性放大), 直接复用输入框里
@@ -3020,9 +3125,13 @@ function runSimulation(strategy, overrides) {
     // dram↔ssd 双向共用 busyUntil(L3)。传输(预取/淘汰)与 decode 读(见 decode 段)
     // 都在同一总线上串行排队——竞争带宽，先到先服务。
     // 多实例: 每实例一条独立总线(各自的 PCIe/NVMe), 带宽按实例数均分
+    // L2 带宽(2026-08-31, §3.2 修复): pcieBW 是**单卡规格**, 聚合 = pcieBW × f,
+    // f = 实例卡数/attnTp(attnTp: TP 模式=tpSize 组内复制读; EP>1=DP-attention 形态读复制
+    // 消失 ⇒ attnTp=1)。TP=实例卡数(默认)时 f=1 ⇒ 与旧 min(pcie,dram) 逐位一致。
+    let iL2BW = effL2LinkBW(iP);
     let iLinks = {
-      'hbm>dram': { bw: Math.min(p.pcieBW, p.dramBW) * 1e9 / instShare, busyUntil: 0 },
-      'dram>hbm': { bw: Math.min(p.pcieBW, p.dramBW) * 1e9 / instShare, busyUntil: 0 },
+      'hbm>dram': { bw: iL2BW * 1e9 / instShare, busyUntil: 0 },
+      'dram>hbm': { bw: iL2BW * 1e9 / instShare, busyUntil: 0 },
       'dram>ssd': { bw: p.ssdBW * 1e9 / instShare, busyUntil: 0 },
       'ssd>dram': { bw: p.ssdBW * 1e9 / instShare, busyUntil: 0 },
     };
@@ -3969,6 +4078,19 @@ function runSimulation(strategy, overrides) {
       return (bq.fetchTime || 0) > 0 ? bq.fetchTime : l3FetchEst(bq); // ★ wc 到达即拉
     return 0;
   }
+  // 有效槽位占用(2026-08-31, M4): 拉取中的 wc 请求**不算占用** —— 对齐 sglang
+  // "未拉齐留在等待队列, 不占 running batch 槽位", 不再阻塞 KV 已齐请求的准入。
+  // be/race 恒占用(它们的拉取语义与计算深度耦合); 无拉取需求(fetchTime=0)恒占用。
+  // ⚠️ 开关关闭时退回旧口径(全占用) —— OFF 下 wc 拉取只在准入后开始,
+  //    不占槽会把"准入即拉取"的请求变成不占槽, 改变旧行为(零回归要求)。
+  // 算力分配无需配套改: 拉取中请求在 prefill 循环本就跳过推进(nAct 不含它们)。
+  // ⚠️ 必须声明在函数顶层(此处), 不能放在 for 循环块内 —— 块级函数声明在块外不可见,
+  //    waitQueue 为空块的步里 while 门控会 filter(undefined) 崩(2026-08-31 踩实:
+  //    _m4_split.py 手术曾把它误放进 for 块, affinity/route 脚本报 TypeError)。
+  function occupiesSlot(q) {
+    if (p.wcArrivalFetch === false) return true;
+    return q._be || q._race || (q.fetchTime || 0) <= (q._fetchDone || 0);
+  }
 
   // 预取：把请求在 DRAM 中可用的块搬回 HBM（占用链路，有耗时）
   function doPrefetchFor(req) {
@@ -4134,7 +4256,7 @@ function runSimulation(strategy, overrides) {
     let kvS = Math.max(0, kv - kvH - kvD);
     let mem = (r.modelWeightBytes * r.decodeWeightRatio + kvH) / r.aggHbmBW
       + perReqMs(n, r.activatedParams, p.gpus) / 1000
-      + kvD / (Math.min(p.pcieBW, p.dramBW) * 1e9)
+      + kvD / (effL2LinkBW(p) * 1e9)
       + kvS / (p.ssdBW * 1e9 * 0.9);
     let cmp = 2 * r.activatedParams * n / r.computeFlops;
     return Math.max(mem, cmp, 1e-6) + r.commTime(n);
@@ -4300,17 +4422,6 @@ function runSimulation(strategy, overrides) {
         if (running >= s.batching.max_batch_size) { inst.staticWaveOpen = false; break; }
       } else if (!waveMode && !p.singleBatch
         && prefillQ.filter(occupiesSlot).length + prefilling.filter(occupiesSlot).length >= prefillSlots) break;
-      // 有效槽位占用(2026-08-31, M4): 拉取中的 wc 请求**不算占用** —— 对齐 sglang
-  // "未拉齐留在等待队列, 不占 running batch 槽位", 不再阻塞 KV 已齐请求的准入。
-  // be/race 恒占用(它们的拉取语义与计算深度耦合); 无拉取需求(fetchTime=0)恒占用。
-  // ⚠️ 开关关闭时退回旧口径(全占用) —— OFF 下 wc 拉取只在准入后开始,
-  //    不占槽会把"准入即拉取"的请求变成不占槽, 改变旧行为(零回归要求)。
-  // 算力分配无需配套改: 拉取中请求在 prefill 循环本就跳过推进(nAct 不含它们)。
-  function occupiesSlot(q) {
-    if (p.wcArrivalFetch === false) return true;
-    return q._be || q._race || (q.fetchTime || 0) <= (q._fetchDone || 0);
-  }
-  // 波次模式: 请求数槽位由 token 预算替代(组波时约束), 准入只受快层容量约束(sglang 无请求数上限)
       // 单批模式: 准入门控全部跳过——所有请求立即准入, 构成单批 batch
       // 快层容量：按"在途请求 KV 总量"估算（含 decodeWait），而非 pools.used——
       // 淘汰会把块移出快层导致 pools.used 虚低，只有按在途请求数×平均KV才能真实反映
@@ -5087,6 +5198,9 @@ function runSimulation(strategy, overrides) {
     l2BWp50: pctOf(stats.l2Inst, 0.50), l2BWp95: pctOf(stats.l2Inst, 0.95), l2BWp99: pctOf(stats.l2Inst, 0.99),
     l3BWp50: pctOf(stats.l3Inst, 0.50), l3BWp95: pctOf(stats.l3Inst, 0.95), l3BWp99: pctOf(stats.l3Inst, 0.99),
     l2BWPeak: pctOf(stats.l2Inst, 1), l3BWPeak: pctOf(stats.l3Inst, 1),
+    // L2 链路实际生效带宽(GB/s, 2026-08-31 EP 诊断): 实例0 的 dram>hbm 链路值,
+    // = min(pcieBW×f, dramBW)/instShare —— 经 makeInstance 接线后的真实值(验证 f 因子用)
+    l2LinkBwGbs: instances[0] ? instances[0].links['dram>hbm'].bw / 1e9 : 0,
     // 容量需求 = 峰值占用（容量低于该值必发生淘汰/丢弃/排队）
     // passTime 分解（名义分量占比）与瓶颈归因（时间主要花在哪层）
     // TTFT 分解（平均 ms）：queue/prefillQ/fetch/compute 构成 prefill 段时间账；
@@ -5136,6 +5250,9 @@ function runSimulation(strategy, overrides) {
       // 每实例明细: 路由到的请求数 / 完成数 / 平均与峰值在途队列 / HBM 峰值占用(GB)
       perInst: instances.map(x => ({
         id: x.id, gpus: x.gpus, routed: x.nRouted, completed: x.nCompleted,
+        epSize: x.p.epSize || 1,            // EP clamp 后的实际生效值(2026-08-31, 供验证/诊断)
+        prefillA: x.pP.prefillA,            // 按本实例卡数重估的 a(EP>1 时含 AllToAll 分摊)
+        l2BwGbs: x.links['dram>hbm'].bw / 1e9,  // 本实例 L2 链路带宽(含 f 因子与 /instShare)
         avgQueue: x.qLenSamples > 0 ? x.qLenSum / x.qLenSamples : 0,
         // busyQueue: 只在系统有负载时统计的平均在途 —— 衡量路由均衡度应看这个
         busyQueue: x.qBusySamples > 0 ? x.qBusySum / x.qBusySamples : 0,
@@ -5477,7 +5594,7 @@ function drawStrategyTierDemand(){
       {name:'L2 峰值',type:'bar',barMaxWidth:16,data:simResults.map(s=>+(s.l2BWPeak/1e9).toFixed(2)),itemStyle:{color:'#534AB7'}},
       {name:'L3 P99',type:'bar',barMaxWidth:16,data:simResults.map(s=>+(s.l3BWp99/1e9).toFixed(2)),itemStyle:{color:'#F0997B'}},
       {name:'L3 峰值',type:'bar',barMaxWidth:16,data:simResults.map(s=>+(s.l3BWPeak/1e9).toFixed(2)),itemStyle:{color:'#D85A30'}},
-      {name:'L2 配置',type:'line',data:simResults.map(()=>Math.min(p.pcieBW, p.dramBW)),symbol:'none',lineStyle:{color:'#f87171',type:'dashed',width:1.5},itemStyle:{color:'#f87171'}},
+      {name:'L2 配置',type:'line',data:simResults.map(()=>effL2LinkBW(p)),symbol:'none',lineStyle:{color:'#f87171',type:'dashed',width:1.5},itemStyle:{color:'#f87171'}},
       {name:'L3 配置',type:'line',data:simResults.map(()=>p.ssdBW),symbol:'none',lineStyle:{color:'#f87171',type:'dotted',width:1.5},itemStyle:{color:'#f87171'}}
     ]
   });
