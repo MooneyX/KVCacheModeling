@@ -353,6 +353,10 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
       </select></div>
       <span style="font-size:.7rem;color:var(--text-dim)">选择后自动写入 DSL 的 PREFETCH 行（wait_complete→none）</span>
     </div>
+    <div class="form-row" style="margin-bottom:8px;align-items:center">
+      <div style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="pWcArrivalFetch" style="width:auto" checked><label style="margin:0;font-size:.75rem" for="pWcArrivalFetch" title="wait_complete 的拉取起点(2026-08-31, 对齐 sglang HiCache):&#10;• 勾(默认): 请求到达即异步发起 L3 拉取, 与排队/前序计算天然重叠; 拉齐才占算力开算。高负载下 TTFT 的 fetch 暴露显著下降(排队掩盖部分移入 queue 分量)。&#10;• 不勾: 旧口径——拉取起点绑死在准入 prefilling, 排队期不拉取。用于 A/B 对比与回归隔离。&#10;仅影响 wait_complete; best_effort(本即排队期拉取)与 race 不受影响。">wc 到达即拉（对齐 sglang HiCache）</label></div>
+      <span style="font-size:.7rem;color:var(--text-dim)">仅作用于 wait_complete；be/race 语义不变</span>
+    </div>
 
     <div style="display:flex;gap:12px;margin-bottom:10px">
       <div style="flex:1">
@@ -753,6 +757,11 @@ function getParams(){
     sparseAttn: !!(document.getElementById('pSparseAttn') && document.getElementById('pSparseAttn').checked),
     sparseTopk: gi('pSparseTopk') || 2048,
     idxHeads: gi('pIdxHeads') || 64, idxHeadDim: gi('pIdxHeadDim') || 128,
+    // wc 到达即拉(2026-08-31): 对齐 sglang HiCache 的 wait_complete 拉取起点。
+    // ⚠️ 无头 harness 的 DOM stub 恒 checked=false ⇒ 脚本默认走**旧口径**(回归隔离,
+    //   既有脚本基线全部不用动); 真实页面复选框带 checked 属性 ⇒ 默认**新口径**。
+    //   要测新口径的脚本必须显式 el.checked = true(见 _verify_wc_queue_fetch.js)。
+    wcArrivalFetch: !!(document.getElementById('pWcArrivalFetch') && document.getElementById('pWcArrivalFetch').checked),
     prefillBIdx: (function(){ var el=document.getElementById('pPrefillBIdx');
       if(!el) return 0; var v=parseFloat(el.value); return isFinite(v)&&v>=0 ? v : 0; })(),
     paramsB: gv('pParamsB'), actB: gv('pActB'),
@@ -3930,6 +3939,36 @@ function runSimulation(strategy, overrides) {
     }
     return r0._beFetchEst;
   }
+  // L3 拉取量估算(wc 到达即拉专用, 2026-08-31): 与 beFetchTimeEst 同口径但**完全独立**
+  // (不复用不重构 —— be 路径必须保持逐字节不变的零回归; 缓存字段也是独立名)。
+  // ⚠️ waitQueue 的请求还没过 placeRequest(fetchTime 未算) —— wc 到达即拉必须
+  //    在准入前拿到目标量, 只能靠这个估算(见 queueFetchTarget)。
+  function l3FetchEst(r0) {
+    if (r0._l3FetchEst !== undefined) return r0._l3FetchEst;
+    r0._l3FetchEst = 0;
+    if (r0.groupId && prefixGroupMap[r0.groupId] && prefixGroupMap[r0.groupId].activated) {
+      let ssdTok = 0;
+      prefixGroupMap[r0.groupId].blkIds.forEach(id => { let loc = findBlock(id); if (loc && loc.tier === 'ssd') ssdTok += loc.blk.tokens; });
+      let cap = r0.prefixTokLen || 0;
+      if (ssdTok > cap) ssdTok = cap;
+      if (ssdTok > 0) r0._l3FetchEst = Math.ceil(ssdTok / p.blockSize) * (isFinite(p.fetchFixedUs) ? p.fetchFixedUs : 209) * 1e-6
+        + ssdTok * kvPerTok / Math.max(p.ssdBW * 1e9 * 0.9, 1);
+    }
+    return r0._l3FetchEst;
+  }
+  // 排队期拉取目标(2026-08-31, wc arrival-fetch): 排队期拉取循环的统一入口。
+  // be → 尽力拉取估算(含固定开销); wc → 到达即拉(开关 pWcArrivalFetch 控制, 关=旧口径
+  // 不在排队期拉); race → 不进排队期循环(race 的拉取在 prefilling 双向进行)。
+  // ⚠️ wc 的目标量分两种来源: prefillQ(已准入)用 placeRequest 算好的 fetchTime;
+  //    waitQueue(未准入, fetchTime 未算)必须用 l3FetchEst 同口径估算 —— 只读
+  //    fetchTime 会让 waitQueue 恒得 0, 排队期拉取对真正的排队者全失效(实测踩到)。
+  function queueFetchTarget(bq) {
+    if (!s.prefetch) return 0;
+    if (s.prefetch.type === 'best_effort') return beFetchTimeEst(bq);
+    if (s.prefetch.type === 'none' && p.wcArrivalFetch !== false)
+      return (bq.fetchTime || 0) > 0 ? bq.fetchTime : l3FetchEst(bq); // ★ wc 到达即拉
+    return 0;
+  }
 
   // 预取：把请求在 DRAM 中可用的块搬回 HBM（占用链路，有耗时）
   function doPrefetchFor(req) {
@@ -3980,7 +4019,17 @@ function runSimulation(strategy, overrides) {
     // 并发拉取的排队等待被错误计入 compute(见 cap=4→64 验证: compute 760→8502ms 含等带宽)。
     // C7(2026-08-18): best_effort 的排队期拉取与排队重叠(拉取时间已计入 queue), 不再
     // 重复计 fetch 组件; 无排队期拉取记录时回退独占折算(与旧口径一致)。
-    let _fW = req._be ? 0 : ((req._fetchWait || 0) > 0 ? (req._fetchWait || 0) : Math.min(req.fetchTime || 0, req._fetchDone || 0));
+    // ★ wc 到达即拉(2026-08-31, M3): 排队期开始拉(_ft0 < prefillStart)且准入前已拉完
+    //   (_ft1 <= prefillStart) ⇒ fetch 分量 = 0, 否则兜底分支会把已藏进 queue 的
+    //   排队期拉取再计一遍(重复计时)。
+    // ⚠️ 判据必须带 _ft0 < prefillStart: 旧口径(OFF)的请求 _ft0 = prefillStart
+    //   (准入处兜底), 其 _ft1 也常 == prefillStart(快拉取首步即完) —— 只判 _ft1
+    //   会把它们的 min(fetchTime,_fetchDone) 也清零, 改变旧口径数值(F6 零回归踩到)。
+    let _fW = req._be ? 0
+      : ((req._fetchWait || 0) > 0 ? (req._fetchWait || 0)
+      : ((req._ft0 !== undefined && req._ft1 !== undefined
+          && req._ft0 < (req.prefillStart || 0) && req._ft1 <= (req.prefillStart || 0)) ? 0
+      : Math.min(req.fetchTime || 0, req._fetchDone || 0)));
     let _cW = Math.max(0, req.prefillEnd - req.prefillStart - _fW);
     // 命中 100%(无剩余计算): prefill 阶段纯 fetch 等待, DT 粒度残差(20ms 步长累加超出
     // fetchTime 的部分)与完成前空转应归 fetch 而非 compute——否则"100% 命中"仍有假性 compute 占比
@@ -4480,26 +4529,35 @@ function runSimulation(strategy, overrides) {
           fetchJobs.push({ req: fq, rem: (fq.fetchTime - (fq._fetchDone || 0)) * effL3BW, kind: 'wc' });
         }
       }
-      // be(2026-08-14): 排队期尽力拉取——遍历 waitQueue+prefillQ 中所有已到达未准入的 be 请求
-      // (拉取从 arrive 起持续到准入 prefilling, 与 prefilling/decode 共享容量池);
-      // 准入后即终止 —— 对齐 sglang best_effort("调度即停, 未拉重算")
+      // 排队期拉取(be: 尽力拉取 2026-08-14; wc: 到达即拉 2026-08-31, 对齐 sglang HiCache):
+      // 遍历 waitQueue+prefillQ 中所有已到达未准入的请求, 拉取从 arrive 起持续
+      // (与 prefilling/decode 共享容量池, 排队期拉取自然受 decode 挤占 —— 真实行为)。
+      // be: 准入即终止("调度即停, 未拉重算"); wc: 准入后由 prefilling 的 kind 'wc' 分支
+      // 从 _fetchDone 续拉(该分支已存在且进位兼容, 无需改动)。
+      // ★ _fetchWait 累计加策略门: 仅 be 在排队期累计(准入时被清零, 无影响);
+      //   wc 在排队期**不累计** —— 它驱动 TTFT fetch 分量(L3983), 排队期拉取已藏进
+      //   queue 分量, 再累计会重复计时。
       for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
         let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
-        let bfte = beFetchTimeEst(bq);
+        let bfte = queueFetchTarget(bq);
         if (bfte <= 0) continue;
-        if (bq._ft0 === undefined) bq._ft0 = bq.arrive; // be: 传输过程自到达起(排队期拉取语义)
+        if (bq._ft0 === undefined) bq._ft0 = bq.arrive; // be/wc: 传输过程自到达起(到达即拉语义)
         if (coalesce && bq.groupId) {
           let gp = groupPull[bq.groupId];
           if (gp && bq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
             bq._fetchDone = gp.frac * bfte;
-            if (gp.frac < 1) bq._fetchWait += DT;
+            if (gp.frac < 1) { if (bq._be) bq._fetchWait += DT; }
             else if (gp.doneAt !== null && bq._ft1 === undefined) bq._ft1 = gp.doneAt;
             continue;
           }
           if (!gp) bq._coGpPuller = groupPull[bq.groupId] = { frac: 0, doneAt: null };
         }
         let rem = (bfte - (bq._fetchDone || 0)) * effL3BW;
-        if (rem > 0) { fetchJobs.push({ req: bq, rem: rem, kind: 'be', bfte: bfte }); bq._fetchWait += DT; }
+        if (rem > 0) {
+          // kind 打 be/wc: 共用 fetchBudget 与进度落账分支(wc 按 fetchTime 判完成, be 按 bfte)
+          fetchJobs.push({ req: bq, rem: rem, kind: bq._be ? 'be' : 'wc', bfte: bfte });
+          if (bq._be) bq._fetchWait += DT;
+        }
         else if (bq._ft1 === undefined) bq._ft1 = now;
       }
       // decode 按需读优先: 拉取只用剩余带宽(上一步 decode L3 读需求, 2ms 滞后)
@@ -4516,8 +4574,11 @@ function runSimulation(strategy, overrides) {
           if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._raceTok / Math.max((q2._pfStartPos || 0) - (q2._l2HitTok || 0), 1));
         } else if (j.kind === 'wc') {
           q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
-          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(q2.fetchTime, 1e-9));
-          if (q2._fetchDone >= (q2.fetchTime || 0)) {
+          // 完成目标: 排队期 job 用 job 自带的 bfte(waitQueue 请求 fetchTime 未算, 读它会
+          // 恒 0 ⇒ 第一步就误判完成, _ft1 被污染); prefilling job 无 bfte ⇒ 回退 fetchTime
+          let tgt = (j.bfte !== undefined) ? j.bfte : (q2.fetchTime || 0);
+          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(tgt, 1e-9));
+          if (q2._fetchDone >= tgt) {
             if (q2._ft1 === undefined) q2._ft1 = now;
             if (q2._coGpPuller && q2._coGpPuller.doneAt === null) q2._coGpPuller.doneAt = now;
           }
