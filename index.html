@@ -4298,8 +4298,19 @@ function runSimulation(strategy, overrides) {
         if (!inst.staticWaveOpen) break;
         let running = decoding.length + prefillQ.length + prefilling.length;
         if (running >= s.batching.max_batch_size) { inst.staticWaveOpen = false; break; }
-      } else if (!waveMode && !p.singleBatch && prefillQ.length + prefilling.length >= prefillSlots) break;
-      // 波次模式: 请求数槽位由 token 预算替代(组波时约束), 准入只受快层容量约束(sglang 无请求数上限)
+      } else if (!waveMode && !p.singleBatch
+        && prefillQ.filter(occupiesSlot).length + prefilling.filter(occupiesSlot).length >= prefillSlots) break;
+      // 有效槽位占用(2026-08-31, M4): 拉取中的 wc 请求**不算占用** —— 对齐 sglang
+  // "未拉齐留在等待队列, 不占 running batch 槽位", 不再阻塞 KV 已齐请求的准入。
+  // be/race 恒占用(它们的拉取语义与计算深度耦合); 无拉取需求(fetchTime=0)恒占用。
+  // ⚠️ 开关关闭时退回旧口径(全占用) —— OFF 下 wc 拉取只在准入后开始,
+  //    不占槽会把"准入即拉取"的请求变成不占槽, 改变旧行为(零回归要求)。
+  // 算力分配无需配套改: 拉取中请求在 prefill 循环本就跳过推进(nAct 不含它们)。
+  function occupiesSlot(q) {
+    if (p.wcArrivalFetch === false) return true;
+    return q._be || q._race || (q.fetchTime || 0) <= (q._fetchDone || 0);
+  }
+  // 波次模式: 请求数槽位由 token 预算替代(组波时约束), 准入只受快层容量约束(sglang 无请求数上限)
       // 单批模式: 准入门控全部跳过——所有请求立即准入, 构成单批 batch
       // 快层容量：按"在途请求 KV 总量"估算（含 decodeWait），而非 pools.used——
       // 淘汰会把块移出快层导致 pools.used 虚低，只有按在途请求数×平均KV才能真实反映
@@ -4327,7 +4338,8 @@ function runSimulation(strategy, overrides) {
     // 但总利用率随并发提升（单请求启动/依赖开销大，并行 batch 把 GPU 填满）——
     // 总速率 = computeFlops × boost(n) / (2×actParams)，boost = min(n, PREFILL_UTIL_CAP/mfu)。
     // 单批模式: 流体提升槽位同样放开——全部请求同时进入 prefilling(并发=请求数=单批 batch)
-    while (!waveMode && (p.singleBatch || prefilling.length < prefillSlots) && prefillQ.length) {
+    // M4: 拉取中的 wc 请求不占有效槽位(occupiesSlot, 见上方注释)
+    while (!waveMode && (p.singleBatch || prefilling.filter(occupiesSlot).length < prefillSlots) && prefillQ.length) {
       let rq = prefillQ.shift();
       rq.state = 'prefill'; rq.prefillStart = now;
       // 传输过程计时起点: wc/race 自进入 prefilling(进入拉取队列)起; be 已于排队期置 _ft0=arrive
