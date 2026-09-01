@@ -616,6 +616,29 @@ let models = {
   // 混元翻译旗舰 Hy-MT2-30B-A3B: MoE 30B/3B 激活（架构细节未完整公开，层数/hidden 按同级 MoE 估计）
   'Hunyuan-MT2-30B-A3B': {attn:'gqa', layers:48, kvHeads:4, headDim:128, hidden:2048, vocab:120832, paramsB:30, actB:3,
     moeLayers:48, denseB:1.5},  // EP 字段按同级 Qwen3-30B-A3B 估算(2026-08-31), 待官方 config 核对
+  // Hunyuan Hy4-preview (2026-08-28 发布并开源, Apache 2.0): 770B-A49B MoE + Gated MLA
+  // + Gated DSA 稀疏注意力 + IndexCache, 1M 上下文。官方 config.json 逐字段
+  // (HF tencent/Hy4-preview, model_type=hy_v4):
+  //   num_hidden_layers=78(mlp_layer_types: 1 dense + 77 sparse) / hidden 6144 / heads 64 /
+  //   kv_lora_rank 512 / q_lora_rank 2048 / qk_nope 192 / qk_rope 64 / v_head_dim 256 /
+  //   vocab 120832 / 256 路由专家 top-8 + 1 共享 / moe_intermediate 2048 / dense interm 18432 /
+  //   index_n_heads 32 / index_head_dim 128 / index_topk 2048 / MTP 1 层(nextn)。
+  // ★ 注意力维度与 GLM-5.1 完全相同(64头/qkNope192/vHead256/indexer 32×128×2048), 层数同 78
+  //   ⇒ **KV/token 与 GLM-5.1 一字不差**: BF16 87.8KB / FP8 43.9KB(比 DS-V3/K2 高 27.9%);
+  //   prefill b 同样偏贵(解压维度 512 vs DS 的 320)。
+  // ⚠️ 与本引擎口径的三个差异(已知简化, 不建模):
+  //   ① IndexCache 跨层索引复用(indexer_types 约 1/4 full + 3/4 shared) ⇒ 引擎 bIdx 按每层
+  //      全量 Indexer 计, 是**上限**估计(实际 prefill 略快);
+  //   ② MTP 层(HF 文件 780B 口径含 10B MTP)不进 paramsB —— 官方 backbone 口径 770B, 投机不建模;
+  //   ③ Gated MLA / iHC 4 残差流对 KV 量与主计算量影响可忽略。
+  // denseB 核算(EP 用): embed+lm_head(不共享) 2×120832×6144≈1.5B + 1 个 dense 层
+  //   (attn 0.17 + MLP 0.34)≈0.5B + 77 MoE 层×(attn 0.17+shared 0.038+indexer ~0.02)≈17.6B
+  //   ⇒ ≈20B(校验: 20 + 77×256 专家×37.75M = 764B ≈ 官方 770 ✓)。
+  // calibA/calibB 不设: 无实测校准值, 由 Roofline 自动推导。
+  'Hunyuan-Hy4': {attn:'mla', layers:78, kvLora:512, ropeDim:64, hidden:6144, vocab:120832,
+    paramsB:770, actB:49, qHeads:64, qkNope:192, vHeadDim:256,
+    sparse:true, sparseTopk:2048, idxHeads:32, idxHeadDim:128,
+    moeLayers:77, denseB:20},
   'DeepSeek-V3':   {attn:'mla', layers:61, kvLora:512, ropeDim:64, hidden:7168, vocab:128256, paramsB:671, actB:37, qHeads:128,
     qkNope:128, vHeadDim:128,
     // EP 字段(2026-08-31, 官方 config 核算): 61 层 = 3 dense + **58 MoE**(first_k_dense_replace=3)。
