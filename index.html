@@ -4595,6 +4595,120 @@ function runSimulation(strategy, overrides) {
       prefilling.push(rq);
       dirty = true;
     }
+    // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
+    // ★ 位置(2026-09-01 搬移): 本块原先**嵌套在下方 `if (prefilling.length)` 的 compute 块内**,
+    //   导致两个问题:
+    //   ① 结构性 bug —— "没有请求在 prefill 时, 排队期拉取也不推进"。方案A 下若某步全部
+    //      prefillQ 请求都未就绪, 无人进 prefilling ⇒ 拉取永不推进 ⇒ 永久死锁
+    //      (实测 0/32 完成, 组波跳过 878 万次)。
+    //   ② 离散化滞后 —— 拉取在 compute/组波**之后**才跑, 本步拉齐的请求要等下一步才被看到。
+    //   现搬到"准入之后、派发/组波之前", 使拉取与 prefill 在同一步内**先推进后可见**, 对齐
+    //   sglang: 其 HiCache 预取跑在独立线程(cache_controller), 与调度器 forward 循环完全并发,
+    //   不存在"没有 batch 在跑就不预取"或"拉齐了本步看不到"。
+    //   实测影响(scripts/debug 探针, 7 档): 完成数/命中率/fetch 分量**全部不变**;
+    //   ΔTTFT 恰为 −1·DT(−2ms) 且仅出现在"拉取处于关键路径"的档位 ——
+    //   F原档 108.66→106.66ms(−1.84%)、方案A 低带宽 836.92→834.92、方案A 高带宽 42.11→40.11;
+    //   波次 OFF / be / race 三档 **0 变化**(它们的完成判定本就在拉取之后, 已是同步的)。
+    //   方案A 的步内定序代价随之从 2·DT 降到 1·DT。
+    // ⚠️ 搬移后 be 的准入折算(_beFetchedTok, 见上方派发循环)会多看到一步拉取进度 —— 这正是
+    //   "拉取与调度并发"的正确语义; 探针实测 be 档 ΔTTFT = 0(其拉取不在关键路径)。
+    // prefill fetch / race 拉取 / be 排队期拉取 与 decode 的 L3 读共享同一条 NVMe 总线
+    // (effL3BW)——替代原独立 l3FetchBudget 预算池(与 decode 读互不排队, decode L3 重读
+    // 无法挤占 prefill 拉取)。优先级: **decode 按需读优先**(与生产存储系统一致:
+    // on-demand IO > 后台预取), prefill 拉取使用剩余带宽 fetchBudget = 池−decode需求
+    // (上一步, 2ms 滞后)——decode L3 重读饱和时拉取被挤占变慢, TTFT 随之上升。
+    // 注意: 按比例共享在 decode 自适应节流(passTime 伸缩使需求∝1/passTime)下会塌缩成
+    // 拉取优先(decode 需求越饿越小), 不能产生挤占效果, 故采用优先级模型。
+    // 单飞(coalesce, 默认关): 同组前缀拉取只发生一次(groupPull={frac,doneAt}, 拉取者推进
+    // frac, 等待者共享进度/完成时刻, 前缀完整点: wc=拉完 / race=相遇 / be=prefill完成);
+    // 关 = 每请求独立重拉(模拟前缀在两请求之间被逐出快层的场景, 与 pDecodeL3Read 同源)。
+    let fetchJobs = [];
+    for (let fi = 0; fi < prefilling.length; fi++) {
+      let fq = prefilling[fi];
+      if (fq._race) {
+        if (fq._raceMeetTok >= 0) continue;
+        let H = fq._pfStartPos || 0;
+        let l2h = fq._l2HitTok || 0;
+        let Hl = H - l2h;   // 双层预热: 拉取目标只含 L3 段 [l2h, H), L2 段不占 L3 带宽
+        if (coalesce && fq.groupId) {
+          let gp = groupPull[fq.groupId];
+          if (gp && fq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
+            fq._coGp = gp;
+            fq._raceTok = gp.doneAt !== null ? Hl : Math.max(fq._raceTok, gp.frac * Hl);
+            continue;
+          }
+          if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
+        }
+        let rem = Math.max(0, Hl - fq._raceTok) * kvPerTok;
+        if (rem > 0) fetchJobs.push({ req: fq, rem: rem, kind: 'race' });
+      } else if (fq._be) {
+        // be: 准入时已终止拉取(排队期尽力拉的量已定格), 剩余由 GPU 重算, 无拉取
+      } else if ((fq.fetchTime || 0) > (fq._fetchDone || 0)) {
+        if (coalesce && fq.groupId) {
+          let gp = groupPull[fq.groupId];
+          if (gp && fq._coGpPuller !== gp) { fq._coGp = gp; continue; }  // 单飞等待者(完成判定在推进循环)
+          if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
+        }
+        fetchJobs.push({ req: fq, rem: (fq.fetchTime - (fq._fetchDone || 0)) * effL3BW, kind: 'wc' });
+      }
+    }
+    // 排队期拉取(be: 尽力拉取 2026-08-14; wc: 到达即拉 2026-08-31, 对齐 sglang HiCache):
+    // 遍历 waitQueue+prefillQ 中所有已到达未准入的请求, 拉取从 arrive 起持续
+    // (与 prefilling/decode 共享容量池, 排队期拉取自然受 decode 挤占 —— 真实行为)。
+    // be: 准入即终止("调度即停, 未拉重算"); wc: 准入后由 prefilling 的 kind 'wc' 分支
+    // 从 _fetchDone 续拉(该分支已存在且进位兼容, 无需改动)。
+    // ★ 排队期拉取**不产生 fetch 分量**: 这段时间已计入 queue/prefillQ, 再记一次会重复计时。
+    //   (2026-09-01 时间戳口径: fetchExposure 从 waveEmpty ≥ prefillStart 起算, 天然满足)
+    for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
+      let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
+      let bfte = queueFetchTarget(bq);
+      if (bfte <= 0) continue;
+      if (bq._ft0 === undefined) bq._ft0 = bq.arrive; // be/wc: 传输过程自到达起(到达即拉语义)
+      if (coalesce && bq.groupId) {
+        let gp = groupPull[bq.groupId];
+        if (gp && bq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
+          bq._fetchDone = gp.frac * bfte;
+          if (gp.frac < 1) { /* 拉取中: 时间戳口径下无需累计(2026-09-01, 原 be 累计为死代码) */ }
+          else if (gp.doneAt !== null && bq._ft1 === undefined) bq._ft1 = gp.doneAt;
+          continue;
+        }
+        if (!gp) bq._coGpPuller = groupPull[bq.groupId] = { frac: 0, doneAt: null };
+      }
+      let rem = (bfte - (bq._fetchDone || 0)) * effL3BW;
+      if (rem > 0) {
+        // kind 打 be/wc: 共用 fetchBudget 与进度落账分支(wc 按 fetchTime 判完成, be 按 bfte)
+        fetchJobs.push({ req: bq, rem: rem, kind: bq._be ? 'be' : 'wc', bfte: bfte });
+      }
+      else if (bq._ft1 === undefined) bq._ft1 = now;
+    }
+    // decode 按需读优先: 拉取只用剩余带宽(上一步 decode L3 读需求, 2ms 滞后)
+    let fetchBudget = Math.max(0, l3PoolBytes - inst.prevDecodeL3);
+    for (let j of fetchJobs) {
+      if (fetchBudget <= 1) break;
+      let take = Math.min(Math.min(j.rem, l3PoolBytes), fetchBudget);
+      fetchBudget -= take;
+      stats.transferL3Bytes += take; stats.fetchBytesPulled += take;
+      let q2 = j.req;
+      if (j.kind === 'race') {
+        q2._raceTok += take / Math.max(kvPerTok, 1);
+        // 双层预热: frac 分母 = L3 段长度(H − l2h), 与拉取目标同口径
+        if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._raceTok / Math.max((q2._pfStartPos || 0) - (q2._l2HitTok || 0), 1));
+      } else if (j.kind === 'wc') {
+        q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
+        // 完成目标: 排队期 job 用 job 自带的 bfte(waitQueue 请求 fetchTime 未算, 读它会
+        // 恒 0 ⇒ 第一步就误判完成, _ft1 被污染); prefilling job 无 bfte ⇒ 回退 fetchTime
+        let tgt = (j.bfte !== undefined) ? j.bfte : (q2.fetchTime || 0);
+        if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(tgt, 1e-9));
+        if (q2._fetchDone >= tgt) {
+          if (q2._ft1 === undefined) q2._ft1 = now;
+          if (q2._coGpPuller && q2._coGpPuller.doneAt === null) q2._coGpPuller.doneAt = now;
+        }
+      } else { // be: 进度(时间当量), 准入时按 _fetchDone/fetchTime 定格已拉前缀
+        q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
+        if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(j.bfte, 1e-9));
+        if (q2._fetchDone >= j.bfte && q2._ft1 === undefined) q2._ft1 = now;
+      }
+    }
     // ===== 波次组批(waveMode, sglang chunked-prefill 对齐, 2026-08-18) =====
     if (waveMode) {
       // 1) fetch-only 请求(命中100%/无剩余计算): 直接进 prefilling 等拉取, 不占波次 token 预算
@@ -4636,12 +4750,11 @@ function runSimulation(strategy, overrides) {
             // _pqSkipped: 记账标记 —— 该请求的 prefillQ 等待里含"等自己的 KV"那一段,
             //   需在 completeRequest 里从 prefillQ 分量划转到 fetch 分量(见那里的 _fqW)。
             //   方案A 关闭时此标记恒 undefined ⇒ 划转量恒 0 ⇒ 记账逐位零回归。
-            // ⚠️ 已知 ≤1·DT(2ms) 的步内定序代价: 本步的拉取作业在**组波之后**才跑, 故这里读到的
-            //   是上一步末的 _fetchDone。请求若在本步内拉齐, 也要等下一步才能进波。
-            //   OFF 路径无此代价(它先把未就绪请求编进波, 拉齐后同步 上岗)。带宽充裕档实测
-            //   平均 TTFT +~2ms/请求(见 _verify_wave_skip_unready.js 的 A7)。
-            //   sglang 无此代价: 其预取跑在独立线程, 与调度器并发, check_prefetch_progress
-            //   读的是实时状态。彻底消除需把拉取作业移到组波之前(牵动 OFF 路径, 独立改动)。
+            // ⚠️ 残留 ≤1·DT(2ms) 的步内定序代价: 拉取块已搬到组波之前(见其块头注释), 故本步
+            //   拉齐的请求本步即可入波; 但请求**首次**落到 prefillQ 的那一步拉取才刚起步,
+            //   必然被让过一次。OFF 路径无此代价(它先把未就绪请求编进波, 拉齐后同步 上岗)。
+            //   带宽充裕档实测 +1·DT(搬移前为 2·DT), 见 _verify_wave_skip_unready.js 的 A7。
+            //   sglang 无此代价: 预取在独立线程与调度并发, check_prefetch_progress 读实时状态。
             rq._pqSkipped = true;
             continue;
           }
@@ -4657,19 +4770,10 @@ function runSimulation(strategy, overrides) {
         if (wv.members.length) inst.prepWave = prepWave = wv;
       }
     }
-    // ⚠️ 守卫条件(2026-09-01, 方案A 必需): 原为 `if (prefilling.length)` —— 但下方的
-    //   **L3 排队期拉取循环也嵌套在本块内**, 于是"没有请求在 prefill 时, 排队期拉取也不推进"。
-    //   方案A 下若某步全部 prefillQ 请求都未就绪, 无人进 prefilling ⇒ 拉取永不推进 ⇒
-    //   **永久死锁**(实测 0/32 完成, 跳过 878 万次)。
-    //   物理上这是建模瑕疵: sglang 的 HiCache 预取跑在独立线程(cache_controller), 与调度器
-    //   forward 循环完全解耦, 不存在"没有 batch 在跑就不预取"。
-    //   修法: 方案A 开启时把 prefillQ 也算作"需要推进拉取"的理由。**故意**只在方案A 下放宽 ——
-    //   OFF 时条件退化为原样 `prefilling.length`, 保证既有基线逐位不变(无条件放宽会让
-    //   waitQueue 在 prefilling 空时也开始拉取, 改变现有全部数值)。彻底解耦留作后续独立改动。
-    //   安全性: prefilling 为空时本块内各循环(nAct 统计/computeNet 累计/波次推进)均遍历
-    //   prefilling ⇒ 自然 no-op; sumCost=0 ⇒ perReqTok=0(有 `if (perReqTok > 0)` 守卫);
-    //   nAct=0 ⇒ GPU 忙碌统计有 `if (nAct > 0)` 守卫, 不污染。
-    if (prefilling.length || (waveSkipUnready && prefillQ.length)) {
+    // 守卫: 有请求在 prefill 才需要算算力分配。
+    // (2026-09-01) L3 拉取块已搬到本块**之前**且不受此守卫约束 —— 原先嵌套在这里造成
+    // "没有请求在 prefill 时排队期拉取也不推进"的结构性 bug, 见搬移后的块头注释。
+    if (prefilling.length) {
       // 并行 prefill 利用率提升: 2026-08-10 实测校准(分散到达口径)——
       // conc1(2请求并行 boost≈2, TTFT 367ms) / conc8(16请求 boost≈3, TTFT 478ms) 均需接近
       // 线性提升; 旧公式 1+(n-1)/gpus 在 8 卡下几乎无提升(1.125), 与实测矛盾(仿真高估 1.7-7×)。
@@ -4766,104 +4870,6 @@ function runSimulation(strategy, overrides) {
       // pfGpuBusySec: GPU 真的在算 prefill 的墙钟(有请求占算力的步数 × DT), 跨实例累加;
       // pfActSum/pfBusySteps: 平均同时在算的请求数 —— ≈1 说明流水线空转, 远大于 1 说明算力被填满。
       if (nAct > 0) { stats.pfGpuBusySec += DT; stats.pfBusySteps++; stats.pfActSum += nAct; }
-      // ===== L3 拉取（2026-08-18 统一共享池, 问题②修复 + 拉取单飞开关）=====
-      // prefill fetch / race 拉取 / be 排队期拉取 与 decode 的 L3 读共享同一条 NVMe 总线
-      // (effL3BW)——替代原独立 l3FetchBudget 预算池(与 decode 读互不排队, decode L3 重读
-      // 无法挤占 prefill 拉取)。优先级: **decode 按需读优先**(与生产存储系统一致:
-      // on-demand IO > 后台预取), prefill 拉取使用剩余带宽 fetchBudget = 池−decode需求
-      // (上一步, 2ms 滞后)——decode L3 重读饱和时拉取被挤占变慢, TTFT 随之上升。
-      // 注意: 按比例共享在 decode 自适应节流(passTime 伸缩使需求∝1/passTime)下会塌缩成
-      // 拉取优先(decode 需求越饿越小), 不能产生挤占效果, 故采用优先级模型。
-      // 单飞(coalesce, 默认关): 同组前缀拉取只发生一次(groupPull={frac,doneAt}, 拉取者推进
-      // frac, 等待者共享进度/完成时刻, 前缀完整点: wc=拉完 / race=相遇 / be=prefill完成);
-      // 关 = 每请求独立重拉(模拟前缀在两请求之间被逐出快层的场景, 与 pDecodeL3Read 同源)。
-      let fetchJobs = [];
-      for (let fi = 0; fi < prefilling.length; fi++) {
-        let fq = prefilling[fi];
-        if (fq._race) {
-          if (fq._raceMeetTok >= 0) continue;
-          let H = fq._pfStartPos || 0;
-          let l2h = fq._l2HitTok || 0;
-          let Hl = H - l2h;   // 双层预热: 拉取目标只含 L3 段 [l2h, H), L2 段不占 L3 带宽
-          if (coalesce && fq.groupId) {
-            let gp = groupPull[fq.groupId];
-            if (gp && fq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
-              fq._coGp = gp;
-              fq._raceTok = gp.doneAt !== null ? Hl : Math.max(fq._raceTok, gp.frac * Hl);
-              continue;
-            }
-            if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
-          }
-          let rem = Math.max(0, Hl - fq._raceTok) * kvPerTok;
-          if (rem > 0) fetchJobs.push({ req: fq, rem: rem, kind: 'race' });
-        } else if (fq._be) {
-          // be: 准入时已终止拉取(排队期尽力拉的量已定格), 剩余由 GPU 重算, 无拉取
-        } else if ((fq.fetchTime || 0) > (fq._fetchDone || 0)) {
-          if (coalesce && fq.groupId) {
-            let gp = groupPull[fq.groupId];
-            if (gp && fq._coGpPuller !== gp) { fq._coGp = gp; continue; }  // 单飞等待者(完成判定在推进循环)
-            if (!gp) fq._coGpPuller = groupPull[fq.groupId] = { frac: 0, doneAt: null };
-          }
-          fetchJobs.push({ req: fq, rem: (fq.fetchTime - (fq._fetchDone || 0)) * effL3BW, kind: 'wc' });
-        }
-      }
-      // 排队期拉取(be: 尽力拉取 2026-08-14; wc: 到达即拉 2026-08-31, 对齐 sglang HiCache):
-      // 遍历 waitQueue+prefillQ 中所有已到达未准入的请求, 拉取从 arrive 起持续
-      // (与 prefilling/decode 共享容量池, 排队期拉取自然受 decode 挤占 —— 真实行为)。
-      // be: 准入即终止("调度即停, 未拉重算"); wc: 准入后由 prefilling 的 kind 'wc' 分支
-      // 从 _fetchDone 续拉(该分支已存在且进位兼容, 无需改动)。
-      // ★ 排队期拉取**不产生 fetch 分量**: 这段时间已计入 queue/prefillQ, 再记一次会重复计时。
-      //   (2026-09-01 时间戳口径: fetchExposure 从 waveEmpty ≥ prefillStart 起算, 天然满足)
-      for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
-        let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
-        let bfte = queueFetchTarget(bq);
-        if (bfte <= 0) continue;
-        if (bq._ft0 === undefined) bq._ft0 = bq.arrive; // be/wc: 传输过程自到达起(到达即拉语义)
-        if (coalesce && bq.groupId) {
-          let gp = groupPull[bq.groupId];
-          if (gp && bq._coGpPuller !== gp) { // 单飞等待者(非本组拉取者): 共享组拉取进度
-            bq._fetchDone = gp.frac * bfte;
-            if (gp.frac < 1) { /* 拉取中: 时间戳口径下无需累计(2026-09-01, 原 be 累计为死代码) */ }
-            else if (gp.doneAt !== null && bq._ft1 === undefined) bq._ft1 = gp.doneAt;
-            continue;
-          }
-          if (!gp) bq._coGpPuller = groupPull[bq.groupId] = { frac: 0, doneAt: null };
-        }
-        let rem = (bfte - (bq._fetchDone || 0)) * effL3BW;
-        if (rem > 0) {
-          // kind 打 be/wc: 共用 fetchBudget 与进度落账分支(wc 按 fetchTime 判完成, be 按 bfte)
-          fetchJobs.push({ req: bq, rem: rem, kind: bq._be ? 'be' : 'wc', bfte: bfte });
-        }
-        else if (bq._ft1 === undefined) bq._ft1 = now;
-      }
-      // decode 按需读优先: 拉取只用剩余带宽(上一步 decode L3 读需求, 2ms 滞后)
-      let fetchBudget = Math.max(0, l3PoolBytes - inst.prevDecodeL3);
-      for (let j of fetchJobs) {
-        if (fetchBudget <= 1) break;
-        let take = Math.min(Math.min(j.rem, l3PoolBytes), fetchBudget);
-        fetchBudget -= take;
-        stats.transferL3Bytes += take; stats.fetchBytesPulled += take;
-        let q2 = j.req;
-        if (j.kind === 'race') {
-          q2._raceTok += take / Math.max(kvPerTok, 1);
-          // 双层预热: frac 分母 = L3 段长度(H − l2h), 与拉取目标同口径
-          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._raceTok / Math.max((q2._pfStartPos || 0) - (q2._l2HitTok || 0), 1));
-        } else if (j.kind === 'wc') {
-          q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
-          // 完成目标: 排队期 job 用 job 自带的 bfte(waitQueue 请求 fetchTime 未算, 读它会
-          // 恒 0 ⇒ 第一步就误判完成, _ft1 被污染); prefilling job 无 bfte ⇒ 回退 fetchTime
-          let tgt = (j.bfte !== undefined) ? j.bfte : (q2.fetchTime || 0);
-          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(tgt, 1e-9));
-          if (q2._fetchDone >= tgt) {
-            if (q2._ft1 === undefined) q2._ft1 = now;
-            if (q2._coGpPuller && q2._coGpPuller.doneAt === null) q2._coGpPuller.doneAt = now;
-          }
-        } else { // be: 进度(时间当量), 准入时按 _fetchDone/fetchTime 定格已拉前缀
-          q2._fetchDone = (q2._fetchDone || 0) + take / effL3BW;
-          if (q2._coGpPuller) q2._coGpPuller.frac = Math.min(1, q2._fetchDone / Math.max(j.bfte, 1e-9));
-          if (q2._fetchDone >= j.bfte && q2._ft1 === undefined) q2._ft1 = now;
-        }
-      }
       if (waveMode) {
         // ===== 波次推进(sglang chunked-prefill 对齐, 2026-08-18) =====
         // fetch-only 成员: 拉取完成即完成 prefill(不占算力不占波次预算)
@@ -5403,13 +5409,19 @@ function runSimulation(strategy, overrides) {
       computeNet: stats.ttftCnet / stats.completed * 1000,
       computeWait: Math.max(0, (stats.ttftC - stats.ttftCnet)) / stats.completed * 1000,
       // computeNetRaw / computeNetClampRate(2026-09-01 诊断): clamp 前的 computeNet 与截断率。
-      //   现状: 修掉"波次 _cNet 双重计入"的 bug 后, **全场景 clampRate == 0**(8 个档位实测),
-      //   即 computeNet ≤ compute − fetch 恒成立, Raw == computeNet。已升级为回归不变量
-      //   (见 scripts/debug/_verify_ttft_timestamp.js)。
-      //   若哪天 clampRate 又 > 0 ⇒ _cNet 的累加口径再次与波耗时脱钩, 回查两处累加点:
-      //   ①流体 perReqTok × τ(需 !waveMode 守卫) ②上岗处 m._cost / wPfFactor。
+      //   ⚠️ 截断是 **DT 离散化的边界 artifact**, 不是逻辑错误, 量级恒 ≤ 1·DT(2ms):
+      //   拉取完成的那一步(_ft1 所在步)**既完成拉取又开始计算**, 但 fetchExposure =
+      //   _ft1 − waveEmpty 把整段算作纯等待 ⇒ _cW = T − _fW 比"实际计算步数×DT"少一步。
+      //   (2026-09-01 拉取块搬到组波之前后暴露: 搬移前那一步被浪费掉, 恰好给 _cW 垫了 1·DT。
+      //    根因是 prefillEnd 记为完成步的**起点**而非终点, 修它会动 TTFT 本身, 不划算。)
+      //   ⇒ 影响: compute 只有数步的场景(如 F 档 ~5 步)相对误差可达 20%, computeWait 被压到 0。
+      //   读图规则: computeWait ≈ 0 且 Raw > computeNet ⇒ **不能**断言"无算力竞争", 需看
+      //   Raw − computeNet 的绝对量; 若接近 1·DT 说明是分辨率极限, 应加大 compute 规模再看。
+      //   回归断言用"截断量 ≤ 1·DT"(见 _verify_ttft_timestamp.js), 而非 clampRate == 0。
       computeNetRaw: stats.cNetRawSum / stats.completed * 1000,
       computeNetClampRate: stats.cNetClampN / stats.completed,
+      // 平均截断量(ms): 应恒 ≤ DT×1000 = 2ms。超出 ⇒ _cNet 累加口径与波耗时脱钩, 回查两处累加点。
+      computeNetClampMs: (stats.cNetRawSum - stats.ttftCnet) / stats.completed * 1000,
       dWait: stats.latDw / stats.completed * 1000,
       dTime: stats.latDt / stats.completed * 1000,
       // prefill 传输独立用时（ms, 未与计算重叠前）: wait_complete 下 ≈fetch(串行);
