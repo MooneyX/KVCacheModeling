@@ -350,11 +350,11 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
     <div class="form-row" style="margin-bottom:8px;align-items:center">
       <div><label>L3 预取策略 (sglang HiCache)</label><select id="sPrefetchPolicy" onchange="setPrefetchPolicy(this.value)" style="width:auto">
         <option value="wait_complete" selected>wait_complete（等 KV 拉齐再算）</option>
-        <option value="timeout">timeout（等拉齐但设超时上限, 超时则未拉部分重算 — sglang 默认）</option>
-        <option value="best_effort">best_effort（排队期尽力拉取, 准入即止, 未拉重算）</option>
+        <option value="timeout">timeout（等拉齐但设超时上限, 超时则未拉尾部重算 — sglang 默认）</option>
+        <option value="best_effort">best_effort（排队期从前往后尽力拉取, 准入即止, 未拉尾部重算）</option>
         <option value="suffix_race">suffix_race（前缀: GPU前向计算 + L3后向预取, 相遇即停, 再算非复用后缀）</option>
       </select></div>
-      <span style="font-size:.7rem;color:var(--text-dim)">选择后自动写入 DSL 的 PREFETCH 行（wait_complete→none）</span>
+      <span style="font-size:.7rem;color:var(--text-dim)" title="拉取方向依据 hiradix_cache.py:1778-1782 —— reverse 默认值 `self.prefetch_stop_policy == &quot;suffix_race&quot;`, 即只有 suffix_race 从后往前(tail-first, 要与 GPU 前向计算相遇); wc/best_effort/timeout 都是从前往后(head-first), 因为它们经 radix 前缀树的连续插入路径消费, 而前缀树只能从根连续延伸。">选择后自动写入 DSL 的 PREFETCH 行（wait_complete→none）；除 suffix_race 外均为 head-first 拉取</span>
     </div>
     <div class="form-row" style="margin-bottom:8px;align-items:center">
       <div><label>timeout 基线(秒)</label><input type="number" id="pPfTimeoutBase" value="1" min="0" step="0.5" style="width:90px" title="对齐 sglang 的 prefetch_timeout_base(hicache_storage_backend_extra_config 默认 1.0 秒)。超时判据: now - 预取起点 > base + 页数 × 每页增量"></div>
@@ -3909,11 +3909,13 @@ function runSimulation(strategy, overrides) {
     req._raceTok = 0;        // race: L3 从尾部(H端)已拉取的前缀 token 数
     req._raceMeetTok = -1;   // race: 相遇点 GPU 已算前缀 token 数; -1=尚未相遇(阶段0: GPU 算前缀)
     // best_effort(2026-08-14): 对齐 sglang —— 排队期(admit→准入prefill)尽力拉取,
-    // 准入时终止拉取: 已拉尾部直接消费, 未拉前缀+后缀由 GPU 重算(不再边算边拉到完成)。
+    // 准入时终止拉取: 已拉**头部**直接消费, 未拉尾部前缀+后缀由 GPU 重算。
+    // (2026-09-02 修正方向: head-first, 见 settleFetchStop/prefillPos 的依据注释。)
     // 仅对命中请求(fetchTime>0)生效。
     req._be = !!(s.prefetch && s.prefetch.type === 'best_effort' && req.fetchTime > 0);
     req._beFetchedTok = 0;  // be/timeout: 终止拉取时已拉前缀 token 数(定格)
     req._bePrefixCap = 0;   // be/timeout: 未拉前缀长度(终止时 = H - _beFetchedTok, GPU 重算段)
+    req._beHeadTok = 0;     // be/timeout: head-first 下 GPU 重算段的起始位置(= 已拉头部末端)
     // timeout(2026-09-02, sglang 默认策略 hicache_storage_prefetch_policy=timeout):
     // 语义 = wait_complete + 超时上限。到达即异步拉取, 拉齐则照常等齐再算(等同 wc);
     // 但超过时限就**终止预取**, 已拉部分直接消费、未拉前缀由 GPU 重算(定格方式等同 be)。
@@ -4192,21 +4194,62 @@ function runSimulation(strategy, overrides) {
     return (q.fetchTime || 0) <= (q._fetchDone || 0) || toExpired(q);
   }
   // 拉取终止定格(2026-09-02 抽出): be 准入即停 / timeout 超时即停 —— 二者在 sglang 里
-  // 都是 can_terminate_prefetch 返回 true ⇒ 终止预取, 已拉尾部直接消费、未拉前缀由 GPU 重算。
+  // 都是 can_terminate_prefetch 返回 true ⇒ 终止预取, 已拉**头部**直接消费、未拉尾部由 GPU 重算。
   // 把"已拉时间进度"按比例折算成 token 数并重设 _pfTotal, 之后走同一条重算路径。
   //   双层预热(2026-08-28): L2 段 [0, l2h) 无条件可用(免费), 拉取进度只作用于 L3 段 [l2h, H)
   //   ⇒ fetchTok = l2h + 进度×(H−l2h)。l2h=0 退化为原式。
   // ⚠️ resetDone: 上岗时调用传 false(调用方随后统一置 _pfDone=0); prefilling 中途超时传 true
   //   (该请求可能已算过 token, 但重算段的位置口径变了, 必须归零重新计)。
+  //
+  // ★ 拉取方向 = head-first(2026-09-02 修正): 已拉的是前缀**头部** [l2h, l2h+pulled),
+  //   GPU 重算段是**尾部** [l2h+pulled, H)。依据 hiradix_cache.py:1778-1782 —
+  //     `if reverse is None:`
+  //     `    # Default: suffix_race fetches tail-first (consumed at the chunk`
+  //     `    # meeting point); all other policies fetch head-first (consumed`
+  //     `    # via the contiguous tree-insert path).`
+  //     `    reverse = self.prefetch_stop_policy == "suffix_race"`
+  //   ⇒ 只有 suffix_race 是 tail-first(它要与 GPU 前向计算在中间相遇);
+  //     wc/best_effort/timeout 全是 head-first —— 它们经由 radix tree 的
+  //     **连续插入**路径消费, 而 radix 前缀树只能从根往下连续延伸, 尾部先到货
+  //     无法插入(中间有空洞) ⇒ 物理上必须 head-first。
+  //   _beHeadTok: GPU 重算段的**起始位置** = l2h + pulled。位置感知成本 τ(i)=a+b·i
+  //   对方向敏感 —— 重算尾部(位置更靠后)比重算头部更贵, 这正是 head-first 的代价。
   function settleFetchStop(q, resetDone) {
     let H = q._pfStartPos || 0;
     let l2h = q._l2HitTok || 0;
     let fetchTok = H > 0 ? Math.min(H, l2h + Math.floor((q._fetchDone || 0) / Math.max(q.fetchTime, 1e-9) * (H - l2h))) : 0;
     q._beFetchedTok = fetchTok;
     if (q._ft0 !== undefined && q._ft1 === undefined) q._ft1 = now;  // 拉取被终止, 传输过程结束
-    q._bePrefixCap = Math.max(0, H - fetchTok);
+    q._bePrefixCap = Math.max(0, H - fetchTok);   // 未拉前缀长度(GPU 重算段长度)
+    q._beHeadTok = fetchTok;                       // head-first: 重算段起始位置 = 已拉头部末端
     q._pfTotal = q._bePrefixCap + Math.max(0, q.prefillTokens ?? q.inputLen);  // = inputLen - fetchTok
     if (resetDone) q._pfDone = 0;
+  }
+  // 计算前沿的**绝对位置**(2026-09-02 抽出): 请求已算 done 个 token 时, 下一个 token 在
+  // 原始序列中的位置 —— 位置感知成本 τ(i)=a+b·i 要用它。
+  // ★ 抽出原因: 流体路径(逐步推进)与波次路径(chunk 中点)此前各写一套, 波次那套一直用
+  //   `_pfStartPos + _pfDone`, 对 be/timeout/race 都不成立(它们的计算起点不是 H):
+  //     · be/timeout 定格后从 _beHeadTok(已拉头部末端) 起算 —— 用 H 会高估位置从而高估成本;
+  //     · race 阶段0 从 l2h 起算前缀 —— 同样高估。
+  //   两处口径不一致会让"同一请求在两种模式下成本不同", 属隐蔽偏差, 故统一到此函数。
+  function prefillPos(q, done) {
+    if (q._race) {
+      let H = q._pfStartPos || 0;
+      // 阶段0: GPU 从 l2h 起前向算前缀(L3 同时从 H 端反向拉, 相遇即停);
+      // 阶段1: 相遇后转算非复用后缀 [H, L)
+      return q._raceMeetTok < 0
+        ? (q._l2HitTok || 0) + done
+        : Math.min(q.inputLen, H + (done - q._raceMeetTok));
+    }
+    if (q._be || q._toFired) {
+      // head-first: 已拉头部 [l2h, _beHeadTok) 直接可用, GPU 从 _beHeadTok 起算。
+      // ★ 未拉前缀段 [_beHeadTok, H) 与非复用后缀 [H, L) **首尾相连** ⇒ 单段连续递增,
+      //   无需像 tail-first 那样分两段跳转。这正对应 sglang 注释里 head-first 走
+      //   "contiguous tree-insert path"(连续插入)的说法。
+      return (q._beHeadTok || 0) + done;
+    }
+    // wc / timeout(未超时): 命中前缀已整体到位, 从 _pfStartPos 起算未命中段
+    return (q._pfStartPos || 0) + done;
   }
   // 有效槽位占用(2026-08-31, M4): 拉取中的 wc 请求**不算占用** —— 对齐 sglang
   // "未拉齐留在等待队列(check_prefetch_progress 未过就 continue), 不占 running batch 槽位"。
@@ -4840,7 +4883,7 @@ function runSimulation(strategy, overrides) {
           //     若先按 tot 切 chunk 会切错(实测会出现 chunk > _pfTotal 的越界波)。
           if (rq._be || (rq._to && toExpired(rq))) {
             // be: 进 batch 即终止预取(can_terminate_prefetch 对 best_effort 恒 True);
-            // timeout: 已超时 ⇒ 同样终止。二者都是"已拉尾部直接用, 未拉前缀 GPU 重算"。
+            // timeout: 已超时 ⇒ 同样终止。二者都是"已拉头部直接用, 未拉尾部 GPU 重算"。
             if (rq._to) rq._toFired = true;
             settleFetchStop(rq, true);
           } else if (rq._race) {
@@ -4905,21 +4948,15 @@ function runSimulation(strategy, overrides) {
         let qq = prefilling[qi];
         qq._tauNow = 0;   // 本步该请求的 τ(pos); 0 = 本步不占算力(拉取中/已算完), 见下方 computeNet 累计
         if (qq._race) {
-          // race: 阶段0 GPU 从前往后计算前缀[0, H](pos=已算前缀数, 位置从0递增);
-          // 相遇后阶段1 计算非复用后缀[H, L](pos=H+已算后缀数, 位置从H递增)
-          // 双层预热(2026-08-28): L2 段[0, l2h) 免费可用, GPU 从 l2h 起算(pos 偏移),
-          // 相遇区间缩为 [l2h, H)。l2h=0 时与原式逐位一致。
-          let H = qq._pfStartPos || 0;
-          let l2h = qq._l2HitTok || 0;
-          let pos = qq._raceMeetTok < 0 ? (l2h + qq._pfDone)
-            : Math.min(qq.inputLen, H + (qq._pfDone - qq._raceMeetTok));
-          qq._tauNow = prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b(卡数不同)
+          // race: 阶段0 GPU 从 l2h 往后算前缀[l2h, H) + L3 从 H 端**反向**拉取, 相遇即停;
+          // 相遇后阶段1 计算非复用后缀[H, L]。位置口径见 prefillPos(与波次路径共用)。
+          qq._tauNow = prefillTau(pP, prefillPos(qq, qq._pfDone));   // PD 真分离: 走 P 节点 a/b
           sumCost += qq._tauNow;
           nAct++;
           continue;
         }
-        // best_effort(修正): 重算未拉前缀(位置0→cap) + 后缀(位置H→L), 全程占算力;
-        // wait_complete 拉取中不占算力
+        // best_effort: 已拉头部直接用, GPU 重算尾部 [_beHeadTok, H) + 后缀 [H, L), 全程占算力;
+        // wait_complete 拉取中不占算力(见上方 continue)
         // timeout(2026-09-02): 在 prefilling 里等拉齐时若超时 ⇒ 就地定格(与上岗块同一套
         //   口径: 已拉量按比例折算, 未拉前缀转 GPU 重算), 定格后即按 be 路径占算力推进。
         if (qq._to && !qq._toFired && (qq.fetchTime || 0) > qq._fetchDone && toExpired(qq)) {
@@ -4928,17 +4965,11 @@ function runSimulation(strategy, overrides) {
         }
         if (!qq._be && !qq._toFired && (qq.fetchTime || 0) > qq._fetchDone) continue;
         if (qq._pfTotal <= 0) continue;  // 命中 100% 或排队期已拉完: 无剩余计算, 不占算力
-        let pos;
-        if (qq._be || qq._toFired) {
-          // be/timeout 定格后: 先算未拉前缀[0, cap)(位置从0递增, 成本低), 再算后缀[H, L]
-          // 双层预热(2026-08-28): 未拉段实为 [l2h, H−pulled), 位置从 l2h 起算(L2 段 KV 已在 GPU)。
-          let cap = qq._bePrefixCap || 0;
-          let l2h = qq._l2HitTok || 0;
-          pos = qq._pfDone < cap ? (l2h + qq._pfDone) : (qq._pfStartPos || 0) + (qq._pfDone - cap);
-        } else {
-          // P0-3: 位置成本偏移——未命中段从 _pfStartPos(命中量) 起算
-          pos = (qq._pfStartPos || 0) + Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
-        }
+        // 位置口径统一走 prefillPos(与波次路径共用, 见其注释)。
+        // wc 分支的 min(_pfDone, _pfTotal−1) 夹紧: 防末步推进超出 _pfTotal 时 pos 越界。
+        let done = (qq._be || qq._toFired) ? qq._pfDone
+          : Math.min(qq._pfDone, Math.max(0, qq._pfTotal - 1));
+        let pos = prefillPos(qq, done);
         qq._tauNow = prefillTau(pP, pos);   // PD 真分离: prefill 走 P 节点 a/b
         sumCost += qq._tauNow;
         nAct++;
@@ -5004,7 +5035,7 @@ function runSimulation(strategy, overrides) {
           }
           if (allReady) {
             // timeout 上岗定格(2026-09-02 第2批): 成员里若有"因超时而结清"的, 在此按 be 路径
-            // 定格 —— 已拉尾部直接用, 未拉前缀转 GPU 重算。必须在算 cost 之前(它改 _pfTotal)。
+            // 定格 —— 已拉头部直接用, 未拉尾部转 GPU 重算。必须在算 cost 之前(它改 _pfTotal)。
             // ⚠️ 定格会缩小/放大 _pfTotal, 成员的 chunk 是组波时按旧值切的 ⇒ 需夹紧, 否则
             //   结算时 _pfDone 会超过 _pfTotal(表现为请求"算完了还留在 prefilling")。
             for (let m of prepWave.members) {
@@ -5039,17 +5070,24 @@ function runSimulation(strategy, overrides) {
             // mfuAuto: a/b 即硬件 Roofline 极限, 不再叠加 boost(同流体模式口径)
             let wBoost = p.mfuAuto ? 1
               : Math.max(1, Math.min(waveTokTotal / Math.max(p.chunkSize, 1), PREFILL_UTIL_CAP / Math.max(p.mfu, 0.05)));
+            // 混合批口径(2026-09-02 第3批, 对齐 enable_mixed_chunk=False 默认):
+            // sglang 的事件循环**每次只跑一个 batch** —— get_next_batch_to_run 里
+            //   `if new_batch is not None: ret = new_batch   # Run prefill first if possible`
+            //   `else: ... ret = self.running_batch          # Run decode`
+            // (scheduler.py:2880-2892) ⇒ prefill 波与 decode pass **交替独占** GPU,
+            // 而非"同批共享算力打折"。故波耗时不再乘 0.7 折扣; 互斥改由 decode 侧实现
+            // (prefill 波执行期间 decode 不推进, 见 decode 段的 gpuBusyByPrefill 门控)。
+            // ⚠️ PD 真分离(pdSep)下 P/D 各有独立 GPU, 本就无互斥 —— 见 decode 段的判据。
             let wPfFactor = 1;
-            if (!p.pdSep) {
-              let decodeUtil = decoding.length / Math.max(1, s.batching.max_batch_size || 8);
-              wPfFactor = 1 - 0.3 * Math.min(1, decodeUtil);
-            }
             // 波耗时 = Σ 成员 chunk 的 τ(i) 位置积分(中点近似, 秒) ÷ (boost × 混合批折扣)
             // 2026-08-19: 与流体模式统一为 τ 口径(旧实现按 2·act·(1+b/a·pos)/computeFlops,
             // 量纲上等价于强制 a=2·act/computeFlops, 手填/实测 a 被忽略)
             let cost = 0;
             for (let m of curWave.members) {
-              let posMid = (m.q._pfStartPos || 0) + m.q._pfDone + m.chunk / 2;
+              // 位置取本 chunk 的**中点**(积分中点近似)。起点口径统一走 prefillPos ——
+              // 2026-09-02 修正: 原式写死 `_pfStartPos + _pfDone`, 对 be/timeout(定格后
+              // 从 _beHeadTok 起算) 与 race(阶段0 从 l2h 起算) 都偏大 ⇒ 高估 τ 成本。
+              let posMid = prefillPos(m.q, m.q._pfDone + m.chunk / 2);
               m._cost = m.chunk * prefillTau(pP, posMid);   // PD 真分离: 波次同样走 P 节点 a/b
               cost += m._cost;
             }
@@ -5228,11 +5266,37 @@ function runSimulation(strategy, overrides) {
       let passTime = (rD.modelWeightBytes * rD.decodeWeightRatio + sumH) / rD.aggHbmBW
         + perReqMs(decoding.length, rD.activatedParams, pdDecodeGpus) / 1000;
       let cmpFloor = 2 * rD.activatedParams * decoding.length / rD.computeFlops;
-      // chunked-prefill 竞争：混合批下并行 prefill 与 decode 共享算力，只放大算力项（带宽/I-O 项不受 prefill 影响）。
-      // 旧实现 passTime×2 把 I-O 读盘时间也翻倍——decode 受限(SSD 慢)场景被严重拖慢，属过度惩罚。
-      // PD 分离（sglang）时 prefill/decode 各用独立资源，无算力竞争。
-      if (!p.pdSep && prefilling.length) cmpFloor *= (1 + 0.5 * prefilling.length);
+      // ===== prefill/decode 交替独占 GPU(2026-09-02 第3批, enable_mixed_chunk=False) =====
+      // sglang 事件循环每次只跑一个 batch: 有 prefill batch 就跑 prefill(优先),
+      // 否则跑 decode(scheduler.py:2880-2892 "Run prefill first if possible") ⇒ 二者
+      // **交替独占**算力, 不是同批共享。
+      // 建模方式: 本步 DT 内 GPU 花在 prefill 上的时间片占比 pfShare, 余下 (1−pfShare)
+      // 才归 decode ⇒ decode 的有效步长按 (1−pfShare) 缩放(见下方 dtEff)。
+      //   · 波次模式: 执行波在 [waveStart, endT] 独占 ⇒ 本步与波区间的重叠比例即 pfShare;
+      //     筹备波只做 L3 拉取(不占算力) ⇒ 不计入。
+      //   · 流体对照基线: 无"波区间"概念, 退化为"有请求在算就按算力份额折算"(保留原
+      //     0.5·n 放大口径, 见下方 else 分支) —— 它本就不是 sglang 行为, 不做对齐。
+      // ⚠️ PD 真分离: P/D 各有独立 GPU, 无互斥 ⇒ pfShare 恒 0。
+      let pfShare = 0;
+      if (!p.pdSep) {
+        if (waveMode) {
+          if (curWave) {
+            // 执行波覆盖本步的比例(波可能在步中途结束)
+            let ovl = Math.min(now + DT, curWave.endT) - now;
+            pfShare = Math.max(0, Math.min(1, ovl / Math.max(DT, 1e-12)));
+          }
+        } else if (prefilling.length) {
+          // 流体基线: 维持原"算力竞争放大"口径(非 sglang 行为, 仅作对照)
+          cmpFloor *= (1 + 0.5 * prefilling.length);
+        }
+      }
       passTime = Math.max(passTime, cmpFloor, 1e-6) + rD.commTime(decoding.length);
+      // dtEff: 本步真正归 decode 的 GPU 时间(2026-09-02 第3批)。
+      // prefill 波独占了 pfShare 比例的时间片 ⇒ decode 只剩 (1−pfShare)·DT。
+      // 下游所有"本步前向次数"换算(pIt/pFinal/passes/tok)统一用 dtEff, 保证
+      // token 产出、KV 读字节、链路占用三者口径一致 —— 只改其一会让带宽统计与吞吐脱节。
+      // pfShare=0(流体基线 / PD 真分离 / 无执行波)时 dtEff===DT ⇒ 逐位零回归。
+      let dtEff = DT * (1 - pfShare);
       // ---- L2 读链路排队(busyUntil) + L3 读统一共享池(2026-08-18, 问题②修复) ----
       // L2(dram>hbm): 维持 busyUntil 排队模型(decode 读与预取/淘汰共享带宽)。
       // L3(ssd>dram): decode 按需读优先于 prefill 拉取(见拉取段注释)——decode 始终按全速
@@ -5245,7 +5309,7 @@ function runSimulation(strategy, overrides) {
       let l2Fin = now;
       let l3ReadPerPass = sumS > 0 ? sumS / Math.max(l3RateAvail, 1) : 0;
       for (let it = 0; it < 4; it++) {
-        let pIt = DT / Math.max(passTime, 1e-9);
+        let pIt = dtEff / Math.max(passTime, 1e-9);
         let l2B = sumD * pIt;                                     // 本步 L2 读字节
         // 排队: 读请求从 max(now, 本方向+反方向共享总线忙到何时) 开始传输
         let l2Start = Math.max(now, l2Link.busyUntil, l2Link.shared.busyUntil);
@@ -5264,7 +5328,7 @@ function runSimulation(strategy, overrides) {
       }
       // 提交链路占用: decode L2 读推进共享总线 busyUntil（后续预取/淘汰在此排队）;
       // L3 读不再写 busyUntil(共享池口径), 改为记录需求供下一步拉取份额分配
-      let pFinal = DT / Math.max(passTime, 1e-9);
+      let pFinal = dtEff / Math.max(passTime, 1e-9);
       if (sumD > 0) {
         let st = Math.max(now, l2Link.busyUntil, l2Link.shared.busyUntil);
         let fin = st + sumD * pFinal / Math.max(l2Link.bw, 1);
@@ -5275,7 +5339,7 @@ function runSimulation(strategy, overrides) {
       stats.transferL2Bytes += sumD * pFinal;
       stats.transferL3Bytes += sumS * pFinal;
       // L2/L3 实测读带宽：本步等效前向次数 = DT/passTime，每次前向读 ΣKV_T 字节
-      let passes = DT / Math.max(passTime, 1e-9);
+      let passes = dtEff / Math.max(passTime, 1e-9);
       stats.hbmReadBytes += sumH * passes;
       stats.dramReadBytes += sumD * passes;
       stats.ssdReadBytes += sumS * passes;
@@ -5299,7 +5363,7 @@ function runSimulation(strategy, overrides) {
       if (cmpFloor > bn) { bn = cmpFloor; bnk = 'bnCmp'; }
       if (rD.commTime(decoding.length) > bn) bnk = 'bnComm';
       stats[bnk]++;
-      let tok = DT / passTime;
+      let tok = dtEff / passTime;
       for (let i = decoding.length - 1; i >= 0; i--) {
         let q = decoding[i];
         // P0-3: 缺失块重算——块被彻底丢弃(drop)后需按 GPU 重算代价恢复（位置感知），
