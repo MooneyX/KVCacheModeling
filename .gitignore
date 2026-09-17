@@ -1,5 +1,10 @@
-# 部署产物(由 index.html 一键生成, 可随时重建)
+# 构建与本地验证产物
 dist/
+node_modules/
+test-results/
+playwright-report/
+.playwright-cli/
+.codebuddy/refactor-baseline/
 
 # 工具内部数据: 个人工作日志不入库(回归脚本 .workbuddy/*.js 保留)
 .workbuddy/memory/

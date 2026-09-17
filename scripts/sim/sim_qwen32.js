@@ -1,38 +1,12 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // 对比仿真: Qwen3-32B 单卡(H20) 参数, 与 .114.88 GPU6 实际测量对比
-const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
 
-function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {},
-    classList: { add(){}, remove(){}, contains(){ return false; } },
-    dataset: {},
-    appendChild(){}, remove(){},
-    querySelectorAll(){ return []; },
-    addEventListener(){}, focus(){},
-  };
-}
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; },
-  createElement(){ return makeEl(); },
-  addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = {
-  init(){ return { setOption(){}, resize(){}, dispose(){} }; },
-  getInstanceByDom(){ return null; },
-};
-(0, eval)(code + `
-globalThis.__sim = { runSimulation, parseDSL, strategyPresets, getParams, calcAll, mulberry32 };
-`);
-const sim = globalThis.__sim;
-const $ = (id) => global.document.getElementById(id);
+const readControl = id => elements[id] || (elements[id] = makeEl());
+
+const sim = createLegacyHarness(readControl);
+const $ = (id) => readControl(id);
 const set = (id, v) => { $(id).value = String(v); };
 
 // ---- Qwen3-32B × H20 单卡(与 .114.88 GPU6 实测一致) ----

@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>参数敏感性 · L3聚合带宽 → 平均TTFT(ms)</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+:root{--bg:#0f1117;--surface:#1a1d27;--surface2:#242837;--border:#2e3347;--accent:#6c63ff;--accent2:#34d399;--text:#e4e4e7;--text-dim:#9ca0b0}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;line-height:1.55}
+.wrap{max-width:1080px;margin:0 auto}
+h1{font-size:1.18rem;margin:0 0 4px}h1 span{color:var(--accent)}
+.sub{color:var(--text-dim);font-size:.8rem;margin:0 0 16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+#chart{height:440px}
+.box{background:var(--surface2);border-left:3px solid var(--accent);border-radius:6px;padding:10px 12px;font-size:.78rem;color:var(--text-dim)}
+.box code{background:rgba(108,99,255,.14);color:var(--accent);padding:1px 5px;border-radius:3px;font-size:.95em}
+.box b{color:var(--text)}
+table{border-collapse:collapse;width:100%;font-size:.78rem}
+th,td{border:1px solid var(--border);padding:5px 9px;text-align:right}
+th{background:var(--surface2);color:var(--text-dim);font-weight:600;text-align:right}
+th:first-child,td.k{text-align:left;color:var(--text-dim)}
+tbody tr:hover{background:rgba(108,99,255,.07)}
+.btn{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:.75rem;font-weight:600;cursor:pointer}
+.btn:hover{background:#7f78ff}
+h2{font-size:.9rem;margin:0 0 10px;display:flex;align-items:center;gap:10px}
+pre{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;overflow:auto;font-size:.7rem;color:var(--text-dim);max-height:220px;margin:0}
+.pgrp{margin-bottom:14px}
+.pgrp>h3{font-size:.78rem;color:var(--accent);margin:0 0 6px;font-weight:600;display:flex;align-items:center;gap:6px}
+.pgrp>h3 i{font-style:normal;font-size:.68rem;color:var(--text-dim);font-weight:400}
+.pgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:6px}
+.pf{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 9px;display:flex;align-items:baseline;gap:8px;min-width:0}
+.pf.mod{border-left:3px solid var(--accent2)}
+.pf .pk{font-size:.7rem;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.pf .pv{font-size:.75rem;color:var(--text);font-weight:600;font-family:var(--mono,ui-monospace,monospace);white-space:nowrap}
+.pf.mod .pv{color:var(--accent2)}
+.pf .pv.off{color:var(--text-dim);font-weight:400}
+.ptog{background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:5px;padding:2px 8px;font-size:.68rem;cursor:pointer;margin-left:8px}
+.ptog:hover{border-color:var(--accent);color:var(--text)}
+.foot{color:var(--text-dim);font-size:.72rem;text-align:center;padding:8px 0 0}
+.mbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.mbar label{font-size:.75rem;color:var(--text-dim)}
+select{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:.76rem}
+.chip{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:.71rem;cursor:pointer}
+.chip:hover{border-color:var(--accent);color:var(--text)}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.fbar{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}
+.fc{background:var(--surface2);color:var(--text-dim);border:1px solid var(--border);border-radius:5px;padding:2px 9px;font-size:.71rem;cursor:pointer;font-variant-numeric:tabular-nums}
+.fc:hover{border-color:var(--accent2);color:var(--text)}
+.fc.on{background:rgba(52,211,153,.16);border-color:var(--accent2);color:var(--accent2);font-weight:600}
+.fmini{background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:5px;padding:2px 7px;font-size:.68rem;cursor:pointer}
+.fmini:hover{border-color:var(--accent);color:var(--text)}
+.fwarn{color:#f59e0b}
+.fdanger{color:#ef4444}
+.pvrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:7px 0}
+.pvrow>b{font-size:.73rem;color:var(--text);min-width:52px;font-weight:600}
+.pvnote{font-size:.71rem;color:var(--text-dim);margin-left:auto}
+.fbar.live{border-left:3px solid #06b6d4;padding-left:8px}
+.fbar.live .fc.on{background:rgba(6,182,212,.16);border-color:#06b6d4;color:#06b6d4}
+</style></head><body><div class="wrap">
+<h1>参数<span>敏感性</span>分析</h1>
+<p class="sub">横轴：L3聚合带宽 ｜ 纵轴：<span id="dimY">平均TTFT(ms)</span><br>基准策略 <b>WC</b> · 随机种子  · 导出于 2026/9/17 08:00:00</p>
+<div class="card">
+<div class="mbar"><label>纵轴指标</label><select id="mSel"><option value="ttft" selected>平均TTFT(ms)</option><option value="throughput">吞吐(tok/s)</option></select>
+<span style="color:var(--border)">|</span>
+<button class="chip" data-m="ttft">平均TTFT(ms)</button><button class="chip" data-m="throughput">吞吐(tok/s)</button>
+<span id="mNote" style="font-size:.71rem;color:var(--text-dim);margin-left:auto">共 2 个指标 · 同一批仿真结果，切换零重算</span>
+</div>
+<div id="chart"></div></div>
+<div class="card"><div class="box"><b>📐 敏感度分析方法</b><br>undefined<br>共同随机数法：扫描时固定其他全部参数与随机种子，因此曲线差异只来自横轴（与颜色/形状）维度本身。</div></div>
+<div class="card"><h2>📋 数据表 <button class="btn" onclick="copyTsv()">复制为 TSV（可直接粘贴到 Excel）</button><span id="copyNote" style="color:var(--accent2);font-size:.72rem"></span></h2>
+<table id="tbl"><thead><tr><th>L3聚合带宽</th><th>WC</th></tr></thead><tbody><tr><td class="k">10GB/s</td><td>12</td></tr>
+<tr><td class="k">50GB/s</td><td>8</td></tr></tbody></table></div>
+<div class="card"><h2>🔧 参数配置<span id="pCount" style="font-size:.7rem;color:var(--text-dim);font-weight:400">共 0 项</span><button class="ptog" id="pJsonTog" style="margin-left:auto">{ } 原始 JSON</button></h2>
+<div id="pWrap"><div id="pJson">
+<p style="font-size:.71rem;color:var(--text-dim);margin:0 0 6px">可全选复制后粘回平台「导入参数」以复现本次扫描</p>
+<pre>{}</pre></div></div>
+</div>
+<p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放 / 指标切换）需联网加载 echarts；离线时数据表仍完整可用</p>
+</div>
+<script>
+var OPT = {"title":{"text":"Regression"},"xAxis":{"data":["10GB/s","50GB/s"]},"yAxis":{},"series":[{"name":"WC","type":"line","data":[12,8]}]};
+var METRIC_DATA = {"ttft":[[12,8]],"throughput":[[100,120]]};
+var METRIC_LABEL = {"ttft":"平均TTFT(ms)","throughput":"吞吐(tok/s)"};
+var CUR_METRIC = "ttft";
+var X_LABEL = "L3聚合带宽";
+var IS_MULTI = false;
+var STACK_KEY = "ttft_stack";
+var STACK_PARTS = [];
+var STACK_DATA = {};
+var STACK_TOTALS = [];
+var STACK_LABELS = [];
+var LINE_LABELS = ["10GB/s","50GB/s"];
+var LINE_TPL = [];
+var CUR_IS_STACK = false;
+var LINE_X_NAME = "L3聚合带宽";
+var STACK_X_NAME = "L3聚合带宽";
+var CURVE_COORDS = [];
+var SEL = {x:null,cmp:null,shape:null};
+function symbolMarker(sym,color){
+  var W='width="10" height="10" viewBox="0 0 10 10" style="vertical-align:middle;margin-right:5px;flex:none"';
+  if(sym==="square") return "<svg "+W+"><rect x=\"1\" y=\"1\" width=\"8\" height=\"8\" fill=\""+color+"\"/></svg>";
+  if(sym==="triangle") return "<svg "+W+"><polygon points=\"5,1 9,9 1,9\" fill=\""+color+"\"/></svg>";
+  if(sym==="diamond") return "<svg "+W+"><polygon points=\"5,1 9,5 5,9 1,5\" fill=\""+color+"\"/></svg>";
+  if(sym==="roundRect") return "<svg "+W+"><rect x=\"1\" y=\"1\" width=\"8\" height=\"8\" rx=\"3\" fill=\""+color+"\"/></svg>";
+  if(sym==="pin") return "<svg "+W+"><path d=\"M5 1C3 1 1.6 2.4 1.6 4.3C1.6 6.3 5 9 5 9S8.4 6.3 8.4 4.3C8.4 2.4 7 1 5 1Z\" fill=\""+color+"\"/></svg>";
+  return "<svg "+W+"><circle cx=\"5\" cy=\"5\" r=\"4\" fill=\""+color+"\"/></svg>";
+}
+OPT.tooltip = OPT.tooltip || {}; OPT.tooltip.trigger = "axis";
+OPT.tooltip.formatter = function(ps){
+  if(!ps||!ps.length) return "";
+  var h = "<div style=\"font-weight:600;margin-bottom:4px\">"+(ps[0].axisValueLabel||ps[0].name)+"</div>";
+  if(CUR_IS_STACK){
+    var tot = 0; ps.forEach(function(p){ tot += (+p.value||0); });
+    ps.forEach(function(p){
+      var v = +p.value||0, pct = tot>0 ? (100*v/tot) : 0;
+      h += "<div style=\"display:flex;align-items:center;line-height:18px\">"
+        + "<span style=\"display:inline-block;width:9px;height:9px;border-radius:2px;background:"+p.color+";margin-right:6px;flex:none\"></span>"
+        + "<span style=\"color:#9ca0b0;margin-right:10px\">"+p.seriesName+"</span>"
+        + "<span style=\"margin-left:auto\"><b style=\"color:#e4e4e7\">"+v.toFixed(1)+"</b>"
+        + "<span style=\"color:#9ca0b0\"> ms · "+pct.toFixed(1)+"%</span></span></div>";
+    });
+    h += "<div style=\"border-top:1px solid #2e3347;margin-top:4px;padding-top:4px;display:flex;line-height:18px\">"
+      + "<span style=\"color:#9ca0b0;margin-right:10px\">TTFT 合计</span>"
+      + "<span style=\"margin-left:auto;font-weight:600;color:#e4e4e7\">"+tot.toFixed(1)+" ms</span></div>";
+    return h;
+  }
+  ps.forEach(function(p){
+    var sym = (OPT.series[p.seriesIndex]&&OPT.series[p.seriesIndex].symbol)||"circle";
+    h += "<div style=\"display:flex;align-items:center;line-height:18px\">"+symbolMarker(sym,p.color)
+      + "<span style=\"color:#9ca0b0;margin-right:8px\">"+p.seriesName+"</span>"
+      + "<span style=\"margin-left:auto;color:#9ca0b0\">"+p.value+"</span></div>";
+  });
+  return h;
+};
+OPT.toolbox = {right:8,top:0,feature:{saveAsImage:{title:"保存为图片",name:"敏感性_"+(METRIC_LABEL[CUR_METRIC]||"").replace(/[\/:*?"<>|()\s]+/g,""),pixelRatio:2,backgroundColor:"#1a1d27"},dataZoom:{title:{zoom:"区域缩放",back:"还原"}},restore:{title:"还原"}},iconStyle:{borderColor:"#9ca0b0"}};
+var ch = null;
+if(window.echarts){ ch = echarts.init(document.getElementById("chart")); ch.setOption(OPT);
+  window.addEventListener("resize", function(){ try{ch.resize()}catch(e){} }); }
+else { document.getElementById("chart").innerHTML = "<div style=\"padding:24px;color:#9ca0b0;font-size:.82rem\">⚠ 未能加载 echarts（当前离线？）——图表无法渲染，但下方数据表完整可用。</div>"; }
+function esc2(t){ return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function inSel(dim, idx){
+  if(idx < 0) return true;
+  var s = SEL[dim]; if(!s) return true;
+  return s.indexOf(idx) >= 0;
+}
+function viewXIdx(){
+  var n = LINE_LABELS.length, out = [];
+  for(var i=0;i<n;i++) if(!SEL.x || SEL.x.indexOf(i)>=0) out.push(i);
+  return out;
+}
+function viewCurves(){
+  var out = [];
+  for(var i=0;i<LINE_TPL.length;i++){
+    var c = CURVE_COORDS[i] || {ci:-1,pi:-1};
+    if(inSel("cmp", c.ci) && inSel("shape", c.pi)) out.push(i);
+  }
+  return out;
+}
+function viewSceneIdx(){
+  var nPt = LINE_LABELS.length, keepC = viewCurves(), keepX = viewXIdx(), out = [];
+  for(var a=0;a<keepC.length;a++) for(var b=0;b<keepX.length;b++)
+    out.push(keepC[a]*nPt + keepX[b]);
+  return out;
+}
+function sceneLabelAt(i){
+  var lb = STACK_LABELS[i]||"";
+  if(viewCurves().length === 1){
+    var nPt = LINE_LABELS.length;
+    return LINE_LABELS[i % nPt] || lb;
+  }
+  return lb;
+}
+function renderTable(){
+  var tbl = document.getElementById("tbl"); if(!tbl) return;
+  var th = tbl.querySelector("thead"), tb = tbl.querySelector("tbody");
+  if(!th||!tb) return;
+  if(CUR_IS_STACK){
+    var sIdx = viewSceneIdx();
+    th.innerHTML = "<tr><th>场景</th>" + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("") + "<th>TTFT合计</th></tr>";
+    tb.innerHTML = sIdx.map(function(i){
+      return "<tr><td class=\"k\">"+esc2(sceneLabelAt(i))+"</td>"
+        + STACK_PARTS.map(function(p){ return "<td>"+esc2((STACK_DATA[p.key]||[])[i])+"</td>"; }).join("")
+        + "<td><b>"+esc2(STACK_TOTALS[i])+"</b></td></tr>";
+    }).join("");
+    return;
+  }
+  var cols = METRIC_DATA[CUR_METRIC]; if(!cols) return;
+  var lb = METRIC_LABEL[CUR_METRIC]||CUR_METRIC;
+  var keepC = viewCurves(), keepX = viewXIdx();
+  th.innerHTML = "<tr><th>"+esc2(LINE_X_NAME)+"</th>"
+    + keepC.map(function(ci){ return "<th>"+esc2(IS_MULTI ? LINE_TPL[ci].name : lb)+"</th>"; }).join("") + "</tr>";
+  tb.innerHTML = keepX.map(function(xi){
+    return "<tr><td class=\"k\">"+esc2(LINE_LABELS[xi])+"</td>"
+      + keepC.map(function(ci){ var v=(cols[ci]||[])[xi]; return "<td>"+esc2(v!=null?v:"")+"</td>"; }).join("") + "</tr>";
+  }).join("");
+}
+function buildStackSeries(){
+  var sIdx = viewSceneIdx();
+  var ss = STACK_PARTS.map(function(p){
+    var src = STACK_DATA[p.key]||[];
+    return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,
+      itemStyle:{color:p.color}, emphasis:{focus:"series"},
+      data:sIdx.map(function(i){ return src[i]; })};
+  });
+  if(ss.length){ ss[ss.length-1].label = {show: sIdx.length<=24, position:"top",
+    color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){
+      var t = STACK_TOTALS[sIdx[p.dataIndex]]||0;
+      return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }
+  return ss;
+}
+function buildLineSeries(k){
+  var cols = METRIC_DATA[k]||[], lb = METRIC_LABEL[k]||k;
+  var keepX = viewXIdx();
+  return viewCurves().map(function(ci){
+    var s = JSON.parse(JSON.stringify(LINE_TPL[ci]));
+    if(!IS_MULTI) s.name = lb;
+    var src = cols[ci]||[];
+    s.data = keepX.map(function(xi){ return src[xi]; });
+    return s;
+  });
+}
+function viewXLabels(){ return viewXIdx().map(function(i){ return LINE_LABELS[i]; }); }
+function viewSceneLabels(){ return viewSceneIdx().map(sceneLabelAt); }
+function applyMetric(k){
+  if(typeof PV_ON!=="undefined" && PV_ON){
+    var toStackP = (k===STACK_KEY);
+    if(toStackP ? !STACK_PARTS.length : !METRIC_DATA[k]) return;
+    CUR_METRIC = k; CUR_IS_STACK = toStackP;
+    var lbP = METRIC_LABEL[k]||k;
+    var selP = document.getElementById("mSel"); if(selP && selP.value!==k) selP.value = k;
+    var chipsP = document.querySelectorAll(".chip[data-m]");
+    for(var ci2=0;ci2<chipsP.length;ci2++){ chipsP[ci2].className = "chip" + (chipsP[ci2].getAttribute("data-m")===k ? " on" : ""); }
+    var dyP = document.getElementById("dimY"); if(dyP) dyP.textContent = lbP;
+    document.title = "参数敏感性 · " + X_LABEL + " → " + lbP;
+    pvRebuild();
+    return;
+  }
+  var toStack = (k===STACK_KEY);
+  if(toStack ? !STACK_PARTS.length : !METRIC_DATA[k]) return;
+  var wasStack = CUR_IS_STACK;
+  CUR_METRIC = k; CUR_IS_STACK = toStack;
+  var lb = METRIC_LABEL[k]||k;
+  if(ch){
+    if(toStack !== wasStack){
+      rebuildAll(k);
+    } else if(toStack){
+    } else {
+      var cols = METRIC_DATA[k], keepX = viewXIdx(), keepC = viewCurves();
+      var ns = keepC.map(function(ci,i){
+        var src = cols[ci]||[];
+        var patch = {data: keepX.map(function(xi){ return src[xi]; })};
+        if(!IS_MULTI){ patch.name = lb; if(OPT.series[i]) OPT.series[i].name = lb; }
+        if(OPT.series[i]) OPT.series[i].data = patch.data.slice();
+        return patch;
+      });
+      OPT.yAxis.name = lb;
+      ch.setOption({series: ns, yAxis: {name: lb}});
+    }
+    try{ ch.setOption({toolbox:{feature:{saveAsImage:{name:"敏感性_"+lb.replace(/[\/:*?"<>|()\s]+/g,"")}}}}); }catch(e){}
+  }
+  var dy = document.getElementById("dimY"); if(dy) dy.textContent = lb;
+  document.title = "参数敏感性 · " + X_LABEL + " → " + lb;
+  var sel = document.getElementById("mSel"); if(sel && sel.value!==k) sel.value = k;
+  var chips = document.querySelectorAll(".chip[data-m]");
+  for(var i=0;i<chips.length;i++){ chips[i].className = "chip" + (chips[i].getAttribute("data-m")===k ? " on" : ""); }
+  renderTable();
+}
+function rebuildAll(k){
+  if(!ch) return;
+  k = k || CUR_METRIC;
+  var toStack = CUR_IS_STACK, lb = METRIC_LABEL[k]||k;
+  var xs = toStack ? viewSceneLabels() : viewXLabels();
+  var nSc = xs.length;
+  var rot = toStack ? (nSc>10?30:(nSc>6?20:0)) : 0;
+  var zoom = toStack && nSc>16;
+  OPT.series = toStack ? buildStackSeries() : buildLineSeries(k);
+  OPT.xAxis.data = xs;
+  OPT.xAxis.name = toStack ? ((viewCurves().length>1) ? STACK_X_NAME : LINE_X_NAME) : LINE_X_NAME;
+  OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};
+  OPT.xAxis.axisLabel.rotate = rot; OPT.xAxis.axisLabel.interval = 0;
+  OPT.xAxis.axisLabel.color = "#9ca0b0";
+  OPT.xAxis.axisLabel.formatter = function(v){ return (CUR_IS_STACK && String(v).length>22) ? String(v).slice(0,21)+"…" : v; };
+  OPT.yAxis.name = toStack ? "TTFT 构成(ms)" : lb;
+  OPT.legend = (toStack||IS_MULTI) ? {top:0,textStyle:{color:"#9ca0b0",fontSize:10}} : undefined;
+  OPT.grid = {left:70,right:20,top:(toStack||IS_MULTI)?36:20,bottom: zoom?76:(rot?62:40)};
+  OPT.tooltip.axisPointer = toStack ? {type:"shadow"} : undefined;
+  OPT.dataZoom = zoom ? [{type:"slider",bottom:8,height:18,borderColor:"#2e3347",
+    textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;
+  ch.setOption(OPT, true);
+}
+(function(){
+  var sel = document.getElementById("mSel");
+  if(sel) sel.addEventListener("change", function(){ applyMetric(sel.value); });
+  var chips = document.querySelectorAll(".chip[data-m]");
+  for(var i=0;i<chips.length;i++){ (function(c){ c.addEventListener("click", function(){ applyMetric(c.getAttribute("data-m")); }); })(chips[i]); }
+  for(var j=0;j<chips.length;j++){ if(chips[j].getAttribute("data-m")===CUR_METRIC) chips[j].className="chip on"; }
+  var keys = Object.keys(METRIC_LABEL);
+  if(keys.length>1) document.addEventListener("keydown", function(e){
+    if(e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    var d = (e.key==="ArrowRight")?1:((e.key==="ArrowLeft")?-1:0); if(!d) return;
+    var i = keys.indexOf(CUR_METRIC); if(i<0) i=0;
+    applyMetric(keys[(i+d+keys.length)%keys.length]); e.preventDefault();
+  });
+})();
+var PIVOT_PTS = [];
+var PIVOT_IDX = {};
+var PIVOT_DIMS = [];
+var HAS_PIVOT = false;
+var SNAP_META = [{"title":"L3聚合带宽 → 平均TTFT(ms)","x":"ssd_bw","cmp":null,"shape":null,"metric":"ttft","at":"2026/9/17 08:00:00","n":0,"sig":[]}];
+var SNAP_PARAMS_HTML = [{"html":"<div id=\"pJson\">\n<p style=\"font-size:.71rem;color:var(--text-dim);margin:0 0 6px\">可全选复制后粘回平台「导入参数」以复现本次扫描<\/p>\n<pre>{}<\/pre><\/div>","count":"共 0 项"}];
+var PV_HINT = "0 个参数组合 —— 改动任一项即按所选角色重绘";
+var PV_ON = false;
+var PV_SEL = {};
+var PV_ROLE = {x:null,c:null,s:null};
+var PV_PALETTE = ["#6c63ff","#f59e0b","#10b981","#ef4444","#06b6d4","#8b5cf6","#84cc16"];
+var PV_SYMBOLS = ["circle","square","triangle","diamond","roundRect","pin"];
+function pvProject(){
+  var kx = PV_ROLE.x, kc = PV_ROLE.c, ks = PV_ROLE.s;
+  if(!kx || !PIVOT_IDX[kx]) return null;
+  var keep = [];
+  for(var i=0;i<PIVOT_PTS.length;i++){
+    var pt = PIVOT_PTS[i], ok = true;
+    for(var k in PV_SEL){
+      var idx = PIVOT_IDX[k]; if(!idx) continue;
+      var v = pt.p[k]; if(v===undefined) continue;
+      var vi = -1; for(var q=0;q<idx.vals.length;q++){ if(String(idx.vals[q])===String(v)){ vi=q; break; } }
+      if(vi>=0 && PV_SEL[k].indexOf(vi)<0){ ok=false; break; }
+    }
+    if(ok) keep.push(pt);
+  }
+  if(!keep.length) return {xs:[],xv:[],curves:[],avgN:0,n:0};
+  var xset = {}; keep.forEach(function(pt){ if(pt.p[kx]!==undefined) xset[pt.p[kx]] = true; });
+  var xv = Object.keys(xset);
+  var xNum = xv.every(function(v){ return v!=="" && isFinite(Number(v)); });
+  if(!xNum) xv.sort(); else xv = xv.map(Number).filter(isFinite).sort(function(a,b){return a-b;});
+  var groups = {}, order = [];
+  keep.forEach(function(pt){
+    var cv = kc ? pt.p[kc] : "", sv = ks ? pt.p[ks] : "";
+    var gk = String(cv)+"\u0001"+String(sv);
+    if(!groups[gk]){ groups[gk] = {cv:cv, sv:sv, byX:{}}; order.push(gk); }
+    var xk = String(pt.p[kx]);
+    if(!groups[gk].byX[xk]) groups[gk].byX[xk] = [];
+    groups[gk].byX[xk].push(pt.r);
+  });
+  function numOr(v){ var n = Number(v); return isFinite(n) ? n : null; }
+  order.sort(function(a,b){
+    var ga = groups[a], gb = groups[b];
+    var ca = numOr(ga.cv), cb = numOr(gb.cv);
+    if(ca!==null && cb!==null && ca!==cb) return ca-cb;
+    if(String(ga.cv)!==String(gb.cv)) return String(ga.cv)<String(gb.cv)?-1:1;
+    var sa = numOr(ga.sv), sb = numOr(gb.sv);
+    if(sa!==null && sb!==null && sa!==sb) return sa-sb;
+    return String(ga.sv)<String(gb.sv)?-1:(String(ga.sv)>String(gb.sv)?1:0);
+  });
+  var cKeys = [], sKeys = [];
+  order.forEach(function(gk){
+    var g = groups[gk];
+    if(cKeys.indexOf(String(g.cv))<0) cKeys.push(String(g.cv));
+    if(sKeys.indexOf(String(g.sv))<0) sKeys.push(String(g.sv));
+  });
+  var avgN = 0;
+  var curves = order.map(function(gk){
+    var g = groups[gk];
+    var nm = [];
+    if(kc) nm.push(pvFmt(kc, g.cv));
+    if(ks) nm.push(pvFmt(ks, g.sv));
+    var data = xv.map(function(x){
+      var arr = g.byX[String(x)];
+      if(!arr || !arr.length) return null;
+      if(arr.length>1) avgN++;
+      return arr;
+    });
+    return {name: nm.length?nm.join(" · "):(METRIC_LABEL[CUR_METRIC]||CUR_METRIC),
+      ci: cKeys.indexOf(String(g.cv)), pi: sKeys.indexOf(String(g.sv)), recs: data};
+  });
+  return {xs: xv.map(function(x){ return pvFmt(kx, x); }), xv: xv, curves: curves,
+    avgN: avgN, n: keep.length, nc: cKeys.length, ns: sKeys.length};
+}
+function pvFmt(k, v){
+  var d = PIVOT_IDX[k]; if(!d) return String(v);
+  for(var i=0;i<d.vals.length;i++) if(String(d.vals[i])===String(v)) return d.texts[i];
+  return String(v);
+}
+function pvMetricVal(recs, k){
+  if(recs===null) return null;
+  var arr = recs, sum = 0, n = 0;
+  for(var i=0;i<arr.length;i++){
+    var v = arr[i] ? arr[i][k] : null;
+    if(v!=null && isFinite(v)){ sum += Number(v); n++; }
+  }
+  return n ? +(sum/n).toFixed(1) : null;
+}
+function pvBuildSeries(proj, k){
+  var single = proj.curves.length===1 && !PV_ROLE.c && !PV_ROLE.s;
+  return proj.curves.map(function(cv){
+    var s = {name: cv.name, type:"line", smooth:true,
+      data: cv.recs.map(function(recs){ return pvMetricVal(recs, k); }),
+      lineStyle:{color: PV_PALETTE[cv.ci % PV_PALETTE.length], width:2},
+      itemStyle:{color: PV_PALETTE[cv.ci % PV_PALETTE.length]},
+      symbol: PV_ROLE.s ? PV_SYMBOLS[cv.pi % PV_SYMBOLS.length] : "circle",
+      symbolSize: PV_ROLE.s ? 7 : 6,
+      connectNulls:false};
+    var hasAvg = cv.recs.some(function(r){ return r && r.length>1; });
+    if(hasAvg){ s.lineStyle.type = "dashed"; s.lineStyle.width = 2.5; }
+    if(single){ s.areaStyle={color:"rgba(108,99,255,.1)"}; s.label={show:true,color:"#9ca0b0",fontSize:9}; }
+    return s;
+  });
+}
+function pvBuildStack(proj){
+  var scenes = [], sceneRecs = [];
+  proj.curves.forEach(function(c){
+    for(var xi=0; xi<proj.xs.length; xi++){
+      scenes.push(proj.curves.length>1 ? (proj.xs[xi] + " \u00b7 " + c.name) : proj.xs[xi]);
+      sceneRecs.push(c.recs[xi]);
+    }
+  });
+  var totals = sceneRecs.map(function(recs){
+    if(recs===null) return null;
+    var t = 0, any = false;
+    STACK_PARTS.forEach(function(p){ var v = pvMetricVal(recs, p.key); if(v!=null){ t += v; any = true; } });
+    return any ? +t.toFixed(1) : null;
+  });
+  var ss = STACK_PARTS.map(function(p){
+    return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,
+      itemStyle:{color:p.color}, emphasis:{focus:"series"},
+      data: sceneRecs.map(function(recs){ return pvMetricVal(recs, p.key); })};
+  });
+  if(ss.length){ ss[ss.length-1].label = {show: scenes.length<=24, position:"top",
+    color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){
+      var t = totals[p.dataIndex];
+      if(t==null) return "";
+      return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }
+  return {series: ss, scenes: scenes, totals: totals};
+}
+function pvRebuild(){
+  var proj = pvProject();
+  var note = document.getElementById("pvNote");
+  if(!proj || !proj.curves.length || !proj.xv.length){
+    if(note){ note.className="pvnote fwarn"; note.textContent="⚠ 当前勾选下没有数据点，请放宽筛选"; }
+    return;
+  }
+  var k = CUR_METRIC;
+  var isStack = (k===STACK_KEY) && STACK_PARTS.length>0;
+  var lb = METRIC_LABEL[k]||k;
+  if(ch){
+    if(isStack){
+      var stv = pvBuildStack(proj);
+      OPT.series = stv.series;
+      OPT.xAxis.data = stv.scenes;
+      var xlab = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";
+      OPT.xAxis.name = proj.curves.length>1 ? (xlab + " × 场景") : xlab;
+      var nSc = stv.scenes.length;
+      var rot = nSc>10?30:(nSc>6?20:0);
+      var zoom = nSc>16;
+      OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};
+      OPT.xAxis.axisLabel.rotate = rot; OPT.xAxis.axisLabel.interval = 0;
+      OPT.xAxis.axisLabel.color = "#9ca0b0";
+      OPT.xAxis.axisLabel.formatter = function(v){ return (String(v).length>22) ? String(v).slice(0,21)+"…" : v; };
+      OPT.yAxis.name = "TTFT 构成(ms)";
+      OPT.legend = {top:0,textStyle:{color:"#9ca0b0",fontSize:10}};
+      OPT.grid = {left:70,right:20,top:36,bottom: zoom?76:(rot?62:40)};
+      OPT.tooltip.axisPointer = {type:"shadow"};
+      OPT.dataZoom = zoom ? [{type:"slider",bottom:8,height:18,borderColor:"#2e3347",
+        textStyle:{color:"#9ca0b0",fontSize:9},fillerColor:"rgba(108,99,255,.18)",startValue:0,endValue:15}] : undefined;
+    } else {
+    OPT.series = pvBuildSeries(proj, k);
+    OPT.xAxis.data = proj.xs;
+    OPT.xAxis.name = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";
+    OPT.xAxis.axisLabel = OPT.xAxis.axisLabel||{};
+    OPT.xAxis.axisLabel.rotate = 0; OPT.xAxis.axisLabel.interval = 0;
+    OPT.xAxis.axisLabel.color = "#9ca0b0";
+    OPT.xAxis.axisLabel.formatter = function(v){ return v; };
+    OPT.yAxis.name = lb;
+    var multiCurve = proj.curves.length>1;
+    OPT.legend = multiCurve ? {top:0,textStyle:{color:"#9ca0b0",fontSize:10}} : undefined;
+    OPT.grid = {left:70,right:20,top:multiCurve?36:20,bottom:40};
+    OPT.tooltip.axisPointer = undefined;
+    OPT.dataZoom = undefined;
+    }
+    ch.setOption(OPT, true);
+  }
+  pvRenderTable(proj, k);
+  var dy = document.getElementById("dimY"); if(dy) dy.textContent = lb;
+  if(note){
+    note.className = "pvnote";
+    var msg = isStack
+      ? ("柱 " + (proj.curves.length * proj.xv.length) + " 根(曲线 " + proj.curves.length + " × 档位 " + proj.xv.length + ") · 命中 " + proj.n + " 点")
+      : ("曲线 " + proj.curves.length + " 条 · 横轴 " + proj.xv.length + " 档 · 命中 " + proj.n + " 点");
+    if(proj.xv.length<2) msg += " ⚠ 横轴只剩 1 档(无法成线)";
+    var un2 = pvVaryingUnassigned();
+    if(un2.length){
+      var worst = 0, kk = isStack ? "ttft" : k;
+      proj.curves.forEach(function(c){ c.recs.forEach(function(recs){
+        if(!recs || recs.length<2) return;
+        var mn = Infinity, mx = -Infinity;
+        recs.forEach(function(r){ var v = r ? r[kk] : null;
+          if(v!=null && isFinite(v)){ if(v<mn) mn=v; if(v>mx) mx=v; } });
+        if(mx>0){ var rt = mn>0 ? mx/mn : Infinity; if(rt>worst) worst = rt; }
+      }); });
+      msg += " ⚠ " + un2.map(function(u){ return PIVOT_IDX[u]?PIVOT_IDX[u].label:u; }).join("/")
+        + " 未指派通道，多点已平均"
+        + (worst>1.05 ? (worst===Infinity||worst>99 ? "（相差 >99×）" : "（最大相差 "+worst.toFixed(1)+"×）") : "")
+        + " —— 把它指派给颜色/形状可分开画";
+      note.className = "pvnote fdanger";
+    }
+    note.textContent = msg;
+  }
+}
+function pvRenderTable(proj, k){
+  var tbl = document.getElementById("tbl"); if(!tbl) return;
+  var th = tbl.querySelector("thead"), tb = tbl.querySelector("tbody");
+  if(!th||!tb) return;
+  if(k===STACK_KEY){
+    var stv = pvBuildStack(proj);
+    th.innerHTML = "<tr><th>场景</th>"
+      + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("")
+      + "<th>TTFT合计</th></tr>";
+    tb.innerHTML = stv.scenes.map(function(sc, i){
+      return "<tr><td class=\"k\">"+esc2(sc)+"</td>"
+        + stv.series.map(function(s){
+            var v = s.data[i];
+            return "<td>"+esc2(v==null?"—":v)+"</td>"; }).join("")
+        + "<td><b>"+esc2(stv.totals[i]==null?"—":stv.totals[i])+"</b></td></tr>";
+    }).join("");
+    return;
+  }
+  var xlb = PIVOT_IDX[PV_ROLE.x] ? PIVOT_IDX[PV_ROLE.x].label : "";
+  th.innerHTML = "<tr><th>"+esc2(xlb)+"</th>"
+    + proj.curves.map(function(c){ return "<th>"+esc2(c.name)+"</th>"; }).join("") + "</tr>";
+  tb.innerHTML = proj.xs.map(function(x,i){
+    return "<tr><td class=\"k\">"+esc2(x)+"</td>"
+      + proj.curves.map(function(c){
+          var v = pvMetricVal(c.recs[i], k);
+          return "<td>"+esc2(v==null?"—":v)+"</td>"; }).join("") + "</tr>";
+  }).join("");
+}
+function pvSyncRoles(changed){
+  var ex = document.getElementById("pvX"), ec2 = document.getElementById("pvC"), es = document.getElementById("pvS");
+  if(!ex) return;
+  var x = ex.value, c = ec2?ec2.value:"", s = es?es.value:"";
+  if(c && c===x) c = "";
+  if(s && (s===x || s===c)) s = "";
+  if(ec2 && ec2.value!==c) ec2.value = c;
+  if(es && es.value!==s) es.value = s;
+  PV_ROLE.x = x; PV_ROLE.c = c||null; PV_ROLE.s = s||null;
+}
+function pvVaryingUnassigned(){
+  var out = [];
+  Object.keys(PV_SEL).forEach(function(k){
+    if(PIVOT_DIMS.indexOf(k)<0) return;
+    if(k===PV_ROLE.x||k===PV_ROLE.c||k===PV_ROLE.s) return;
+    if(PV_SEL[k].length>1) out.push(k);
+  });
+  return out;
+}
+function pvAutoAssign(){
+  var un = pvVaryingUnassigned();
+  for(var i=0;i<un.length;i++){
+    var k = un[i], target = null;
+    if(!PV_ROLE.c && k!==PV_ROLE.x) target = 'c';
+    else if(!PV_ROLE.s && k!==PV_ROLE.x && k!==PV_ROLE.c) target = 's';
+    if(!target) break;
+    PV_ROLE[target] = k;
+    var el = document.getElementById(target==="c"?"pvC":"pvS");
+    if(el) el.value = k;
+  }
+}
+function pvToggle(on){
+  PV_ON = !!on;
+  var bar = document.getElementById("fbar");
+  if(bar) bar.className = "fbar" + (PV_ON ? " live" : "");
+  var rb = document.getElementById("pvReset"); if(rb) rb.style.display = PV_ON ? "" : "none";
+  if(PV_ON){ pvSyncRoles("x"); pvRebuild(); }
+  else {
+    rebuildAll(CUR_METRIC); renderTable();
+    var nt = document.getElementById("pvNote");
+    if(nt){ nt.className = "pvnote"; nt.textContent = PV_HINT; }
+  }
+}
+function pvEnter(){ if(PV_ON){ pvRebuild(); } else { pvToggle(true); } }
+function copyTsv(){
+  var rs = document.querySelectorAll("#tbl tr");
+  var out = [];
+  for(var i=0;i<rs.length;i++){
+    var cs = rs[i].querySelectorAll("th,td"), line = [];
+    for(var j=0;j<cs.length;j++) line.push(cs[j].textContent.trim());
+    out.push(line.join("\t"));
+  }
+  var txt = out.join("\n"), note = document.getElementById("copyNote");
+  function ok(){ if(note){ note.textContent = "✓ 已复制 "+rs.length+" 行"; setTimeout(function(){note.textContent=""},2500); } }
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(ok,fallback); } else fallback();
+  function fallback(){ var ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select();
+    try{document.execCommand("copy"); ok();}catch(e){ if(note) note.textContent="⚠ 复制失败，请手动选中表格"; } document.body.removeChild(ta); }
+}
+(function(){
+  var tog = document.getElementById("pJsonTog");
+  if(!tog) return;
+  tog.addEventListener("click", function(){
+    var box = document.getElementById("pJson"), view = document.getElementById("pView");
+    if(!box) return;
+    var showJson = (box.style.display === "none");
+    box.style.display = showJson ? "" : "none";
+    if(view) view.style.display = showJson ? "none" : "";
+    tog.textContent = showJson ? "▤ 分组视图" : "{ } 原始 JSON";
+  });
+})();
+function pvSwapParams(si){
+  var w = document.getElementById("pWrap");
+  if(!w || typeof SNAP_PARAMS_HTML==="undefined" || !SNAP_PARAMS_HTML.length) return;
+  var it = SNAP_PARAMS_HTML[si]; if(!it) return;
+  w.innerHTML = it.html;
+  var c = document.getElementById("pCount"); if(c) c.innerHTML = it.count;
+  var tog = document.getElementById("pJsonTog"); if(tog) tog.textContent = "{ } 原始 JSON";
+}
+</script></body></html>

@@ -1,0 +1,475 @@
+{
+  "pAttnType": {
+    "value": "gqa",
+    "type": "select-one",
+    "options": [
+      "gqa",
+      "mla"
+    ]
+  },
+  "pLayers": {
+    "value": "80",
+    "type": "number"
+  },
+  "pKvHeads": {
+    "value": "8",
+    "type": "number"
+  },
+  "pHeadDim": {
+    "value": "128",
+    "type": "number"
+  },
+  "pKvLora": {
+    "value": "512",
+    "type": "number"
+  },
+  "pRopeDim": {
+    "value": "64",
+    "type": "number"
+  },
+  "pHidden": {
+    "value": "8192",
+    "type": "number"
+  },
+  "pQkNope": {
+    "value": "0",
+    "type": "number"
+  },
+  "pVHeadDim": {
+    "value": "0",
+    "type": "number"
+  },
+  "pMlaPrefillPath": {
+    "value": "mha",
+    "type": "select-one",
+    "options": [
+      "mha",
+      "absorb"
+    ]
+  },
+  "pVocab": {
+    "value": "128000",
+    "type": "number"
+  },
+  "pQHeads": {
+    "value": "0",
+    "type": "number"
+  },
+  "pSparseAttn": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": false
+  },
+  "pSparseTopk": {
+    "value": "2048",
+    "type": "number"
+  },
+  "pIdxHeads": {
+    "value": "64",
+    "type": "number"
+  },
+  "pIdxHeadDim": {
+    "value": "128",
+    "type": "number"
+  },
+  "pPrefillBIdx": {
+    "value": "0.000000",
+    "type": "number"
+  },
+  "pDtype": {
+    "value": "1",
+    "type": "select-one",
+    "options": [
+      "2",
+      "1",
+      "0.5"
+    ]
+  },
+  "pWeightDtype": {
+    "value": "1",
+    "type": "select-one",
+    "options": [
+      "2",
+      "1",
+      "0.5"
+    ]
+  },
+  "pParamsB": {
+    "value": "0",
+    "type": "number"
+  },
+  "pActB": {
+    "value": "0",
+    "type": "number"
+  },
+  "pGpuCount": {
+    "value": "8",
+    "type": "number"
+  },
+  "pHbm": {
+    "value": "96",
+    "type": "number"
+  },
+  "pHbmBW": {
+    "value": "4",
+    "type": "number"
+  },
+  "pTflops": {
+    "value": "148",
+    "type": "number"
+  },
+  "pTpSize": {
+    "value": "8",
+    "type": "number"
+  },
+  "pNvlinkBW": {
+    "value": "900",
+    "type": "number"
+  },
+  "pPcieBW": {
+    "value": "64",
+    "type": "number"
+  },
+  "pTierQuant": {
+    "value": "1",
+    "type": "select-one",
+    "options": [
+      "1",
+      "0.5",
+      "0.25"
+    ]
+  },
+  "pDram": {
+    "value": "1024",
+    "type": "number"
+  },
+  "pDramBW": {
+    "value": "400",
+    "type": "number"
+  },
+  "pSsd": {
+    "value": "20",
+    "type": "number"
+  },
+  "pSsdBW": {
+    "value": "50",
+    "type": "number"
+  },
+  "pConcurrency": {
+    "value": "32",
+    "type": "number"
+  },
+  "pInputLen": {
+    "value": "4096",
+    "type": "number"
+  },
+  "pOutputLen": {
+    "value": "1024",
+    "type": "number"
+  },
+  "pQps": {
+    "value": "8",
+    "type": "number"
+  },
+  "pArrivalDist": {
+    "value": "poisson",
+    "type": "select-one",
+    "options": [
+      "poisson",
+      "uniform"
+    ]
+  },
+  "pMfu": {
+    "value": "50",
+    "type": "number"
+  },
+  "pLenDist": {
+    "value": "uniform",
+    "type": "select-one",
+    "options": [
+      "uniform",
+      "lognormal",
+      "fixed"
+    ]
+  },
+  "pSeed": {
+    "value": "42",
+    "type": "number"
+  },
+  "pMaxBatch": {
+    "value": "8",
+    "type": "number"
+  },
+  "pBlockSize": {
+    "value": "16",
+    "type": "number"
+  },
+  "pSimMaxTime": {
+    "value": "1200",
+    "type": "number"
+  },
+  "pMultiTurn": {
+    "value": "0",
+    "type": "number"
+  },
+  "pPrefixHit": {
+    "value": "40",
+    "type": "range",
+    "min": "0",
+    "max": "100"
+  },
+  "pPrefixHitNum": {
+    "value": "40",
+    "type": "number"
+  },
+  "pPrefixWarmL2": {
+    "value": "0",
+    "type": "range",
+    "min": "0",
+    "max": "40"
+  },
+  "pPrefixWarm": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": false
+  },
+  "pFetchRepull": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": true
+  },
+  "pSingleBatch": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": false
+  },
+  "pPrefillA": {
+    "value": "238.73",
+    "type": "number"
+  },
+  "pPrefillB": {
+    "value": "0.004428",
+    "type": "number"
+  },
+  "pFetchFixedUs": {
+    "value": "0",
+    "type": "number"
+  },
+  "pChunkSize": {
+    "value": "2048",
+    "type": "number"
+  },
+  "pMaxPrefillTok": {
+    "value": "16384",
+    "type": "number"
+  },
+  "pPdSep": {
+    "value": "0",
+    "type": "select-one",
+    "options": [
+      "0",
+      "2"
+    ]
+  },
+  "pTieredKv": {
+    "value": "1",
+    "type": "select-one",
+    "options": [
+      "1",
+      "0"
+    ]
+  },
+  "pPdPrefillGpus": {
+    "value": "2",
+    "type": "number"
+  },
+  "pPdLinkBW": {
+    "value": "400",
+    "type": "number"
+  },
+  "pPdLinkUtil": {
+    "value": "0.7",
+    "type": "number"
+  },
+  "pPdKvComp": {
+    "value": "1",
+    "type": "select-one",
+    "options": [
+      "1",
+      "0"
+    ]
+  },
+  "pInstances": {
+    "value": "1",
+    "type": "number"
+  },
+  "pRoutePolicy": {
+    "value": "round_robin",
+    "type": "select-one",
+    "options": [
+      "round_robin",
+      "power_of_two",
+      "hash_prefix",
+      "random"
+    ]
+  },
+  "pPrefixAffinity": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": false
+  },
+  "pEpSize": {
+    "value": "1",
+    "type": "number"
+  },
+  "pMoeLayers": {
+    "value": "0",
+    "type": "number"
+  },
+  "pDenseB": {
+    "value": "0",
+    "type": "number"
+  },
+  "pA2aFactor": {
+    "value": "1",
+    "type": "number"
+  },
+  "sPrefetchPolicy": {
+    "value": "wait_complete",
+    "type": "select-one",
+    "options": [
+      "wait_complete",
+      "timeout",
+      "best_effort",
+      "suffix_race"
+    ]
+  },
+  "pPfTimeoutBase": {
+    "value": "1",
+    "type": "number"
+  },
+  "pPfTimeoutPerPage": {
+    "value": "0.25",
+    "type": "number"
+  },
+  "sDsl": {
+    "value": "ADMIT: always\nEVICT: lru from hbm when 95% -> dram\nPREFETCH: none\nBATCH: continuous max(8)\nPLACE: hbm_first",
+    "type": "textarea"
+  },
+  "sName": {
+    "value": "",
+    "type": "text"
+  },
+  "sSweepParam": {
+    "value": "evict_threshold",
+    "type": "select-one",
+    "options": [
+      "evict_threshold",
+      "max_batch_size",
+      "prefix_hit",
+      "prefix_warm_l2",
+      "ssd_bw",
+      "input_len",
+      "qps",
+      "concurrency",
+      "gpu_preset"
+    ]
+  },
+  "sSweepRange": {
+    "value": "",
+    "type": "text"
+  },
+  "sSweepCompareParam": {
+    "value": "",
+    "type": "select-one",
+    "options": [
+      "",
+      "evict_threshold",
+      "max_batch_size",
+      "prefix_hit",
+      "prefix_warm_l2",
+      "ssd_bw",
+      "input_len",
+      "qps",
+      "concurrency",
+      "gpu_preset"
+    ]
+  },
+  "sSweepCompare": {
+    "value": "",
+    "type": "text"
+  },
+  "sShapeDim": {
+    "value": "prefetch",
+    "type": "select-one",
+    "options": [
+      "prefetch",
+      "gpu_preset",
+      "evict_threshold",
+      "max_batch_size",
+      "prefix_hit",
+      "prefix_warm_l2",
+      "ssd_bw",
+      "input_len",
+      "qps",
+      "concurrency"
+    ]
+  },
+  "sPfWait": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": true
+  },
+  "sPfBest": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": true
+  },
+  "sPfRace": {
+    "value": "on",
+    "type": "checkbox",
+    "checked": true
+  },
+  "sShapeVals": {
+    "value": "h20x8,b300x8",
+    "type": "text"
+  },
+  "sSweepMetric": {
+    "value": "hit_rate",
+    "type": "select-one",
+    "options": [
+      "hit_rate",
+      "prefix_hit_rate",
+      "latency",
+      "latency_p50",
+      "p99_latency",
+      "ttft",
+      "ttft_p50",
+      "ttft_p99",
+      "tpot",
+      "tpot_p50",
+      "tpot_p99",
+      "throughput",
+      "mem_util",
+      "prefill_thr",
+      "prefill_comp_thr",
+      "prefill_cache_amp",
+      "decode_thr",
+      "prefill_thr_per_req",
+      "decode_thr_per_req",
+      "prefill_active_s",
+      "decode_active_s",
+      "prefill_overlap",
+      "decode_overlap",
+      "fetch_ratio",
+      "compute_net",
+      "compute_wait",
+      "compute_wait_ratio",
+      "ttft_queue",
+      "ttft_prefillq",
+      "ttft_fetch",
+      "ttft_xfer",
+      "ttft_stack"
+    ]
+  }
+}

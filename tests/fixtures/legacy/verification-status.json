@@ -1,0 +1,13 @@
+{
+  "phase": "before-refactor",
+  "executed": [
+    { "script": "scripts/verify/_verify_result_schema.js", "pass": 8, "fail": 0 },
+    { "script": "scripts/verify/_verify_worker_scan.js", "pass": 6, "fail": 0 },
+    { "script": "scripts/verify/_verify_sens_export.js", "pass": 58, "fail": 3, "existingFailures": ["E9 default vs historical baseline", "E9 ssdBW=400 vs historical baseline", "E9 prefixHit=90 vs historical baseline"] }
+  ],
+  "notExecuted": "Other historical verification scripts were not treated as a passing baseline.",
+  "knownRisks": [
+    "Existing ECharts 5.5.0: GHSA-fgmj-fm8m-jvvx (moderate); version deliberately unchanged.",
+    "Existing scan worker failure/requeue completion-count behavior is retained, not repaired in this refactor."
+  ]
+}

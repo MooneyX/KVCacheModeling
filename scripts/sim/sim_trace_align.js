@@ -1,43 +1,19 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // sim_trace_align.js: 用与实测 trace 完全一致的参数运行仿真(供 aligned_bench.py 实测对照)
 // 注意: 实测服务器为 sglang 混合批(非PD) → fw=sglang, pc=radix, pdSep=0, tiered=1
 // trace: seed=42, conc8/in2048/out256/qps4/hit40/uniform/poisson
 const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
-function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {},
-    classList: { add(){}, remove(){}, contains(){ return false; } },
-    dataset: {},
-    appendChild(){}, remove(){},
-    querySelectorAll(){ return []; },
-    addEventListener(){}, focus(){},
-  };
-}
+
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; },
-  createElement(){ return makeEl(); },
-  addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = {
-  init(){ return { setOption(){}, resize(){}, dispose(){} }; },
-  getInstanceByDom(){ return null; },
-};
-(0, eval)(code + `
-globalThis.__sim = { runSimulation, parseDSL, strategyPresets, getParams, calcAll, mulberry32 };
-`);
-const sim = globalThis.__sim;
-const $ = (id) => global.document.getElementById(id);
+const readControl = id => elements[id] || (elements[id] = makeEl());
+
+const sim = createLegacyHarness(readControl);
+const $ = (id) => readControl(id);
 const set = (id, v) => { $(id).value = String(v); };
 
 // 从 trace.json 读取参数(与实测请求流完全一致)
-const trace = JSON.parse(fs.readFileSync('D:/Documents/KVCacheModeling/trace.json', 'utf8'));
+const trace = JSON.parse(fs.readFileSync(require('node:path').resolve(__dirname, '../../data/trace.json'), 'utf8'));
 const P = trace.p;
 set('pAttnType', 'mla'); set('pLayers', 61); set('pKvLora', 512); set('pRopeDim', 64); set('pHidden', 7168); set('pVocab', 129280);
 set('pParamsB', 671); set('pActB', 37); set('pWeightDtype', 1); set('pDtype', 1);

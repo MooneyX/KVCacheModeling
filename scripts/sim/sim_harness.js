@@ -1,46 +1,13 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // Harness: 直接执行 index.html 内的仿真引擎,输出 DeepSeek-V3 × H20x8 基准参数下的仿真指标
-const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-
-// 提取所有内联 <script> 块(不含 src 外部引用)
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-if (scripts.length === 0) { console.error('NO_SCRIPT_FOUND'); process.exit(1); }
-const code = scripts.join('\n');
 
 // ---- DOM 桩 ----
-function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {},
-    classList: { add(){}, remove(){}, contains(){ return false; } },
-    dataset: {},
-    appendChild(){}, remove(){},
-    querySelectorAll(){ return []; },
-    addEventListener(){}, focus(){},
-  };
-}
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; },
-  createElement(){ return makeEl(); },
-  addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = {
-  init(){ return { setOption(){}, resize(){}, dispose(){} }; },
-  getInstanceByDom(){ return null; },
-};
+const readControl = id => elements[id] || (elements[id] = makeEl());
 
-// 间接 eval: 脚本内 let/const 在同一 eval 作用域内可见
-(0, eval)(code + `
-globalThis.__sim = { runSimulation, parseDSL, strategyPresets, strategyPresetsJS,
-  getParams, calcAll, mulberry32, autoNameStrategy, hwPresets, models };
-`);
-
-const sim = globalThis.__sim;
-const $ = (id) => global.document.getElementById(id);
+const sim = createLegacyHarness(readControl);
+const $ = (id) => readControl(id);
 
 // ---- 设置 DeepSeek-V3 × H20x8 基准参数(与网页默认一致,模型切换为 DeepSeek-V3)----
 const set = (id, v) => { $(id).value = String(v); };

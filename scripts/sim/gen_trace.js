@@ -1,43 +1,14 @@
-// gen_trace.js: 从 index.html 提取请求生成逻辑(泊松到达 + uniform/log-normal 长度 + 4组前缀分配),
-// 输出与仿真 runSimulation 内部完全一致的请求 trace(JSON),供实测脚本复刻。
+// gen_trace.js: 复用共享请求生成逻辑，输出供实测脚本复刻的请求 trace。
 const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
+const path = require('path');
+const { createLegacyHarness } = require('../../dist/node/library.cjs');
 
-// ---- DOM 桩(与 sim_harness 一致)----
 function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {},
-    classList: { add(){}, remove(){}, contains(){ return false; } },
-    dataset: {},
-    appendChild(){}, remove(){},
-    querySelectorAll(){ return []; },
-    addEventListener(){}, focus(){},
-  };
+  return { value: value !== undefined ? String(value) : '0' };
 }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; },
-  createElement(){ return makeEl(); },
-  addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = {
-  init(){ return { setOption(){}, resize(){}, dispose(){} }; },
-  getInstanceByDom(){ return null; },
-};
-
-// ---- 提取请求生成代码块: "// ---------- 请求生成 ----------" 到 "// ---------- JS 策略编译 ----------" ----
-const startMark = '  // ---------- 请求生成 ----------';
-const endMark = '  // ---------- JS 策略编译 ----------';
-const si = code.indexOf(startMark);
-const ei = code.indexOf(endMark);
-if (si < 0 || ei < 0 || ei <= si) { console.error('MARKER_NOT_FOUND', si, ei); process.exit(1); }
-const genBlock = code.slice(si, ei);
+const readControl = id => elements[id] || (elements[id] = makeEl());
+const sim = createLegacyHarness(readControl);
 
 // ---- 参数(从命令行读取, 默认与网页一致)----
 const argv = process.argv.slice(2);
@@ -66,22 +37,7 @@ setP('pQps', argv[3] || 4); setP('pMfu', 50); setP('pLenDist', process.env.LENDI
 setP('pMaxBatch', argv[5] || 8); setP('pBlockSize', 16); setP('pMultiTurn', 0); setP('pPrefixHit', argv[6] || 40);
 setP('pArrivalDist', process.env.ARRIVAL || 'poisson');
 
-// ---- 执行: 前置依赖 + 生成块 ----
-(0, eval)(code + `
-globalThis.__gen = (function(){
-  let overrides = {};
-  let p = getParams();
-  let rng = mulberry32(p.seed >>> 0);
-${genBlock}
-  return { p: p, requests: requests.map(r => ({
-    id: r.id, arrive: r.arrive, inputLen: r.inputLen, outputLen: r.outputLen,
-    groupId: r.groupId, prefixTokLen: r.prefixTokLen, isFounder: r.isFounder,
-    followUp: r.followUp, multiTurn: p.multiTurn
-  })) };
-});
-`);
-
-const out = globalThis.__gen();
+const out = sim.createTrace();
 // 汇总打印 + 输出 trace 文件
 console.log('=== TRACE 摘要 ===');
 console.log('N =', out.requests.length);
@@ -100,5 +56,5 @@ const inLens = out.requests.map(r => r.inputLen);
 const outLens = out.requests.map(r => r.outputLen);
 console.log('inputLen: min=' + Math.min(...inLens), 'max=' + Math.max(...inLens), 'avg=' + Math.round(inLens.reduce((a, b) => a + b, 0) / inLens.length));
 console.log('outputLen: min=' + Math.min(...outLens), 'max=' + Math.max(...outLens), 'avg=' + Math.round(outLens.reduce((a, b) => a + b, 0) / outLens.length));
-fs.writeFileSync('D:/Documents/KVCacheModeling/trace.json', JSON.stringify(out, null, 1));
+fs.writeFileSync(path.resolve(__dirname, '../../data/trace.json'), JSON.stringify(out, null, 1));
 console.log('trace.json 已写入');

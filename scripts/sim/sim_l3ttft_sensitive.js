@@ -1,29 +1,15 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // 推荐场景复现: H20×8 + Llama-3-70B, L3 带宽显著影响 TTFT (1→10GB/s 时 2.66×)
 // 物理配方: ①GQA大KV(160KB/tok) ②高命中90%(sharer只算非前缀prefill) ③长输入32K(fetch字节大)
 //          ④KV下沉SSD(HBM12/卡+DRAM16, 前缀块被挤到SSD) ⑤bs64压209μs/块固定开销 ⑥低并发低qps(时序命中)
 // 用法: node sim_l3ttft_sensitive.js
-const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
-function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {}, classList: { add(){}, remove(){}, contains(){ return false; } }, dataset: {},
-    appendChild(){}, remove(){}, querySelectorAll(){ return []; }, addEventListener(){}, focus(){},
-  };
-}
+
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; }, createElement(){ return makeEl(); }, addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = { init(){ return { setOption(){}, resize(){}, dispose(){} }; }, getInstanceByDom(){ return null; }, };
-(0, eval)(code + `globalThis.__sim = { runSimulation, parseDSL, strategyPresets, getParams, calcAll, mulberry32 };`);
-const sim = globalThis.__sim;
-const $ = (id) => global.document.getElementById(id);
+const readControl = id => elements[id] || (elements[id] = makeEl());
+
+const sim = createLegacyHarness(readControl);
+const $ = (id) => readControl(id);
 const set = (id, v) => { $(id).value = String(v); };
 set('pAttnType', 'gqa'); set('pLayers', 80); set('pKvHeads', 8); set('pHeadDim', 128);
 set('pKvLora', 512); set('pRopeDim', 64); set('pHidden', 8192); set('pVocab', 128256);

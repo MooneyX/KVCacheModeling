@@ -1,0 +1,32 @@
+{
+  "name": "kv-cache-modeling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.2 <23"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build:web": "vite build",
+    "build:node": "tsup --config tsup.config.ts",
+    "build": "npm run typecheck && npm run build:web && npm run build:node",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build:node && node --test tests/regression/*.test.mjs",
+    "test:browser": "npm run build:web && playwright test",
+    "simulate": "node dist/node/cli.cjs"
+  },
+  "dependencies": {
+    "echarts": "5.5.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.13.10",
+    "acorn": "8.14.1",
+    "jsdom": "26.0.0",
+    "tsup": "8.4.0",
+    "typescript": "5.8.3",
+    "vite": "6.4.3"
+  }
+}

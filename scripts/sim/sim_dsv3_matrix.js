@@ -1,22 +1,12 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // DS-V3 × 8×H20 仿真精度矩阵: 多参数组合的仿真预期值(供实测对比)
-const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
-function makeEl(value) {
-  return { value: value !== undefined ? String(value) : '0', textContent: '', innerHTML: '', placeholder: '',
-    style: {}, classList: { add(){}, remove(){}, contains(){ return false; } }, dataset: {},
-    appendChild(){}, remove(){}, querySelectorAll(){ return []; }, addEventListener(){}, focus(){}, };
-}
+
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 function runCase(params, label) {
   const elements = {};
-  global.document = {
-    getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-    querySelectorAll(){ return []; }, createElement(){ return makeEl(); }, addEventListener(){},
-  };
-  global.window = { addEventListener(){}, };
-  global.echarts = { init(){ return { setOption(){}, resize(){}, dispose(){} }; }, getInstanceByDom(){ return null; }, };
-  const set = (id, v) => { global.document.getElementById(id).value = String(v); };
+  const readControl = id => elements[id] || (elements[id] = makeEl());
+
+  const set = (id, v) => { readControl(id).value = String(v); };
   // DS-V3 基础参数
   set('pAttnType','mla'); set('pLayers',61); set('pKvLora',512); set('pRopeDim',64); set('pHidden',7168); set('pVocab',129280);
   set('pParamsB',671); set('pActB',37); set('pWeightDtype',1); set('pDtype',1);
@@ -30,8 +20,7 @@ function runCase(params, label) {
   set('pFramework', params.fw || 'generic'); set('pPrefixCache', params.pc || 'hash'); set('pPdSep', params.pdSep || '0'); set('pTieredKv', params.tiered || '1');
   // 2026-08-10 实测校准: DS-V3 prefillA=216μs/tok(2048tok=444ms 反推), b=kvPerTok/aggHbmBW=1.1e-3
   set('pPrefillA', 216); set('pPrefillB', 0.0011); set('pFetchFixedUs', 209); set('pChunkSize', 2048);
-  (0, eval)(code + '\nglobalThis.__s={runSimulation,parseDSL,strategyPresets,calcAll,getParams};');
-  const s = globalThis.__s;
+  const s = createLegacyHarness(readControl);
   const r = s.calcAll(s.getParams());
   const out = s.runSimulation(s.parseDSL(s.strategyPresets['Pure-HBM']), {});
   console.log(label

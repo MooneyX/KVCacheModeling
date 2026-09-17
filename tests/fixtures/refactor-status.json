@@ -1,0 +1,16 @@
+{
+  "baseline": "legacy/index.html and legacy/manifest.json",
+  "productionEntrypoints": ["dist/web/index.html", "dist/node/cli.cjs", "dist/node/library.cjs"],
+  "historicalTools": {
+    "scripts/sim": "Loading migrated to shared modules; existing numeric/reporting defects were not corrected.",
+    "scripts/verify": "Historical HTML-scraping scripts remain unchanged and are not current entrypoints. Use npm test and npm run test:browser for maintained regression coverage.",
+    "scripts/debug": "Historical exploratory tools were not migrated."
+  },
+  "knownIssuesOutsideScope": [
+    "Historical sim_harness.js and sim_sens_l3.js call hitRate.toFixed although hitRate is an object; preserved as pre-existing output defects.",
+    "Historical report regression E9 has three failures against an older model version; see legacy/verification-status.json.",
+    "Existing scan requeue completion counter and progress DOM replacement behaviors were preserved.",
+    "ECharts remains at 5.5.0 for compatibility and has a moderate XSS advisory GHSA-fgmj-fm8m-jvvx. Do not use untrusted strategies or report inputs.",
+    "Capacity limits and simulation algorithm were not changed or benchmarked for larger workloads."
+  ]
+}

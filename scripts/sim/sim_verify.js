@@ -1,26 +1,12 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // 修改后 index.html 验证: conc1/conc8/conc32/out64/out1024 vs 实测
-const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
-function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {}, classList: { add(){}, remove(){}, contains(){ return false; } }, dataset: {},
-    appendChild(){}, remove(){}, querySelectorAll(){ return []; }, addEventListener(){}, focus(){},
-  };
-}
+
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; }, createElement(){ return makeEl(); }, addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = { init(){ return { setOption(){}, resize(){}, dispose(){} }; }, getInstanceByDom(){ return null; }, };
-(0, eval)(code + `globalThis.__sim = { runSimulation, parseDSL, strategyPresets, getParams, calcAll, mulberry32 };`);
-const sim = globalThis.__sim;
-const $ = (id) => global.document.getElementById(id);
+const readControl = id => elements[id] || (elements[id] = makeEl());
+
+const sim = createLegacyHarness(readControl);
+const $ = (id) => readControl(id);
 const set = (id, v) => { $(id).value = String(v); };
 function setup(conc, inLen, outLen, qps, hit) {
   set('pAttnType', 'mla'); set('pLayers', 61); set('pKvLora', 512); set('pRopeDim', 64); set('pHidden', 7168); set('pVocab', 129280);

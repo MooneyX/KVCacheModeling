@@ -1,0 +1,95 @@
+export function generateRequests(p, overrides, rng, prefixGroupMap) {
+  let N = overrides.nreq || Math.min(p.concurrency, 256);
+  let requests = [], t = 0, lambda = Math.max(p.qps, 1e-9); // qps 真实生效; 仅防 0/负导致除零(极小值→无请求到达)
+  let sigma = 0.6, muL = Math.log(Math.max(p.inputLen,1)) - sigma*sigma/2;
+  let muO = Math.log(Math.max(p.outputLen,1)) - sigma*sigma/2;
+  function sampleLen(avg, mu){
+    if (p.lenDist === 'fixed') return Math.max(64, Math.round(avg)); // 严格固定 = 均值(输入/输出均精确)
+    if (p.lenDist === 'lognormal') {
+      let u1 = Math.max(rng(), 1e-9), u2 = rng();
+      let z = Math.sqrt(-2*Math.log(u1)) * Math.cos(2*Math.PI*u2);
+      return Math.max(64, Math.min(avg*8, Math.round(Math.exp(mu + sigma*z))));
+    }
+    return Math.max(64, Math.round(avg * (0.5 + rng())));
+  }
+  for (let i = 0; i < N; i++) {
+    // 到达间隔: 泊松(指数分布, 有突发) 或 均匀(固定间隔 1/λ)
+    t += p.arrivalDist === 'uniform' ? 1 / lambda : -Math.log(Math.max(rng(), 1e-9)) / lambda;
+    let inLen = sampleLen(p.inputLen, muL);
+    let outLen = sampleLen(p.outputLen, muO);
+    requests.push({ id: i, arrive: t, inputLen: inLen, outputLen: outLen,
+      groupId: null, prefixTokLen: 0, isFounder: false, followUp: false, retainIds: null,
+      state: 'wait', tokensGen: 0, admitTime: 0, prefillStart: 0, prefillEnd: 0, decodeStart: 0, completeTime: 0,
+      prefixBlkIds: [], ownBlkIds: [], kvHbm: 0, kvDram: 0, kvSsd: 0, prefillTokens: inLen,
+      _outAllocTok: 0, _outSeq: 0, _outMerge: 1, _recomputeTok: 0 });
+  }
+  requests.sort((a, b) => a.arrive - b.arrive);
+
+  // 单批 prefill 微基准(2026-08-19): 全部请求 t=0 同时到达(忽略 qps/到达分布),
+  // 配合准入/槽位门控跳过 + prefill 完成即结束, 实现"单个 batch 的 prefill 操作"隔离测量。
+  // ⚠️ 位置(2026-09-03 修 bug): 原语句在前缀组分配块(prefixHit>0.001)内部, prefixHit=0
+  //   时整块被跳过 ⇒ t=0 覆盖失效, 请求仍按泊松散布, "单批"名存实亡(流体时代被槽位全
+  //   放开掩盖; 移植到波次路径后暴露 —— 每请求各自成波, 批级同步消失)。移到组分配之前,
+  //   对 prefixHit=0/有命中 两种场景统一生效。
+  if (p.singleBatch) requests.forEach(rq => { rq.arrive = 0; });
+
+  // 前缀组分配（与旧版相同思想：4组差异化前缀，按命中率目标配比，seeded）
+  if (p.prefixHit > 0.001) {
+    let totalInput = requests.reduce((s, r) => s + r.inputLen, 0);
+    let h = Math.min(p.prefixHit, 1);                 // 命中率 h ∈ (0,1]
+    let avgInput = Math.max(p.inputLen, 1);
+    let groupDefs = [
+      { id: 'pfx_A', ratio: 0.12 }, { id: 'pfx_B', ratio: 0.22 },
+      { id: 'pfx_C', ratio: 0.35 }, { id: 'pfx_D', ratio: 0.48 },
+    ];
+    let sumRatioSq = groupDefs.reduce((s, g) => s + g.ratio * g.ratio, 0);
+    // 入组数按满命中(h=1)基准配比(与 h 无关)；单请求覆盖量随 h 缩放:
+    // (修复 2026-08-11: 旧版 pTokLen 固定、仅 nTotal 随 h 增长, maxAssign 封顶后命中率不敏感)
+    // 修复旧版: nTotal=k×ratio+1 使 ΣnTotal≈3N 膨胀, 被 maxAssign 截断后实际覆盖≈h×0.29
+    // (h=99% 实测仅 27.7% 覆盖)。新版水桶分配 ΣnTotal=maxAssign, 无截断。
+    // 2026-08-12 v2 语义: prefixHit = 每个请求的"前缀命中比例"(与长度无关的固定比例)——
+    // 每个入组请求命中 round(inputLen×h) 的输入(短/长请求一致), 与解析层 prefixSavedPerReq 同口径;
+    // 共享前缀长度 = max(成员 inputLen)×h(组内统一), founder 取组内最长请求以保证能建完整前缀。
+    let assignments = [];
+    if (h > 0.001) {
+      let maxAssign = Math.max(4, N);                   // 全请求入组(请求级命中率100%, 前缀缓存全覆盖); 保底4 兼容小N
+      let sumRatio = groupDefs.reduce((s, g) => s + g.ratio, 0);
+      let quota = groupDefs.map(g => maxAssign * g.ratio / sumRatio);
+      let nTotals = quota.map(Math.floor);
+      let rem = maxAssign - nTotals.reduce((s, x) => s + x, 0);
+      let order = quota.map((q, i) => [i, q - Math.floor(q)]).sort((a, b) => b[1] - a[1]);
+      for (let j = 0; j < rem; j++) nTotals[order[j % order.length][0]]++;
+      groupDefs.forEach((g, i) => {
+        if (nTotals[i] >= 1) assignments.push({ group: g, nTotal: nTotals[i] });  // >=1: 全请求入组(1人组也建组, 预热开时命中自己的前缀)
+      });
+    }
+    let pool = requests.slice();
+    for (let i = pool.length - 1; i > 0; i--) { let j = Math.floor(rng() * (i + 1)); let tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp; }
+    let pi = 0;
+    assignments.forEach(a => {
+      let grp = [];
+      for (let i = 0; i < a.nTotal && pi < pool.length; i++, pi++) {
+        let req = pool[pi];
+        req.groupId = a.group.id;
+        req.prefixTokLen = Math.max(1, Math.round(req.inputLen * h)); // 每请求固定命中比例(与其自身长度无关)
+        req.isFounder = false; grp.push(req);
+      }
+      if (grp.length >= 1) {
+        // founder = 组内最长请求: 能 prefill 出完整组前缀(ownTokens = maxInput - P ≥ 0)
+        grp.sort((x, y) => y.inputLen - x.inputLen);
+        grp[0].isFounder = true;
+        let P = Math.max(...grp.map(r0 => r0.prefixTokLen));  // 组前缀 = 最长请求的 h%
+        prefixGroupMap[a.group.id] = { prefixTokLen: P, blkIds: [], refcount: 0, activated: false };
+      }
+    });
+    Object.keys(prefixGroupMap).forEach(gid => {
+      let grp = requests.filter(r0 => r0.groupId === gid);
+      let founder = grp.find(r0 => r0.isFounder);
+      let minOther = Math.min(...grp.filter(r0 => !r0.isFounder).map(r0 => r0.arrive));
+      if (founder && isFinite(minOther)) founder.arrive = Math.max(0, minOther - 0.001);
+    });
+    requests.sort((a, b) => a.arrive - b.arrive);
+
+  }
+  return { N, requests };
+}

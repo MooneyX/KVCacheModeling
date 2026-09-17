@@ -1,0 +1,57 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { parse } from 'acorn';
+import { legacyCode } from '../fixtures/legacy-loader.mjs';
+
+const read = relative => readFileSync(new URL(relative, import.meta.url), 'utf8');
+const tokenValues = text => {
+  const tokens = [];
+  parse(text, { ecmaVersion: 'latest', sourceType: 'module', onToken: tokens });
+  return tokens.map(token => [token.type.label, token.value]);
+};
+
+test('frozen legacy input retains its original checksum', () => {
+  const manifest = JSON.parse(read('../fixtures/legacy/manifest.json'));
+  assert.equal(createHash('sha256').update(read('../fixtures/legacy/index.html')).digest('hex'), manifest.files['index.html']);
+});
+
+test('engine body is unchanged except explicit inputs and shared request extraction', () => {
+  const ast = parse(legacyCode, { ecmaVersion: 'latest' });
+  const original = ast.body.find(node => node.type === 'FunctionDeclaration' && node.id.name === 'runSimulation');
+  let expected = legacyCode.slice(original.start, original.end)
+    .replace('function runSimulation(strategy, overrides)', 'export function runSimulation(params, strategy, overrides, strategyMode = "dsl")')
+    .replace('let p = getParams();', 'let p = JSON.parse(JSON.stringify(params));');
+  const start = expected.indexOf('  let N = overrides.nreq');
+  const end = expected.indexOf('    // S4: 把前缀组表分发给各实例。');
+  const requests = expected.slice(start, end);
+  expected = expected.slice(0, start) + '  let { N, requests } = generateRequests(p, overrides, rng, prefixGroupMap);\n  if (p.prefixHit > 0.001) {\n' + expected.slice(end);
+  const source = read('../../src/core/simulation.js');
+  assert.deepEqual(tokenValues(source.slice(source.indexOf('export function runSimulation'))), tokenValues(expected));
+  assert.deepEqual(tokenValues(read('../../src/core/requests.js')), tokenValues('export function generateRequests(p, overrides, rng, prefixGroupMap) {\n' + requests + '}\nreturn {N, requests};\n}'));
+});
+
+test('all calculation and DSL expressions are token-identical to baseline', () => {
+  const ast = parse(legacyCode, { ecmaVersion: 'latest' });
+  const originals = new Map(ast.body.filter(n => n.type === 'FunctionDeclaration').map(n => [n.id.name, legacyCode.slice(n.start, n.end)]));
+  for (const file of ['calculations.js', 'math.js', 'strategy.js']) {
+    const source = read('../../src/core/' + file);
+    for (const node of parse(source, { ecmaVersion: 'latest', sourceType: 'module' }).body) {
+      if (node.type !== 'ExportNamedDeclaration' || node.declaration?.type !== 'FunctionDeclaration') continue;
+      const fn = node.declaration;
+      assert.deepEqual(tokenValues(source.slice(fn.start, fn.end)), tokenValues(originals.get(fn.id.name)), fn.id.name);
+    }
+  }
+});
+
+test('runtime core imports no browser adapters and sim scripts no longer scrape HTML', () => {
+  for (const file of readdirSync(new URL('../../src/core/', import.meta.url))) {
+    const source = read('../../src/core/' + file);
+    assert.doesNotMatch(source, /from\s+['"][^'"]*(?:ui|adapters|execution)\//);
+  }
+  for (const file of readdirSync(new URL('../../scripts/sim/', import.meta.url)).filter(file => file.endsWith('.js'))) {
+    const source = read('../../scripts/sim/' + file);
+    assert.doesNotMatch(source, /matchAll\(\/<script>|eval\(js\)|eval\)\(code|global\.document\s*=|scripts\.length/, file);
+  }
+});

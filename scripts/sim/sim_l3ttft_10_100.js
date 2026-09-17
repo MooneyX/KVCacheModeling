@@ -1,3 +1,4 @@
+const { createLegacyHarness } = require("../../dist/node/library.cjs");
 // 推荐场景复现: H20×8 + Llama-3-70B(预设模型, BF16) → L3 带宽在 10-100GB/s 区间显著影响 TTFT
 // 前提: ①引擎"前缀预热"(网页勾选 前缀预热/L3常驻, HiCache 语义) ②策略用 Tiered-3L 无预取变体
 //       (eager prefetch 会把 SSD 前缀块提前搬回 HBM → 后期 sharer 免费命中 → 带宽不敏感;
@@ -5,28 +6,13 @@
 // 物理配方: ①Llama-70B BF16 kvPerTok=320KB ②命中99%+预热(sharer 只算 1% 非前缀 prefill)
 //          ③in16K(fetch=0.7×16K×320KB≈3.6GB → bw10=0.4s/bw100=0.04s) ④KV下沉SSD ⑤bs64压固定开销
 // 用法: node sim_l3ttft_10_100.js
-const fs = require('fs');
-const html = fs.readFileSync('D:/Documents/KVCacheModeling/index.html', 'utf8');
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = scripts.join('\n');
-function makeEl(value) {
-  return {
-    value: value !== undefined ? String(value) : '0',
-    textContent: '', innerHTML: '', placeholder: '',
-    style: {}, classList: { add(){}, remove(){}, contains(){ return false; } }, dataset: {},
-    appendChild(){}, remove(){}, querySelectorAll(){ return []; }, addEventListener(){}, focus(){},
-  };
-}
+
+function makeEl(value) { return { value: value !== undefined ? String(value) : "0" }; }
 const elements = {};
-global.document = {
-  getElementById(id){ if (!elements[id]) elements[id] = makeEl(); return elements[id]; },
-  querySelectorAll(){ return []; }, createElement(){ return makeEl(); }, addEventListener(){},
-};
-global.window = { addEventListener(){}, };
-global.echarts = { init(){ return { setOption(){}, resize(){}, dispose(){} }; }, getInstanceByDom(){ return null; }, };
-(0, eval)(code + `globalThis.__sim = { runSimulation, parseDSL, strategyPresets, getParams, calcAll, mulberry32 };`);
-const sim = globalThis.__sim;
-const $ = (id) => global.document.getElementById(id);
+const readControl = id => elements[id] || (elements[id] = makeEl());
+
+const sim = createLegacyHarness(readControl);
+const $ = (id) => readControl(id);
 const set = (id, v) => { $(id).value = String(v); };
 // Llama-3-70B 预设 (GQA 80x8x128) + BF16 → kvPerTok=320KB
 set('pAttnType', 'gqa'); set('pLayers', 80); set('pKvHeads', 8); set('pHeadDim', 128);
