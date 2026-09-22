@@ -45,6 +45,31 @@
   <div id="serverTaskList"></div>
 </section>
 
+<section class="card" id="replayPanel" aria-labelledby="replayTitle">
+  <h2 id="replayTitle">真实数据集 Replay</h2>
+  <p class="subtitle">上传已构建的 UTF-8 bundle v1 JSON，使用当前模型、硬件、batch 和 DSL 策略在服务器运行。上传后不会自动执行。</p>
+  <div class="form-row">
+    <div><label for="replayFile">Replay bundle（单个 .json，最多 8 MiB）</label><input id="replayFile" type="file" accept=".json,application/json"></div>
+  </div>
+  <p id="replayFileInfo">尚未选择文件；可选择仓库 data/replay/sample.json。</p>
+  <div class="form-row">
+    <div><label for="replayQps">目标 QPS</label><input id="replayQps" type="number" step="any" value="5"></div>
+    <div><label for="replaySeed">seed（uint32，允许 0）</label><input id="replaySeed" type="number" min="0" max="4294967295" step="1" value="42"></div>
+    <div><label for="replayDuration">投放时长 T（秒）</label><input id="replayDuration" type="number" step="any" value="2"></div>
+    <div><label for="replayWarmup">暖机时长 W（秒）</label><input id="replayWarmup" type="number" min="0" step="any" value="0"></div>
+    <div><label for="replayDrain">排空上限 D（秒）</label><input id="replayDrain" type="number" min="0" step="any" value="600"></div>
+  </div>
+  <p class="subtitle">仅支持单计算实例（8 张 GPU 不等于 8 个实例）、DSL、非物理 P/D 分离。Replay 显式覆盖为 64-token 页，不修改原页粒度控件；到达模型固定 closed，超级块关闭。</p>
+  <p class="subtitle">[0,T) 按泊松过程投放 session，T 后继续已投放 session，最迟 T+D 停止；并非把模板池完整回放一遍。仅支持 HBM 连续前缀缓存且容量充足的运行；低 QPS 不保证容量安全，不支持 L2/L3 回读及容量恢复。输出身份 unmapped，完成依赖为推断所得；稳定性和理想缓存未评估。</p>
+  <p class="subtitle">仅接受已构建 bundle，不接受原始 trace、构建报告或配置文件。旧参数导入导出不包含 Replay 数据；上传内容不持久化，刷新后需重新选择。整任务体及实际运行仍受服务端限额约束。</p>
+  <div class="form-row">
+    <button class="btn btn-sm" id="replayRun" type="button" disabled>运行 Replay</button>
+    <button class="btn btn-sm" id="replayDownload" type="button" disabled>下载完整结果 JSON</button>
+  </div>
+  <p id="replayStatus" role="status" aria-live="polite">请选择 Replay bundle。</p>
+  <div id="replaySummary" hidden></div>
+</section>
+
 <!-- ====== TAB 1: 基础参数 ====== -->
 <div class="tab-panel active" id="tab-params">
   <div class="card">
