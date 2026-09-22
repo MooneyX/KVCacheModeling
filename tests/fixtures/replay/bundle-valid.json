@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "blockSize": 64,
+  "sessions": [
+    { "req": [
+      { "in": 128, "out": 10, "blockRuns": [[0, 2]], "timing": { "kind": "origin", "anchorReq": null, "offsetMs": 0 } },
+      { "in": 192, "out": 0, "blockRuns": [[0, 3]], "timing": { "kind": "completion", "anchorReq": 0, "offsetMs": 20 } },
+      { "in": 128, "out": 2, "blockRuns": [[0, 1], [3, 1]], "timing": { "kind": "arrival", "anchorReq": 1, "offsetMs": 0 } }
+    ] },
+    { "req": [
+      { "in": 64, "out": 1, "blockRuns": [[100, 1]], "timing": { "kind": "origin", "anchorReq": null, "offsetMs": 5 } }
+    ] }
+  ]
+}

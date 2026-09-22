@@ -1,0 +1,707 @@
+{
+  "reportVersion": 1,
+  "bundle": {
+    "sha256": "c7d4ad24cbbe333503a791af2d25191e86aad6670000c902185e87bf22504089",
+    "bytes": 24939,
+    "version": 1,
+    "blockSize": 64,
+    "encoding": "json"
+  },
+  "source": {
+    "path": "D:\\Documents\\KVCacheModeling\\data\\cc-traces\\traces.jsonl",
+    "bytes": 1847151435,
+    "sha256": "29b6a19e751ff5230771519aab755f80a0f43a4ba9cf96b72d3a6a437ec99276",
+    "lines": 393,
+    "sessions": 393
+  },
+  "selection": {
+    "maxSpanSeconds": 350,
+    "maxSessions": 8,
+    "seed": 1,
+    "spanDefinition": "max(t + api_time) - min(t), model requests only",
+    "orderSeed": 1
+  },
+  "counts": {
+    "before": {
+      "sessions": 393,
+      "requests": 98827,
+      "inputTokens": 21635381376,
+      "outputTokens": 106474498,
+      "blockReferences": 338052834
+    },
+    "eligible": {
+      "sessions": 8,
+      "requests": 220,
+      "inputTokens": 16563904,
+      "outputTokens": 99783,
+      "blockReferences": 258811
+    },
+    "selected": {
+      "sessions": 8,
+      "requests": 220,
+      "inputTokens": 16563904,
+      "outputTokens": 99783,
+      "blockReferences": 258811
+    }
+  },
+  "stats": {
+    "sessions": 8,
+    "requests": 220,
+    "inputTokens": 16563904,
+    "outputTokens": 99783,
+    "runs": 299,
+    "blockReferences": 258811,
+    "meanRequestsPerSession": 27.5,
+    "anchors": {
+      "origin": 8,
+      "arrival": 25,
+      "completion": 187
+    }
+  },
+  "uniqueBlocks": 13464,
+  "diagnostics": {
+    "firstMain": 8,
+    "overlapArrival": 0,
+    "completion": 187,
+    "backtrackedCompletion": 8,
+    "fallbackArrival": 6,
+    "groupOrigin": 0,
+    "groupArrival": 1,
+    "innerArrival": 18
+  },
+  "thinkTimeBefore": {
+    "missing": 393,
+    "null": 0,
+    "zero": 25051,
+    "positive": 73383
+  },
+  "validation": {
+    "schema": true,
+    "pathIdentities": true,
+    "originalTiming": true,
+    "countsPreserved": true,
+    "crossSessionIsolation": true,
+    "completionDependencies": "inferred"
+  },
+  "limits": {
+    "source": {
+      "maxSourceBytes": 4294967296,
+      "maxLineBytes": 268435456,
+      "maxSourceSessions": 10000,
+      "maxSourceRequests": 1000000,
+      "maxSourceBlockReferences": 500000000
+    },
+    "bundle": {
+      "maxDecompressedBytes": 33554432,
+      "maxSessions": 8,
+      "maxRequests": 1000000,
+      "maxRuns": 2000000,
+      "maxBlockReferences": 100000000
+    },
+    "evidenceLimit": 32
+  },
+  "mapping": [
+    {
+      "templateIndex": 0,
+      "sourceIndex": 33,
+      "lineNumber": 34,
+      "id": "12cfecf98c158ab54fb65980602421f00d69",
+      "requests": 20,
+      "inputTokens": 1853056,
+      "outputTokens": 6409,
+      "blockReferences": 28954,
+      "spanSeconds": 347.284,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 1,
+        "positive": 18
+      },
+      "startBlockId": 2825,
+      "uniqueBlocks": 1762
+    },
+    {
+      "templateIndex": 1,
+      "sourceIndex": 84,
+      "lineNumber": 85,
+      "id": "35de830dbe1dbe90e6eaa36bc4814c7410ec",
+      "requests": 60,
+      "inputTokens": 3546688,
+      "outputTokens": 16302,
+      "blockReferences": 55417,
+      "spanSeconds": 288.312,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 0,
+        "positive": 59
+      },
+      "startBlockId": 4587,
+      "uniqueBlocks": 1202
+    },
+    {
+      "templateIndex": 2,
+      "sourceIndex": 109,
+      "lineNumber": 110,
+      "id": "47a89e30bcdf1bc8002a026ad7ebfc914766",
+      "requests": 20,
+      "inputTokens": 1276608,
+      "outputTokens": 14075,
+      "blockReferences": 19947,
+      "spanSeconds": 302.38199999999995,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 1,
+        "positive": 18
+      },
+      "startBlockId": 9073,
+      "uniqueBlocks": 1287
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "lineNumber": 27,
+      "id": "0e4206535a79f980e2b1091181202ea987fe",
+      "requests": 27,
+      "inputTokens": 3888320,
+      "outputTokens": 13367,
+      "blockReferences": 60755,
+      "spanSeconds": 321.839,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 1,
+        "positive": 25
+      },
+      "startBlockId": 0,
+      "uniqueBlocks": 2825
+    },
+    {
+      "templateIndex": 4,
+      "sourceIndex": 306,
+      "lineNumber": 307,
+      "id": "bbdcb12440a7ab3496b9fac8b5f9824b1672",
+      "requests": 21,
+      "inputTokens": 818752,
+      "outputTokens": 3949,
+      "blockReferences": 12793,
+      "spanSeconds": 70.593,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 1,
+        "positive": 19
+      },
+      "startBlockId": 11817,
+      "uniqueBlocks": 1647
+    },
+    {
+      "templateIndex": 5,
+      "sourceIndex": 106,
+      "lineNumber": 107,
+      "id": "46c7f09048fc482e94f4552b0a99a4ca5e30",
+      "requests": 25,
+      "inputTokens": 1918144,
+      "outputTokens": 18212,
+      "blockReferences": 29971,
+      "spanSeconds": 321.48299999999995,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 1,
+        "positive": 23
+      },
+      "startBlockId": 7431,
+      "uniqueBlocks": 1642
+    },
+    {
+      "templateIndex": 6,
+      "sourceIndex": 94,
+      "lineNumber": 95,
+      "id": "3d8fcda6a4decdb4d4f56839db6eba041e60",
+      "requests": 23,
+      "inputTokens": 1704896,
+      "outputTokens": 17267,
+      "blockReferences": 26639,
+      "spanSeconds": 291.451,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 1,
+        "positive": 21
+      },
+      "startBlockId": 5789,
+      "uniqueBlocks": 1642
+    },
+    {
+      "templateIndex": 7,
+      "sourceIndex": 142,
+      "lineNumber": 143,
+      "id": "5c5e408b76e5e22747853915f67be3c491a4",
+      "requests": 24,
+      "inputTokens": 1557440,
+      "outputTokens": 10202,
+      "blockReferences": 24335,
+      "spanSeconds": 220.535,
+      "thinkTime": {
+        "missing": 1,
+        "null": 0,
+        "zero": 0,
+        "positive": 23
+      },
+      "startBlockId": 10360,
+      "uniqueBlocks": 1457
+    }
+  ],
+  "evidence": [
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 0,
+      "topIndex": 0,
+      "innerIndex": null,
+      "tMs": 0,
+      "apiMs": 8242,
+      "timing": {
+        "kind": "origin",
+        "anchorReq": null,
+        "offsetMs": 0
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 1,
+      "topIndex": 1,
+      "innerIndex": null,
+      "tMs": 9502,
+      "apiMs": 1322,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 0,
+        "offsetMs": 1260
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 2,
+      "topIndex": 2,
+      "innerIndex": null,
+      "tMs": 11549,
+      "apiMs": 12721,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 1,
+        "offsetMs": 725
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 3,
+      "topIndex": 3,
+      "innerIndex": null,
+      "tMs": 27557,
+      "apiMs": 4243,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 2,
+        "offsetMs": 3287
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 4,
+      "topIndex": 4,
+      "innerIndex": null,
+      "tMs": 33419,
+      "apiMs": 4529,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 3,
+        "offsetMs": 1619
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 5,
+      "topIndex": 5,
+      "innerIndex": null,
+      "tMs": 39604,
+      "apiMs": 3706,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 4,
+        "offsetMs": 1656
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 6,
+      "topIndex": 6,
+      "innerIndex": null,
+      "tMs": 44863,
+      "apiMs": 4687,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 5,
+        "offsetMs": 1553
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 7,
+      "topIndex": 7,
+      "innerIndex": null,
+      "tMs": 51398,
+      "apiMs": 3458,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 6,
+        "offsetMs": 1848
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 8,
+      "topIndex": 8,
+      "innerIndex": null,
+      "tMs": 57258,
+      "apiMs": 59260,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 7,
+        "offsetMs": 2402
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 9,
+      "topIndex": 9,
+      "innerIndex": null,
+      "tMs": 119393,
+      "apiMs": 5349,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 8,
+        "offsetMs": 2875
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 10,
+      "topIndex": 10,
+      "innerIndex": null,
+      "tMs": 184610,
+      "apiMs": 1123,
+      "timing": {
+        "kind": "arrival",
+        "anchorReq": 9,
+        "offsetMs": 65217
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 11,
+      "topIndex": 11,
+      "innerIndex": null,
+      "tMs": 184704,
+      "apiMs": 1613,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 9,
+        "offsetMs": 59962
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 12,
+      "topIndex": 12,
+      "innerIndex": null,
+      "tMs": 189149,
+      "apiMs": 3536,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 11,
+        "offsetMs": 2832
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 13,
+      "topIndex": 13,
+      "innerIndex": null,
+      "tMs": 195616,
+      "apiMs": 2262,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 12,
+        "offsetMs": 2931
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 14,
+      "topIndex": 14,
+      "innerIndex": null,
+      "tMs": 200632,
+      "apiMs": 3714,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 13,
+        "offsetMs": 2754
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 15,
+      "topIndex": 15,
+      "innerIndex": null,
+      "tMs": 206981,
+      "apiMs": 1981,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 14,
+        "offsetMs": 2635
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 16,
+      "topIndex": 16,
+      "innerIndex": null,
+      "tMs": 211616,
+      "apiMs": 2006,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 15,
+        "offsetMs": 2654
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 17,
+      "topIndex": 17,
+      "innerIndex": null,
+      "tMs": 216236,
+      "apiMs": 2031,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 16,
+        "offsetMs": 2614
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 18,
+      "topIndex": 18,
+      "innerIndex": null,
+      "tMs": 221025,
+      "apiMs": 1113,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 16,
+        "offsetMs": 7403
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 19,
+      "topIndex": 19,
+      "innerIndex": null,
+      "tMs": 259390,
+      "apiMs": 2205,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 16,
+        "offsetMs": 45768
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 20,
+      "topIndex": 20,
+      "innerIndex": null,
+      "tMs": 264197,
+      "apiMs": 2363,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 19,
+        "offsetMs": 2602
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 21,
+      "topIndex": 21,
+      "innerIndex": null,
+      "tMs": 269149,
+      "apiMs": 1845,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 20,
+        "offsetMs": 2589
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 22,
+      "topIndex": 22,
+      "innerIndex": null,
+      "tMs": 273698,
+      "apiMs": 1472,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 21,
+        "offsetMs": 2704
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 23,
+      "topIndex": 23,
+      "innerIndex": null,
+      "tMs": 277749,
+      "apiMs": 1288,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 22,
+        "offsetMs": 2579
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 24,
+      "topIndex": 24,
+      "innerIndex": null,
+      "tMs": 309197,
+      "apiMs": 1452,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 23,
+        "offsetMs": 30160
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 25,
+      "topIndex": 25,
+      "innerIndex": null,
+      "tMs": 313463,
+      "apiMs": 3840,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 24,
+        "offsetMs": 2814
+      }
+    },
+    {
+      "templateIndex": 3,
+      "sourceIndex": 26,
+      "request": 26,
+      "topIndex": 26,
+      "innerIndex": null,
+      "tMs": 320583,
+      "apiMs": 1256,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 25,
+        "offsetMs": 3280
+      }
+    },
+    {
+      "templateIndex": 0,
+      "sourceIndex": 33,
+      "request": 0,
+      "topIndex": 0,
+      "innerIndex": null,
+      "tMs": 0,
+      "apiMs": 1553,
+      "timing": {
+        "kind": "origin",
+        "anchorReq": null,
+        "offsetMs": 0
+      }
+    },
+    {
+      "templateIndex": 0,
+      "sourceIndex": 33,
+      "request": 1,
+      "topIndex": 1,
+      "innerIndex": null,
+      "tMs": 258,
+      "apiMs": 2213,
+      "timing": {
+        "kind": "arrival",
+        "anchorReq": 0,
+        "offsetMs": 258
+      }
+    },
+    {
+      "templateIndex": 0,
+      "sourceIndex": 33,
+      "request": 2,
+      "topIndex": 2,
+      "innerIndex": null,
+      "tMs": 4019,
+      "apiMs": 4556,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 1,
+        "offsetMs": 1548
+      }
+    },
+    {
+      "templateIndex": 0,
+      "sourceIndex": 33,
+      "request": 3,
+      "topIndex": 3,
+      "innerIndex": null,
+      "tMs": 9747,
+      "apiMs": 7222,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 2,
+        "offsetMs": 1172
+      }
+    },
+    {
+      "templateIndex": 0,
+      "sourceIndex": 33,
+      "request": 4,
+      "topIndex": 4,
+      "innerIndex": null,
+      "tMs": 30951,
+      "apiMs": 1953,
+      "timing": {
+        "kind": "completion",
+        "anchorReq": 2,
+        "offsetMs": 22376
+      }
+    }
+  ]
+}

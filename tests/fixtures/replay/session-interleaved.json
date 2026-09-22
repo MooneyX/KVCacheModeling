@@ -1,0 +1,12 @@
+{
+  "id": "interleaved", "models": ["test-model"], "block_size": 64, "hash_id_scope": "local",
+  "requests": [
+    { "type": "n", "t": 10.0004, "model": "test-model", "in": 128, "out": 1, "hash_ids": [7, 8], "api_time": 0.0026 },
+    { "type": "subagent", "t": 9, "agent_id": "group-a", "requests": [
+      { "type": "s", "t": 10.0016, "model": "test-model", "in": 64, "out": 0, "hash_ids": [9], "api_time": 0.0004, "think_time": 0 },
+      { "type": "n", "t": 10.0006, "model": "test-model", "in": 64, "out": 2, "hash_ids": [7], "api_time": 0.0015, "think_time": null }
+    ] },
+    { "type": "s", "t": 10.0016, "model": "test-model", "in": 192, "out": 3, "hash_ids": [7, 8, 9], "api_time": 0, "think_time": 0.2 },
+    { "type": "subagent", "t": 10.002, "agent_id": "empty", "requests": [] }
+  ]
+}

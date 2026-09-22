@@ -82,3 +82,9 @@ sim_race*.js
 
 # 外部克隆源码(分析用, 不入库)
 sglang/
+data/*
+!data/replay/
+data/replay/*
+!data/replay/sample.json
+!data/replay/sample.json.gz
+!data/replay/sample.report.json

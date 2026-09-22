@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "blockSize": 64,
+  "sessions": [{ "req": [
+    { "in": 64, "out": 0, "blockRuns": [[0, 1]], "timing": { "kind": "completion", "anchorReq": 0, "offsetMs": 0 } }
+  ] }]
+}
