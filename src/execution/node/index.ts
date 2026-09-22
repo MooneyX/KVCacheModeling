@@ -14,6 +14,10 @@ export * from '../../application/metrics.js';
 export * from '../../application/sweep.js';
 export { readParams } from '../../adapters/parameters.js';
 export { paramsFromControls, jobFromControls } from '../../adapters/node/params.js';
-export { parseJob } from '../../adapters/node/input';
+export { parseJob, loadReplayBundle } from '../../adapters/node/input';
+export {
+  parseReplayBundle, validateReplayBundle, validateReplayOverride,
+  replayLimits, replayRunLimits, DEFAULT_REPLAY_LIMITS, DEFAULT_REPLAY_RUN_LIMITS,
+} from '../../core/replay.js';
 export { createLegacyHarness } from '../../adapters/node/legacy.js';
 export { createTrace } from '../../application/trace.js';

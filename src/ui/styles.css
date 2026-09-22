@@ -88,3 +88,8 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
 .mode-btn.active{background:var(--accent);color:#fff}
 .mode-btn:hover:not(.active){color:var(--text)}
 .progress-note{text-align:center;padding:80px 20px;color:var(--text-dim);font-size:.8rem}
+#serverStatus{font-size:.78rem;color:var(--text-dim);margin:12px 0}
+#serverTaskList{max-height:220px;overflow:auto;font-size:.76rem}
+.server-task{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--border)}
+.server-task>span{flex:1;overflow-wrap:anywhere}
+.server-task a{white-space:nowrap;text-decoration:none}

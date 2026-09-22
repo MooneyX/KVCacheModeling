@@ -3,6 +3,10 @@ import { hwPresets } from "./presets.js";
 import { mulberry32, pctOf, unionSpanSec } from "./math.js";
 import { calcAll, estimatePrefillParams, effL2LinkBW, prefillIntegral, prefillTau, perReqMs } from "./calculations.js";
 import { autoNameStrategy } from "./strategy.js";
+import { createReplayRuntime, ReplayValidationError } from "./replay.js";
+import { createReplayCache } from "./replay-cache.js";
+import { createHash } from "node:crypto";
+import { createReplayMetrics } from "./replay-metrics.js";
 
 export function runSimulation(params, strategy, overrides, strategyMode = "dsl") {
   overrides = overrides || {};
@@ -32,7 +36,29 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     p.gpus = _hwOv.gpus;
     // 注意: 故意**不**写 p.ssdBW —— 见上方第 1 条
   }
-  for (let k in overrides) { if (k !== 'seed' && k !== 'nreq' && k !== 'hwPreset') p[k] = overrides[k]; }
+  for (let k in overrides) { if (k !== 'seed' && k !== 'nreq' && k !== 'hwPreset' && k !== 'replay') p[k] = overrides[k]; }
+  let replayMetrics = null;
+  const replay = overrides.replay === undefined ? null : createReplayRuntime(overrides.replay, {
+    qps: p.qps, seed: overrides.seed ?? p.seed,
+    hooks: {
+      launch: event => replayMetrics.launch(event), arrive: req => replayMetrics.arrive(req),
+      complete: req => replayMetrics.complete(req), fail: (req, reason) => replayMetrics.fail(req, reason),
+      cancel: (req, time) => replayMetrics.cancel(req, time),
+    },
+  });
+  if (replay) {
+    if (p.instances !== 1) throw new ReplayValidationError('replay.instances', 'only a single instance is supported through S09');
+    if (p.blockSize !== 64) throw new ReplayValidationError('replay.blockSize', 'only 64-token pages are supported through S09');
+    if (p.pdMode === 2) throw new ReplayValidationError('replay.pdMode', 'separate physical P/D pools are not yet supported');
+    if (strategyMode !== 'dsl') throw new ReplayValidationError('replay.strategyMode', 'custom JavaScript cache hooks are not yet supported');
+    if (!(p.simMaxTime >= 0) || !Number.isFinite(p.simMaxTime)) throw new ReplayValidationError('replay.simMaxTime', 'expected finite nonnegative drain seconds');
+    if (!Number.isFinite(replay.options.durationSeconds + p.simMaxTime) || (replay.options.durationSeconds + p.simMaxTime) / 0.002 > Number.MAX_SAFE_INTEGER)
+      throw new ReplayValidationError('replay.hardCutoff', 'unrepresentable simulation clock');
+    p.singleBatch = false; p.multiTurn = 0; p.prefixHit = 0; p.prefixWarm = false; p.prefixWarmL2 = 0;
+    p.inputLen = replay.launcher.stats.inputTokens / replay.launcher.stats.requests;
+    p.outputLen = replay.launcher.stats.outputTokens / replay.launcher.stats.requests;
+    p.lenDist = 'fixed'; p.arrivalDist = 'poisson'; p.concurrency = 1;
+  }
   if (_hwOv) {
     let _e = estimatePrefillParams(p);
     // 与 applyEstimatedParams() 写输入框的精度对齐(a 两位小数 / b、bIdx 六位小数),
@@ -40,6 +66,16 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     p.prefillA = parseFloat(_e.a.toFixed(2));
     p.prefillB = parseFloat(_e.b.toFixed(6));
     p.prefillBIdx = parseFloat(_e.bIdx.toFixed(6));
+  }
+  if (replay) {
+    const bypassedParameters = ['inputLen', 'outputLen', 'lenDist', 'arrivalDist', 'concurrency', 'prefixHit', 'prefixWarm', 'prefixWarmL2', 'multiTurn', 'singleBatch', 'nreq'];
+    const execution = Object.fromEntries(Object.entries(p).filter(([key]) => !bypassedParameters.includes(key)));
+    replayMetrics = createReplayMetrics({ ...replay.options, hardCutoff: replay.options.durationSeconds + p.simMaxTime,
+      stats: replay.launcher.stats, seed: overrides.seed ?? p.seed, qps: p.qps,
+      lambdaSession: replay.launcher.lambdaSession, limits: replay.launcher.limits,
+      configuration: { bundleVersion: 1, bundleDigest: createHash('sha256').update(JSON.stringify(overrides.replay.bundle)).digest('hex'),
+        digestEncoding: 'JSON.stringify/sha256', blockMapping: { logical: 64, physical: p.blockSize }, execution, bypassedParameters,
+        strategy: JSON.parse(JSON.stringify(strategy)) } });
   }
   let r = calcAll(p);
   // ---------- PD 真分离: 双资源视图(2026-08-20) ----------
@@ -257,6 +293,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // 请求的前缀键: 复用已有的 groupId(pfx_A/B/C/D) —— 它天然就是"同前缀请求"的标识,
   // 无需新造。无组请求(不共享前缀)按自身 id 散列, 等价于随机分布。
   function prefixKeyOf(req) {
+    if (replay) return req.sessionInstanceKey;
     return req.groupId ? req.groupId : ('r' + req.id);
   }
   // S4 前缀亲和(2026-08-20): 仅多实例时有意义 —— 单实例下"隔离"无对象可隔离。
@@ -351,7 +388,8 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // evictThreshold('dram')(读 s.eviction), 原声明在预热段之后 ⇒ TDZ 报错。
   // 'ssd' 分支恰好不读 s(直接 return 0.98)才一直没暴露。
   let s = strategy;
-  let { N, requests } = generateRequests(p, overrides, rng, prefixGroupMap);
+  let { N, requests } = replay ? { N: 0, requests: [] } : generateRequests(p, overrides, rng, prefixGroupMap);
+  if (replay) rng = replay.launcher.routeRandom;
   if (p.prefixHit > 0.001) {
     // S4: 把前缀组表分发给各实例。
     // 亲和关 → 全部实例共用**同一个对象引用**(全局共享前缀池, 与历史口径逐位一致);
@@ -602,10 +640,10 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   function pickVictim(tier) {
     let pool = pools[tier];
     // C1 修复(2026-08-12): prewarmed 块为 L3 常驻(pinned)前缀, 永不被淘汰——HiCache 常驻语义
-    let avail = pool.blocks.filter(b => b.available && !b.prewarmed);
+    let avail = pool.blocks.filter(b => b.available && !b.prewarmed && (!replay || (b.refcount === 0 && !b.pinned && !b.transferLocked)));
     if (avail.length === 0) return null;
     if (jsEvict) {
-      try { let v = jsEvict(pool, tier); if (v && pool.blockIndex[v.id] && v.available && !v.prewarmed) return v; } catch(e) {}
+      try { let v = jsEvict(pool, tier); if (v && pool.blockIndex[v.id] && v.available && !v.prewarmed && (!replay || avail.includes(v))) return v; } catch(e) {}
     }
     // 淘汰算法(2026-09-02): 恒 LRU —— 对齐 sglang RadixCache.evict(), 它按 last_access_time
     // 建最小堆逐个弹出最久未访问的叶子(radix_cache.py:568-590)。原 lfu/fifo 分支已删除
@@ -827,7 +865,39 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // P0-1: decode 阶段动态分配输出 KV 块——真实系统中输出 token 持续产生新 KV，
   // 显存占用与 decode 读取量随 tokensGen 增长。修复前输出 KV 从不建块。
   // 输出块优先放 HBM（decode 生成的 KV 本就在 GPU 上），容量不足按策略淘汰/下沉。
+  const replayCache = replay ? createReplayCache({ pool: pools.hbm, blockBytes, add: poolAdd, remove: poolRemove,
+    maxBlockReferences: replay.launcher.limits.maxBlockReferences }) : null;
+
+  function admitReplayRequests() {
+    replay.drainEvents(now, req => {
+      const target = routeRequest(req);
+      req.instId = target.id;
+      target.nRouted++;
+      target.waitQueue.push(req);
+    });
+    for (let i = 0; i < waitQueue.length; i++) {
+      const req = waitQueue[i];
+      const hit = replayCache.place(req, now);
+      waitQueue.splice(i--, 1);
+      if (!hit) {
+        req.state = 'infeasible'; req.completeTime = now;
+        replay.fail(req, 'infeasible', now);
+        req.replayTemplate = null;
+        continue;
+      }
+      req.state = 'prefillQ'; req.admitTime = now;
+      stats.reqTokTotal += hit.inputTokens;
+      stats.hitTokL1 += hit.hitL1Tokens; stats.missTok += hit.missTokens;
+      inst.hitTok += hit.hitL1Tokens; inst.reqTok += hit.inputTokens;
+      if (hit.hitL1Tokens) { stats.prefixHits++; stats.prefixSavedBytes += hit.hitL1Tokens * kvPerTok; }
+      replayMetrics?.admit(req, hit);
+      prefillQ.push(req);
+      dirty = true;
+    }
+  }
+
   function allocOutBlock(q, targetTok) {
+    if (replay) { replayCache.output(q, targetTok, now); dirty = true; return; }
     let want = Math.min(q.outputLen, targetTok);
     let chunk = Math.max(1, q._outMerge || 1) * p.blockSize;
     while (q._outAllocTok < want) {
@@ -923,7 +993,8 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       prefixGroupMap[q.groupId].blkIds = q.groupBlkIds;
     }
     // 单批模式(2026-08-19): prefill 完成即整个仿真终点——直接完成请求, 不进 decode/decodeWait
-    if (p.singleBatch) { completeRequest(q); dirty = true; return; }
+    if (replay) replayCache.publish(q, now);
+    if (p.singleBatch || (replay && q.outputLen === 0)) { completeRequest(q); dirty = true; return; }
     // ---- PD 真分离(2026-08-20): prefill 在 P 节点算完, KV 必须经互联网络搬到 D 节点才能 decode ----
     // 物理: P/D 是两台机器, KV 不在同一片 HBM 里。传输耗时进入 TTFT(首 token 必须等 KV 到位)。
     // 单批模式已在上面返回(它不进 decode, 无需传输)。
@@ -1114,8 +1185,10 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // ---------- 完成与释放 ----------
   let pending = requests;
   let timeline = [], followUpCount = 0;
+  const replayCompletions = [];
 
   function completeRequest(req) {
+    if (replay && req.state === 'done') return;
     req.state = 'done'; req.completeTime = now;
     stats.latencies.push((now - req.arrive) * 1000);
     // TTFT 口径(2026-08-20 PD 真分离): 首 token 产出时刻。
@@ -1232,6 +1305,11 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     if (timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
       prefillStart: req.prefillStart, prefillEnd: req.prefillEnd, completeTime: now });
 
+    if (replay) {
+      replay.complete(req, now);
+      replayCache.release(req, now);
+      return;
+    }
     // 多轮会话：保留KV，安排后续轮次复用（真实前缀命中）
     // 单批模式: 不产生后续轮次——仿真范围严格限定为"单批 prefill"
     let retain = (!req.followUp && !p.singleBatch && p.multiTurn > 0 && rng() < p.multiTurn);
@@ -1294,8 +1372,8 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     let cmp = 2 * r.activatedParams * n / r.computeFlops;
     return Math.max(mem, cmp, 1e-6) + r.commTime(n);
   }
-  let estPass = estDecodePass(estN);
-  let drainEst = totalPrefillEst + p.outputLen * estPass * Math.ceil(N / Math.max(1, estN)) * 2;
+  let estPass = replay ? 0 : estDecodePass(estN);
+  let drainEst = replay ? null : totalPrefillEst + p.outputLen * estPass * Math.ceil(N / Math.max(1, estN)) * 2;
   // 仿真窗口 = min(排水估计, 可调上限 simMaxTime)：上限是硬保险（默认 1200s 防极端负载卡死），
   // 排水估计含 KV 下沉减速（与引擎同口径）；触顶未排空时按剩余负载自动延长（见循环末尾），
   // 但不得超过 simCap（用户上限）——因此"设大上限即可跑完全部请求"，即使排水估计低估也不会
@@ -1304,6 +1382,12 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   let maxTime = lastArrive + Math.min(Math.max(drainEst, 120), Math.max(p.simMaxTime || 1200, 60));
   let maxSteps = Math.ceil(maxTime / DT);
   let simCap = lastArrive + Math.max(p.simMaxTime || 1200, 60); // 硬保险：仿真墙钟不超过此值
+  if (replay) {
+    simCap = replay.options.durationSeconds + p.simMaxTime;
+    maxTime = simCap;
+    maxSteps = Math.ceil(simCap / DT) + 1;
+    drainEst = null;
+  }
   // 剩余排水估计：基于当前未完成请求（排队/在飞/decode），供窗口自动延长使用。
   // 与 drainEst 同口径（位置感知 prefill + 分波 decode），保证延长量覆盖剩余工作
   function estimateRemainingDrain() {
@@ -1361,7 +1445,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       }
       q.prefixBlkIds.concat(q.ownBlkIds).forEach(id => {
         let hb = pools.hbm.blockIndex[id];
-        if (hb) { if (hb.available) { h += hb.size; touchBlock('hbm', id); stats.hbmAcc++; } else chargeInFlight(hb); return; }
+        if (hb) { if (hb.available) { h += replay ? hb.tokens * kvPerTok : hb.size; touchBlock('hbm', id); stats.hbmAcc++; } else chargeInFlight(hb); return; }
         let db = pools.dram.blockIndex[id];
         if (db) { if (db.available) { d += sizeInTier(db, 'dram'); touchBlock('dram', id); stats.dramAcc++; } else chargeInFlight(db); return; }
         let sb = pools.ssd.blockIndex[id];
@@ -1382,7 +1466,20 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   }
 
   for (let step = 0; step < maxSteps; step++) {
-    now = step * DT;
+    now = replay ? Math.min(step * DT, simCap) : step * DT;
+    if (replay) {
+      if (step % 1024 === 0) replay.checkWallTime();
+      for (let i = replayCompletions.length - 1; i >= 0; i--) {
+        if (replayCompletions[i].at <= now + 1e-12) {
+          const { req } = replayCompletions.splice(i, 1)[0];
+          completeRequest(req);
+          dirty = true;
+        }
+      }
+      replayMetrics.observe(now, { activeSessions: replay.sessions.size,
+        activeRequests: waitQueue.length + prefillQ.length + prefilling.length + decoding.length + decodeWait.length + replayCompletions.length,
+        queuedRequests: waitQueue.length + prefillQ.length, ...replayCache.snapshot() });
+    }
 
     // 事件跳跃(2026-08-18): 系统全空闲(无在途请求, 拉取/波次自然也不存在)时直接快进至
     // 下一事件时刻——下一到达 或 在途传输完成(inFlight), 跳过中间空转步。低 qps/短输出
@@ -1397,7 +1494,17 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
         || xi.kvXfer.length || xi.decodeWait.length || xi.decoding.length) { allIdle = false; break; }
     }
-    if (pending.length && allIdle) {
+    if (replay && allIdle && !replayCompletions.length) {
+      let next = replay.nextTime;
+      for (const transfer of inFlight) next = Math.min(next, transfer.arriveAt);
+      if (!Number.isFinite(next) && !replay.done) throw new Error('Replay scheduling invariant: unresolved anchors without future events');
+      const target = Math.min(simCap, next, replay.done ? Math.max(now, replay.options.durationSeconds) : Infinity);
+      if (target > now) {
+        step = Math.ceil(target / DT);
+        now = Math.min(step * DT, simCap);
+      }
+    }
+    if (!replay && pending.length && allIdle) {
       let nextEv = pending[0].arrive;
       for (let ei = 0; ei < inFlight.length; ei++) nextEv = Math.min(nextEv, inFlight[ei].arriveAt);
       if (nextEv > now) {
@@ -1460,7 +1567,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     //  KV 容量判据 —— 对应 sglang 的 available_size/new_token_ratio 检查, 不足则在
     //  waiting_queue 等待。)
     let fastCap = (caps.hbm + caps.dram) * 0.98; // 快层容量：HBM+DRAM 为"软家"，SSD 是最后手段
-    for (let i = 0; i < waitQueue.length; i++) {
+    for (let i = 0; !replay && i < waitQueue.length; i++) {
       // 单批模式: 准入门控全部跳过——所有请求立即准入, 构成单批 batch
       // 快层容量：按"在途请求 KV 总量"估算（含 decodeWait），而非 pools.used——
       // 淘汰会把块移出快层导致 pools.used 虚低，只有按在途请求数×平均KV才能真实反映
@@ -1971,7 +2078,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       // 下游所有"本步前向次数"换算(pIt/pFinal/passes/tok)统一用 dtEff, 保证
       // token 产出、KV 读字节、链路占用三者口径一致 —— 只改其一会让带宽统计与吞吐脱节。
       // pfShare=0(流体基线 / PD 真分离 / 无执行波)时 dtEff===DT ⇒ 逐位零回归。
-      let dtEff = DT * (1 - pfShare);
+      let dtEff = (replay ? Math.min(DT, Math.max(0, simCap - now)) : DT) * (1 - pfShare);
       // ---- L2 读链路排队(busyUntil) + L3 读统一共享池(2026-08-18, 问题②修复) ----
       // L2(dram>hbm): 维持 busyUntil 排队模型(decode 读与预取/淘汰共享带宽)。
       // L3(ssd>dram): decode 按需读优先于 prefill 拉取(见拉取段注释)——decode 始终按全速
@@ -2022,7 +2129,9 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       // 该样本含排队与突发，供 P50/P95/P99/峰值分位统计——平均口径会低估"所需带宽"。
       let instL2 = (stats.transferL2Bytes - stats._prevL2) / Math.max(DT, 1e-9);
       let instL3 = (stats.transferL3Bytes - stats._prevL3) / Math.max(DT, 1e-9);
-      stats.l2Inst.push(Math.max(instL2, 0)); stats.l3Inst.push(Math.max(instL3, 0));
+      if (!replay || stats.l2Inst.length < 20_000) {
+        stats.l2Inst.push(Math.max(instL2, 0)); stats.l3Inst.push(Math.max(instL3, 0));
+      }
       // passTime 名义分量 + 瓶颈归因（时间主要花在哪一层；comm 为通信项，cmp 为算力下限）
       let tHbm = (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
         + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000;
@@ -2058,9 +2167,14 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
         // P0-1: 输出 KV 动态分配——真实系统输出 token 每生成一块就建一个块（PagedAttention 粒度），
         // 跨过块边界才分配（避免每步都分配整块造成虚增），纳入 pools.used 与 decode 读取量
         let chunk = Math.max(1, q._outMerge || 1) * p.blockSize;
-        let targetTok = Math.min(q.outputLen, Math.floor(q.tokensGen / chunk) * chunk);
+        let targetTok = Math.min(q.outputLen, replay ? Math.floor(q.tokensGen) : Math.floor(q.tokensGen / chunk) * chunk);
         if (targetTok > q._outAllocTok) allocOutBlock(q, targetTok);
-        if (q.tokensGen >= q.outputLen) { decoding.splice(i, 1); completeRequest(q); dirty = true; }
+        if (q.tokensGen >= q.outputLen) {
+          decoding.splice(i, 1);
+          if (replay) replayCompletions.push({ req: q, at: Math.min(now + DT, simCap) });
+          else completeRequest(q);
+          dirty = true;
+        }
       }
     }
 
@@ -2077,6 +2191,11 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       if (_busyPhase) { inst.qBusySum += _qh; inst.qBusySamples++; }
     } // ======== end 逐实例推进 ========
 
+    if (replay) {
+      useInstance(instances[0]);
+      admitReplayRequests();
+    }
+
     // 显存利用率采样（峰值 + 时间加权平均）+ 并发度采样
     // 多实例(S2): 容量/占用类指标按**全部实例求和**(整机视角), 利用率按总容量归一
     let _sHbmUsed = 0, _sHbmCap = 0, _sDram = 0, _sSsd = 0, _sDec = 0, _sPf = 0, _sQ = 0;
@@ -2087,6 +2206,9 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       _sDec += xi.decoding.length;    _sPf += xi.prefilling.length;
       _sQ += xi.waitQueue.length + xi.prefillQ.length;
     }
+    if (replay) replayMetrics.observe(now, { activeSessions: replay.sessions.size,
+      activeRequests: _sDec + _sPf + _sQ + replayCompletions.length,
+      queuedRequests: _sQ, ...replayCache.snapshot() });
     let u = _sHbmUsed / Math.max(_sHbmCap, 1);
     stats.memUtilSum += u; stats.memUtilSamples++;
     if (u > stats.memUtilPeak) stats.memUtilPeak = u;
@@ -2097,20 +2219,24 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     // 传输差分基准：本步末的累计值 → 下一步初的差分起点
     stats._prevL2 = stats.transferL2Bytes;
     stats._prevL3 = stats.transferL3Bytes;
-    if (step % 5 === 0) {
+    if (step % 5 === 0 && (!replay || stats.concSamples.length < 20_000)) {
       stats.concSamples.push([+now.toFixed(2), _sDec, _sPf, _sQ]);
       // L2/L3 驻留时间序列（GB）——策略行为的瞬态画像（预取/淘汰波次可见）
       stats.l2Series.push([+now.toFixed(2), +(_sDram / 1e9).toFixed(2)]);
       stats.l3Series.push([+now.toFixed(2), +(_sSsd / 1e9).toFixed(2)]);
     }
 
-    let _allDone = !pending.length;
+    let _allDone = !pending.length && (!replay || (replay.done && !inFlight.length && now >= replay.options.durationSeconds));
     for (let ii = 0; _allDone && ii < instances.length; ii++) {
       let xi = instances[ii];
       if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
         || xi.kvXfer.length || xi.decodeWait.length || xi.decoding.length) _allDone = false;
     }
     if (_allDone) { drained = true; break; }
+    if (replay) {
+      if (now >= simCap) break;
+      continue;
+    }
     // 触顶未排空 → 按剩余负载自动延长（覆盖排水估计低估，保证"设大上限即可跑完"）；
     // 延长后超过用户上限 simCap ⇒ 截断退出（truncated=true，结果警示并给出建议上限值）。
     if (step + 1 >= maxSteps) {
@@ -2158,7 +2284,8 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     xi.decoding.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decoding' }));
   });
 
-  return {
+  if (replay) incomplete = incomplete.slice(0, 320);
+  const result = {
     name: strategy.name || autoNameStrategy(strategy),
     hbmHitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
     throughput: stats.outTokens / simEnd,
@@ -2400,10 +2527,28 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       miss: stats.missTok, total: stats.reqTokTotal },
     prefixGroups: Object.keys(prefixGroupMap).length,
     fragPct: r.fragPct,
-    completed: stats.completed, totalReqs: N + followUpCount,
+    completed: stats.completed, totalReqs: replay ? replay.launcher.plannedRequests : N + followUpCount,
+    ...(replay ? { replay: replayMetrics.finish(now, { ...replay.counts(), truncated, terminationReason: truncated ? 'hard_cutoff' : 'drained' }) } : {}),
     truncated: truncated, simEnd: simEnd, drainEst: drainEst, // 截断标志 + 仿真结束时间 + 排水估计(截断时建议上限值)
     latencies: stats.latencies, timeline: timeline, concTimeline: stats.concSamples,
     incomplete: incomplete,   // (simEnd 已在上一行给出, 此处原有重复 key 已删 —— 2026-08-20)
     admission: strategy.admission.type, eviction: strategy.eviction.type, prefetch: strategy.prefetch.type,
   };
+  if (replay) {
+    Object.assign(result.replay.cache, replayCache.snapshot());
+    result.replay.samples.legacy = {
+      maxSeriesSamples: 20_000, maxTimelineSamples: 320,
+      concurrencyCoverage: stats.concSamples.length ? [stats.concSamples[0][0], stats.concSamples.at(-1)[0]] : null,
+      completedTimelineSamples: timeline.length, incompleteTimelineSamples: incomplete.length,
+      bandwidthSamples: stats.l2Inst.length, bandwidthSampling: 'first-20000-decode-steps',
+      requestArrayLimit: replay.launcher.limits.maxRequests,
+    };
+    result.memUtilAvg = (result.replay.samples.timeWeightedMean.hbmBytes || 0) / Math.max(caps.hbm, 1) * 100;
+    result.memUtilPeak = result.replay.samples.peak.hbmBytes / Math.max(caps.hbm, 1) * 100;
+    result.hitRate && (result.hitRate.input = null);
+    const bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+    if (bytes > replay.launcher.limits.maxResultBytes) throw new ReplayValidationError('replay.result', 'result byte resource limit exceeded');
+    replay.checkWallTime();
+  }
+  return result;
 }

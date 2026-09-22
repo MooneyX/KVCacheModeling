@@ -33,6 +33,17 @@
 
 <!-- Main Content -->
 <div class="main-content">
+<section class="card" id="serverTasks">
+  <h2>服务器计算任务</h2>
+  <p class="subtitle">完整仿真在服务器独立进程执行；页面保留解析估算和图表。关闭页面后任务继续，可回来下载输入与结果。暂不支持远程 JavaScript 策略。</p>
+  <div class="form-row">
+    <div><input id="serverAccessKey" type="password" autocomplete="off" placeholder="服务器访问密钥（仅受保护服务需要）" aria-label="服务器访问密钥"></div>
+    <button class="btn btn-sm" id="serverConnect">连接服务</button>
+    <button class="btn btn-sm" id="serverRefresh">刷新任务</button>
+  </div>
+  <p id="serverStatus" role="status">正在连接服务器...</p>
+  <div id="serverTaskList"></div>
+</section>
 
 <!-- ====== TAB 1: 基础参数 ====== -->
 <div class="tab-panel active" id="tab-params">

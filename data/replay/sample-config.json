@@ -1,0 +1,32 @@
+{
+  "pAttnType": "mla",
+  "pLayers": "78",
+  "pKvLora": "512",
+  "pRopeDim": "64",
+  "pHidden": "6144",
+  "pVocab": "120832",
+  "pParamsB": "770",
+  "pActB": "49",
+  "pQHeads": "64",
+  "pQkNope": "192",
+  "pVHeadDim": "256",
+  "pSparseAttn": true,
+  "pSparseTopk": "2048",
+  "pIdxHeads": "32",
+  "pIdxHeadDim": "128",
+  "pMoeLayers": "77",
+  "pDenseB": "20",
+  "pDtype": "1",
+  "pWeightDtype": "1",
+  "pMfu": "50",
+  "pInstances": "1",
+  "pBlockSize": "64",
+  "pQps": "5",
+  "pSimMaxTime": "600",
+  "pSeed": "42",
+  "sName": "Replay sample: 8xB300 / Hunyuan-Hy4-preview / FP8 / MFU50",
+  "overrides": {
+    "hwPreset": "b300x8",
+    "replay": {"options": {"durationSeconds": 2, "warmupSeconds": 0, "superblocks": false}}
+  }
+}

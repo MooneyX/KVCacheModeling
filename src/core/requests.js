@@ -93,3 +93,15 @@ export function generateRequests(p, overrides, rng, prefixGroupMap) {
   }
   return { N, requests };
 }
+
+/** @param {import('../contracts/replay').ReplayRequest} template @param {number} id @param {number} arrive @param {any} identity */
+export function createReplayRequest(template, id, arrive, identity) {
+  return {
+    id, arrive, inputLen: template.in, outputLen: template.out,
+    groupId: null, prefixTokLen: 0, isFounder: false, followUp: false, retainIds: null,
+    state: 'wait', tokensGen: 0, admitTime: 0, prefillStart: 0, prefillEnd: 0, decodeStart: 0, completeTime: 0,
+    prefixBlkIds: [], ownBlkIds: [], kvHbm: 0, kvDram: 0, kvSsd: 0, prefillTokens: template.in,
+    _outAllocTok: 0, _outSeq: 0, _outMerge: 1, _recomputeTok: 0,
+    replayTemplate: template, ...identity,
+  };
+}

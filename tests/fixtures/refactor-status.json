@@ -1,15 +1,25 @@
 {
   "baseline": "legacy/index.html and legacy/manifest.json",
-  "productionEntrypoints": ["dist/web/index.html", "dist/node/cli.cjs", "dist/node/library.cjs"],
+  "productionEntrypoints": ["dist/node/server.cjs", "dist/node/runner.cjs", "dist/web/index.html", "dist/node/cli.cjs", "dist/node/library.cjs"],
+  "serverExecution": {
+    "start": "npm start (after npm run build)",
+    "architecture": "Single Node HTTP service with a bounded FIFO task queue and dedicated calculation child processes; no client fallback.",
+    "persistence": "Inputs, result points and status live in SIM_DATA_DIR, default .runtime/tasks. One service instance per directory.",
+    "recovery": "Closing the page does not cancel accepted tasks. Completed results survive service restart; unfinished tasks are marked interrupted, not checkpoint-resumed.",
+    "access": "Session-scoped task ownership and optional shared access key; no multi-user accounts/SSO. Use HTTPS and an access key before exposing beyond loopback.",
+    "limits": "Concurrency, task time, V8 old-space, body/result size, retained task count and TTL are configurable. These are not OS-level CPU/RSS isolation.",
+    "strategies": "Remote execution accepts DSL only. Trusted JS remains available through the explicitly opted-in local CLI.",
+    "batching": "Each accepted batch executes points sequentially in one child process; independent tasks can execute concurrently. No single-simulation parallel speedup is claimed."
+  },
   "historicalTools": {
-    "scripts/sim": "Loading migrated to shared modules; existing numeric/reporting defects were not corrected.",
-    "scripts/verify": "Historical HTML-scraping scripts remain unchanged and are not current entrypoints. Use npm test and npm run test:browser for maintained regression coverage.",
-    "scripts/debug": "Historical exploratory tools were not migrated."
+    "scripts/legacy/sim": "Loading migrated to shared modules; existing numeric/reporting defects were not corrected.",
+    "scripts/legacy/verify": "Historical HTML-scraping scripts remain unchanged and are not current entrypoints. Use npm test and npm run test:browser for maintained regression coverage.",
+    "scripts/legacy/debug": "Historical exploratory tools were not migrated."
   },
   "knownIssuesOutsideScope": [
     "Historical sim_harness.js and sim_sens_l3.js call hitRate.toFixed although hitRate is an object; preserved as pre-existing output defects.",
     "Historical report regression E9 has three failures against an older model version; see legacy/verification-status.json.",
-    "Existing scan requeue completion counter and progress DOM replacement behaviors were preserved.",
+    "The browser scan Worker scheduler was replaced with server batch tasks; metric mapping, point caches and chart calculations were retained. File persistence currently uses synchronous I/O and requires fast local storage.",
     "ECharts remains at 5.5.0 for compatibility and has a moderate XSS advisory GHSA-fgmj-fm8m-jvvx. Do not use untrusted strategies or report inputs.",
     "Capacity limits and simulation algorithm were not changed or benchmarked for larger workloads."
   ]

@@ -10,7 +10,7 @@ const cases = [
   baseControls,
   { ...baseControls, pPrefillA: '0', pPrefillB: '0', pMfu: '', pPrefixWarmL2: '90', pPrefixHit: '40' },
   { pMaxBatch: '64', sDsl: 'ADMIT: always\nBATCH: continuous max(12)\nPREFETCH: race' },
-  JSON.parse(readFileSync(new URL('../../data/params_332_report_pipeline.json', import.meta.url), 'utf8')),
+  JSON.parse(readFileSync(new URL('../fixtures/params_332_report_pipeline.json', import.meta.url), 'utf8')),
 ];
 for (const [index, values] of cases.entries()) {
   test(`CLI control conversion matches initialized page import ${index}`, () => {

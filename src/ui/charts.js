@@ -186,12 +186,18 @@ export function refreshScheduleTab(){
 
 
 
-export function drawGantt(){
+let ganttRun = 0;
+export async function drawGantt(){
+  const run = ++ganttRun;
   // 甘特图展示"当前配置的策略"（方案A：不再隐式绑定 savedStrategies[0]）；结果走缓存，切 tab 不重跑
   let p = getParams(); // 修复历史 bug：formulaGantt 引用 p.* 但此前未定义 → 甘特图渲染必抛错
   let s = getCurrentStrategy();
   if (!s) s = {name:'Default', admission:{type:'always'}, eviction:{type:'lru',hbm_evict_threshold:0.9}, prefetch:{type:'none'}, placement:{type:'hbm_first'}, batching:{type:'continuous',max_batch_size:8}, dsl:''};
-  let r = cachedSimulation(s);
+  let r;
+  $('chartGantt').textContent = '正在等待服务器仿真...';
+  try { r = await cachedSimulation(s, undefined, p); }
+  catch (error) { if (run === ganttRun) $('chartGantt').textContent = error.message; return; }
+  if (run !== ganttRun) return;
   let simEnd = r.simEnd || 1;
   // 合并已完成 + 未完成请求（未完成的最终阶段用浅色显示，截至仿真结束时刻）
   let timeline = (r.timeline || []).map(t => Object.assign({}, t, { state: 'done' }))

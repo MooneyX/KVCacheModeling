@@ -8,7 +8,12 @@ export type SimulationStrategy = ReturnType<typeof parseDSL>;
 export type SimulationResult = ReturnType<typeof runSimulation>;
 export type SensitivityMetrics = ReturnType<typeof extractSensMetrics>;
 export type StrategyMode = 'dsl' | 'js';
-export type SimulationOverrides = Partial<SimulationParams> & { seed?: number; nreq?: number; hwPreset?: string };
+export type SimulationOverrides = Partial<SimulationParams> & {
+  seed?: number;
+  nreq?: number;
+  hwPreset?: string;
+  replay?: import('./replay').ReplayOverride;
+};
 
 export interface SimulationJob {
   params: SimulationParams;

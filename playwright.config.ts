@@ -13,10 +13,11 @@ export default defineConfig({
   },
   projects: [
     { name: 'development', use: { baseURL: 'http://127.0.0.1:4173' } },
-    { name: 'production', use: { baseURL: 'http://127.0.0.1:4174' } },
+    { name: 'production', use: { baseURL: 'http://127.0.0.1:8787' } },
   ],
   webServer: [
     { command: 'npm run dev -- --port 4173 --strictPort', url: 'http://127.0.0.1:4173', reuseExistingServer: false },
-    { command: 'npm run preview -- --port 4174 --strictPort', url: 'http://127.0.0.1:4174', reuseExistingServer: false },
+    { command: 'npm start', url: 'http://127.0.0.1:8787/api/health', reuseExistingServer: false,
+      env: { HOST: '127.0.0.1', PORT: '8787', SIM_ACCESS_TOKEN: '', SIM_DATA_DIR: '.runtime/browser-tests', SIM_MAX_TASKS: '1000' } },
   ],
 });

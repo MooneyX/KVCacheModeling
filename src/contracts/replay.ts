@@ -27,6 +27,28 @@ export interface ReplayLimits {
   maxBlockReferences: number;
 }
 
+export interface ReplayRunLimits {
+  maxSessions: number;
+  maxRequests: number;
+  maxEvents: number;
+  maxBlockReferences: number;
+  maxWallTimeMs: number;
+  maxResultBytes: number;
+}
+
+export interface ReplayOptions {
+  arrivalModel?: 'closed';
+  durationSeconds: number;
+  warmupSeconds: number;
+  superblocks?: boolean;
+  limits?: Partial<ReplayRunLimits>;
+}
+
+export interface ReplayOverride {
+  bundle: ReplayBundle;
+  options: ReplayOptions;
+}
+
 export interface ReplayBundleStats {
   sessions: number;
   requests: number;

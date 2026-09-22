@@ -14,8 +14,14 @@
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
     "test": "npm run build:node && node --test tests/regression/*.test.mjs",
-    "test:browser": "npm run build:web && playwright test",
-    "simulate": "node dist/node/cli.cjs"
+    "test:browser": "npm run build && playwright test",
+    "simulate": "node dist/node/cli.cjs",
+    "replay": "node dist/node/replay.cjs",
+    "start": "node dist/node/server.cjs",
+    "dev:server": "npm run build:node && node dist/node/server.cjs",
+    "local": "node scripts/local.mjs",
+    "local:dev": "node scripts/local.mjs --dev",
+    "test:local": "node --test tests/local/*.test.mjs"
   },
   "dependencies": {
     "echarts": "5.5.0"

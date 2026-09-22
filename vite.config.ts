@@ -3,5 +3,5 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   base: './',
   build: { outDir: 'dist/web', emptyOutDir: true, target: 'es2022' },
-  worker: { format: 'es' },
+  server: { proxy: { '/api': { target: 'http://127.0.0.1:8787' } } },
 });

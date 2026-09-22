@@ -1,10 +1,20 @@
 import { getParams } from "../adapters/browser/params.js";
 import { state } from "./state.js";
-import { runSimulation } from "../adapters/browser/simulation.js";
+
 import { getCurrentStrategy } from "./strategy.js";
 import { $ } from "../adapters/browser/dom.js";
 import { drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
-import { executeSimulation } from '../execution/browser/client.ts';
+import { executeSimulation, executeBatch, serverVersion } from '../execution/browser/client.ts';
+
+const pending = new Map();
+function cacheKey(params, strategy, overrides, mode, version) {
+  return JSON.stringify([version, mode, params, strategy.dsl || strategy.name || '', overrides || null]);
+}
+function storeResult(key, result) {
+  const keys = Object.keys(state.simCache);
+  if (keys.length >= 30) delete state.simCache[keys[0]];
+  state.simCache[key] = result;
+}
 
 let running = false;
 
@@ -18,17 +28,20 @@ async function runSelectedStrategies(list) {
   running = true;
   buttons.forEach(button => { button.disabled = true; });
   try {
-    const results = [];
-    for (const strategy of strategies) {
-      const key = JSON.stringify([params, strategy.dsl || strategy.name || '', null]);
-      let result = state.simCache[key];
-      if (!result) {
-        result = await executeSimulation({ params, strategy, mode });
-        const keys = Object.keys(state.simCache);
-        if (keys.length >= 30) delete state.simCache[keys[0]];
-        state.simCache[key] = result;
-      }
-      results.push(result);
+    if (mode === 'js') throw new Error('服务器暂不支持 JavaScript 策略，请选择 DSL。');
+    const version = await serverVersion();
+    const keys = strategies.map(strategy => cacheKey(params, strategy, null, mode, version));
+    const results = keys.map(key => state.simCache[key]);
+    const missing = strategies.map((strategy, index) => ({ strategy, index })).filter(({ index }) => !results[index]);
+    if (missing.length) {
+      await executeBatch(missing.map(({ strategy }) => ({ params, strategy, mode })), missing.length === 1 ? 'simulation' : 'batch', {
+        label: strategies.length === 1 ? strategies[0].name : '全部已保存策略',
+        onPoint: point => {
+          const index = missing[point.index].index;
+          results[index] = point.result;
+          storeResult(keys[index], point.result);
+        },
+      });
     }
     state.simResults = results;
     state.simInput = { params, controls };
@@ -42,15 +55,15 @@ async function runSelectedStrategies(list) {
 }
 
 
-export function cachedSimulation(strategy, overrides) {
-  let s = strategy || {};
-  let key = JSON.stringify([getParams(), s.dsl || s.name || '', overrides || null]);
+export async function cachedSimulation(strategy, overrides, params = getParams()) {
+  const mode = state.strategyMode;
+  if (mode === 'js') throw new Error('服务器暂不支持 JavaScript 策略，请选择 DSL。');
+  const version = await serverVersion();
+  const key = cacheKey(params, strategy, overrides, mode, version);
   if (state.simCache[key]) return state.simCache[key];
-  let r = runSimulation(s, overrides);
-  let keys = Object.keys(state.simCache);
-  if (keys.length >= 30) delete state.simCache[keys[0]]; // FIFO 淘汰最旧
-  state.simCache[key] = r;
-  return r;
+  if (!pending.has(key)) pending.set(key, executeSimulation({ params, strategy, overrides, mode })
+    .then(result => { storeResult(key, result); return result; }).finally(() => pending.delete(key)));
+  return pending.get(key);
 }
 
 

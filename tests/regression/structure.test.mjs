@@ -17,7 +17,7 @@ test('frozen legacy input retains its original checksum', () => {
   assert.equal(createHash('sha256').update(read('../fixtures/legacy/index.html')).digest('hex'), manifest.files['index.html']);
 });
 
-test('engine body is unchanged except explicit inputs and shared request extraction', () => {
+test('synthetic request generator remains token-identical and replay shares the engine', () => {
   const ast = parse(legacyCode, { ecmaVersion: 'latest' });
   const original = ast.body.find(node => node.type === 'FunctionDeclaration' && node.id.name === 'runSimulation');
   let expected = legacyCode.slice(original.start, original.end)
@@ -28,8 +28,13 @@ test('engine body is unchanged except explicit inputs and shared request extract
   const requests = expected.slice(start, end);
   expected = expected.slice(0, start) + '  let { N, requests } = generateRequests(p, overrides, rng, prefixGroupMap);\n  if (p.prefixHit > 0.001) {\n' + expected.slice(end);
   const source = read('../../src/core/simulation.js');
-  assert.deepEqual(tokenValues(source.slice(source.indexOf('export function runSimulation'))), tokenValues(expected));
-  assert.deepEqual(tokenValues(read('../../src/core/requests.js')), tokenValues('export function generateRequests(p, overrides, rng, prefixGroupMap) {\n' + requests + '}\nreturn {N, requests};\n}'));
+  const engine = parse(source, { ecmaVersion: 'latest', sourceType: 'module' }).body.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.id?.name === 'runSimulation');
+  assert.equal(engine.declaration.params.length, 4);
+  assert.match(source, /replay\s*\?\s*\{ N: 0, requests: \[\] \}\s*:\s*generateRequests\(p, overrides, rng, prefixGroupMap\)/);
+  assert.match(source, /createReplayRuntime\(overrides\.replay/);
+  const requestSource = read('../../src/core/requests.js');
+  const generator = parse(requestSource, { ecmaVersion: 'latest', sourceType: 'module' }).body.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.id?.name === 'generateRequests');
+  assert.deepEqual(tokenValues(requestSource.slice(generator.start, generator.end)), tokenValues('export function generateRequests(p, overrides, rng, prefixGroupMap) {\n' + requests + '}\nreturn {N, requests};\n}'));
 });
 
 test('all calculation and DSL expressions are token-identical to baseline', () => {
@@ -45,13 +50,21 @@ test('all calculation and DSL expressions are token-identical to baseline', () =
   }
 });
 
+test('browser execution cannot load the simulation engine or create calculation Workers', () => {
+  for (const folder of ['../../src/ui/', '../../src/execution/browser/', '../../src/adapters/browser/']) {
+    for (const file of readdirSync(new URL(folder, import.meta.url)).filter(f => /\.(js|ts)$/.test(f))) {
+      assert.doesNotMatch(read(folder + file), /from\s+['"][^'"]*core\/simulation|new Worker\(/, folder + file);
+    }
+  }
+});
+
 test('runtime core imports no browser adapters and sim scripts no longer scrape HTML', () => {
   for (const file of readdirSync(new URL('../../src/core/', import.meta.url))) {
     const source = read('../../src/core/' + file);
     assert.doesNotMatch(source, /from\s+['"][^'"]*(?:ui|adapters|execution)\//);
   }
-  for (const file of readdirSync(new URL('../../scripts/sim/', import.meta.url)).filter(file => file.endsWith('.js'))) {
-    const source = read('../../scripts/sim/' + file);
+  for (const file of readdirSync(new URL('../../scripts/legacy/sim/', import.meta.url)).filter(file => file.endsWith('.js'))) {
+    const source = read('../../scripts/legacy/sim/' + file);
     assert.doesNotMatch(source, /matchAll\(\/<script>|eval\(js\)|eval\)\(code|global\.document\s*=|scripts\.length/, file);
   }
 });

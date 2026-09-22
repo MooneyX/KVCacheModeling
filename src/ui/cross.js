@@ -3,7 +3,7 @@ import { getParams } from "../adapters/browser/params.js";
 import { state } from "./state.js";
 import { parseDSL } from "../core/strategy.js";
 import { strategyPresets } from "../core/presets.js";
-import { runSimulation } from "../adapters/browser/simulation.js";
+import { executeBatch } from '../execution/browser/client.ts';
 import { initChart, setFormula } from "./charts.js";
 
 
@@ -15,7 +15,7 @@ export function refreshCrossTab(){
   if (window.__crossAnalyzed) { drawCrossAnalysis(); return; }
   $('chartHeatmap').innerHTML = '<div class="progress-note" style="padding:28px 16px;text-align:center;line-height:2">'+
     '交叉分析需运行 <b>24</b> 次「策略 × 并发」仿真 + <b>4</b> 次综合评分仿真<br>'+
-    '高并发档(64/128/256)每次约 5-20s，串行执行期间页面会短暂无响应<br><br>'+
+    '计算在服务器独立进程执行，任务提交后可关闭页面，在任务列表下载结果<br><br>'+
     '<button class="btn" onclick="runCrossAnalysis()" style="font-size:.85rem">▶️ 按需运行交叉分析</button></div>';
   $('chartRadar').innerHTML = '';
   $('formulaHeatmap').innerHTML = '';
@@ -31,8 +31,14 @@ export function runCrossAnalysis(){
 
 
 // 热力图+雷达图共用一批真实仿真（异步执行避免阻塞UI）
-export function drawCrossAnalysis(){
+let crossRunning = false;
+let crossRequested = '';
+export async function drawCrossAnalysis(){
   let p=getParams();
+  const fingerprint = JSON.stringify([p, state.savedStrategies, state.strategyMode]);
+  crossRequested = fingerprint;
+  if (crossRunning) return;
+  crossRunning = true;
   let presetNames=['Pure-HBM','HBM+DRAM','Tiered-3L','Aggressive'];
   let strategies=[];
   state.savedStrategies.slice(0,4).forEach(s=>strategies.push(s));
@@ -53,29 +59,29 @@ export function drawCrossAnalysis(){
   });});
   strategies.forEach((s,j)=>{jobs.push({type:'radar',j:j,s:s});});
 
-  let idx=0;
-  function runNext(){
-    if(idx>=jobs.length){renderAll();return;}
-    let job=jobs[idx];
-    setTimeout(()=>{
-      try{
-        let overrides = job.type==='heat'
-          ? {concurrency:job.c, nreq:Math.min(job.c*1.5,60), seed:p.seed}
-          : {nreq:Math.min(p.concurrency,80), seed:p.seed};
-        let r=runSimulation(job.s, overrides);
-        if(job.type==='heat'){
-          // 无完成请求 → 延迟无定义，显示 ∞ 而非误导性的 0
-          let v = (r.completed > 0 && r.p99 > 0) ? +r.p99.toFixed(0) : null;
-          heatData[job.i*4+job.j]=[job.i,job.j,v];
-        }
-        else radarResults[job.j]=r;
-      }catch(e){
-        if(job.type==='heat') heatData[job.i*4+job.j]=[job.i,job.j,null];
-      }
-      doneJobs++;
-      heatEl.innerHTML='<div class="progress-note">⏳ 交叉分析仿真中... '+doneJobs+'/'+totalJobs+'</div>';
-      idx++; runNext();
-    },0);
+  async function runRemote(){
+    const batch = jobs.map(job => ({ params: p, strategy: job.s, mode: state.strategyMode,
+      overrides: job.type === 'heat'
+        ? { concurrency: job.c, nreq: Math.min(job.c * 1.5, 60), seed: p.seed }
+        : { nreq: Math.min(p.concurrency, 80), seed: p.seed } }));
+    try {
+      await executeBatch(batch, 'batch', { label: '交叉分析', onPoint: point => {
+        const job = jobs[point.index], r = point.result;
+        if (job.type === 'heat') {
+          const v = (r.completed > 0 && r.p99 > 0) ? +r.p99.toFixed(0) : null;
+          heatData[job.i * 4 + job.j] = [job.i, job.j, v];
+        } else radarResults[job.j] = r;
+        doneJobs++;
+        if (crossRequested === fingerprint) heatEl.textContent = '服务器交叉分析中... ' + doneJobs + '/' + totalJobs;
+      } });
+      if (crossRequested === fingerprint) renderAll();
+    } catch (error) {
+      heatEl.textContent = error.message;
+      $('chartRadar').textContent = '任务未完成，请查看服务器任务列表。';
+    } finally {
+      crossRunning = false;
+      if (crossRequested !== fingerprint) void drawCrossAnalysis();
+    }
   }
 
   function renderAll(){
@@ -145,5 +151,5 @@ export function drawCrossAnalysis(){
       '仿真条件: 当前参数 · 请求数=min(请求数,80) · 种子='+p.seed
     );
   }
-  runNext();
+  await runRemote();
 }

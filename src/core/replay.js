@@ -1,5 +1,6 @@
 // @ts-check
 import { mulberry32 } from './math.js';
+import { createReplayRequest } from './requests.js';
 
 /** @typedef {import('../contracts/replay').ReplayBundle} ReplayBundle */
 /** @typedef {import('../contracts/replay').ReplayLimits} ReplayLimits */
@@ -522,4 +523,292 @@ export function orderReplaySessions(entries, orderSeed = 1) {
     for (const layer of visits) if (round < layers[layer].length) ordered.push(layers[layer][round]);
   }
   return ordered;
+}
+
+/** @type {Readonly<import('../contracts/replay').ReplayRunLimits>} */
+export const DEFAULT_REPLAY_RUN_LIMITS = Object.freeze({
+  maxSessions: 10_000,
+  maxRequests: 20_000,
+  maxEvents: 40_000,
+  maxBlockReferences: 2_000_000,
+  maxWallTimeMs: 30_000,
+  maxResultBytes: 32 * 1024 * 1024,
+});
+
+/** @param {Partial<typeof DEFAULT_REPLAY_RUN_LIMITS>} [overrides] */
+export function replayRunLimits(overrides = {}) {
+  record(overrides, 'replay.options.limits');
+  const limits = { ...DEFAULT_REPLAY_RUN_LIMITS };
+  for (const key of Object.keys(overrides)) {
+    if (!Object.hasOwn(limits, key)) invalid(`replay.options.limits.${key}`, 'unknown resource limit');
+    const name = /** @type {keyof typeof limits} */ (key);
+    limits[name] = integer(overrides[name], `replay.options.limits.${key}`, 1);
+  }
+  return limits;
+}
+
+/** @param {unknown} value @param {string} path */
+function positiveSeconds(value, path) {
+  const result = seconds(value, path);
+  if (result === 0) invalid(path, 'expected a positive number');
+  return result;
+}
+
+/** @param {number} seed */
+export function createReplayRandomStreams(seed) {
+  integer(seed, 'replay.seed');
+  if (seed > 0xffffffff) invalid('replay.seed', 'expected a uint32 seed');
+  return { launch: mulberry32((seed ^ 0x6c61756e) >>> 0), route: mulberry32((seed ^ 0x726f7574) >>> 0) };
+}
+
+/** @typedef {{time: number, sequence: number, kind: string, data: any}} ReplayEvent */
+export class ReplayEventHeap {
+  /** @param {number} [limit] */
+  constructor(limit = DEFAULT_REPLAY_RUN_LIMITS.maxEvents) {
+    this.limit = integer(limit, 'replay.maxEvents', 1);
+    /** @type {ReplayEvent[]} */
+    this.items = [];
+    this.sequence = 0;
+  }
+  get size() { return this.items.length; }
+  peek() { return this.items[0]; }
+  /** @param {ReplayEvent} a @param {ReplayEvent} b */
+  before(a, b) { return a.time < b.time || (a.time === b.time && a.sequence < b.sequence); }
+  /** @param {number} time @param {string} kind @param {any} [data] */
+  push(time, kind, data) {
+    seconds(time, 'replay.event.time');
+    budget(this.size + 1, this.limit, 'replay.events');
+    integer(this.sequence + 1, 'replay.event.sequence');
+    const event = { time, kind, data, sequence: this.sequence++ };
+    let i = this.items.length;
+    this.items.push(event);
+    while (i > 0) {
+      const parent = Math.floor((i - 1) / 2);
+      if (!this.before(event, this.items[parent])) break;
+      this.items[i] = this.items[parent];
+      i = parent;
+    }
+    this.items[i] = event;
+    return event;
+  }
+  pop() {
+    if (!this.size) return undefined;
+    const first = this.items[0];
+    const tail = /** @type {ReplayEvent} */ (this.items.pop());
+    if (this.size) {
+      let i = 0;
+      while (2 * i + 1 < this.size) {
+        let child = 2 * i + 1;
+        if (child + 1 < this.size && this.before(this.items[child + 1], this.items[child])) child++;
+        if (!this.before(this.items[child], tail)) break;
+        this.items[i] = this.items[child];
+        i = child;
+      }
+      this.items[i] = tail;
+    }
+    return first;
+  }
+}
+
+let replayRunSequence = 0;
+
+/**
+ * Only one future launch is materialized; consuming a launch never consumes routing randomness.
+ * @param {ReplayBundle} bundle
+ * @param {{qps: number, durationSeconds: number, seed: number, limits?: Partial<typeof DEFAULT_REPLAY_RUN_LIMITS>}} options
+ */
+export function createReplayLauncher(bundle, options) {
+  const stats = validateReplayBundle(bundle);
+  const durationSeconds = positiveSeconds(options.durationSeconds, 'replay.durationSeconds');
+  const qps = positiveSeconds(options.qps, 'replay.qps');
+  const limits = replayRunLimits(options.limits);
+  const random = createReplayRandomStreams(options.seed);
+  const lambdaSession = qps / stats.meanRequestsPerSession;
+  if (!(lambdaSession > 0) || !Number.isFinite(lambdaSession)) invalid('replay.lambdaSession', 'unrepresentable session rate');
+  const runKey = integer(++replayRunSequence, 'replay.runSequence', 1);
+  let time = 0;
+  let launches = 0;
+  let plannedRequests = 0;
+  let blockReferences = 0;
+  const templateBlocks = bundle.sessions.map(session => session.req.reduce((sum, req) => sum + Math.ceil(req.in / 64), 0));
+  /** @type {{time: number, templateIndex: number, launchIndex: number, sessionInstanceKey: string} | null} */
+  let next = null;
+  function advance() {
+    const gap = -Math.log((random.launch() * 0x100000000 + 0.5) / 0x100000000) / lambdaSession;
+    const future = time + gap;
+    if (future >= durationSeconds) { next = null; return; }
+    if (!Number.isFinite(future) || future <= time) invalid('replay.launch.time', 'arrival interval cannot advance the clock');
+    time = future;
+    const templateIndex = launches % stats.sessions;
+    next = { time, templateIndex, launchIndex: launches, sessionInstanceKey: `r${runKey}:t${templateIndex}:n${launches}` };
+  }
+  advance();
+  return {
+    stats, limits, lambdaSession, routeRandom: random.route,
+    peek: () => next,
+    get launches() { return launches; },
+    get plannedRequests() { return plannedRequests; },
+    get blockReferences() { return blockReferences; },
+    take() {
+      if (!next) return null;
+      const event = next;
+      const count = bundle.sessions[event.templateIndex].req.length;
+      budget(launches + 1, limits.maxSessions, 'replay.launchedSessions');
+      budget(add(plannedRequests, count, 'replay.plannedRequests'), limits.maxRequests, 'replay.plannedRequests');
+      budget(add(blockReferences, templateBlocks[event.templateIndex], 'replay.blockReferences'), limits.maxBlockReferences, 'replay.blockReferences');
+      launches++;
+      plannedRequests += count;
+      blockReferences += templateBlocks[event.templateIndex];
+      advance();
+      return event;
+    },
+  };
+}
+
+/** @param {unknown} input @returns {import('../contracts/replay').ReplayOverride} */
+export function validateReplayOverride(input) {
+  const value = fields(input, ['bundle', 'options'], 'replay');
+  validateReplayBundle(value.bundle);
+  budget(JSON.stringify(value.bundle).length, DEFAULT_REPLAY_LIMITS.maxDecompressedBytes, 'replay.bundle.bytes');
+  const options = record(value.options, 'replay.options');
+  const allowed = ['arrivalModel', 'durationSeconds', 'warmupSeconds', 'superblocks', 'limits'];
+  for (const key of Object.keys(options)) if (!allowed.includes(key)) invalid(`replay.options.${key}`, 'unknown option');
+  if (options.arrivalModel !== undefined && options.arrivalModel !== 'closed') invalid('replay.options.arrivalModel', 'only closed is supported');
+  const durationSeconds = positiveSeconds(options.durationSeconds, 'replay.options.durationSeconds');
+  const warmupSeconds = seconds(options.warmupSeconds, 'replay.options.warmupSeconds');
+  if (warmupSeconds >= durationSeconds) invalid('replay.options.warmupSeconds', 'must be less than durationSeconds');
+  if (options.superblocks !== undefined && typeof options.superblocks !== 'boolean') invalid('replay.options.superblocks', 'expected boolean');
+  if (options.superblocks === true) invalid('replay.options.superblocks', 'unsupported before logical-block equivalence validation');
+  const limits = replayRunLimits(options.limits);
+  return { bundle: value.bundle, options: { arrivalModel: 'closed', durationSeconds, warmupSeconds, superblocks: false, limits } };
+}
+
+/**
+ * Request states: waiting anchor, scheduled, arrived, successful, failed, cancelled.
+ * @param {import('../contracts/replay').ReplayOverride} replay
+ * @param {{qps: number, seed: number, hooks?: Record<string, Function>}} config
+ */
+export function createReplayRuntime(replay, config) {
+  const { bundle, options } = validateReplayOverride(replay);
+  const launcher = createReplayLauncher(bundle, { ...options, qps: config.qps, seed: config.seed });
+  const heap = new ReplayEventHeap(launcher.limits.maxEvents);
+  const hooks = config.hooks || {};
+  const templates = bundle.sessions.map(session => {
+    const arrival = session.req.map(() => /** @type {number[]} */ ([]));
+    const completion = session.req.map(() => /** @type {number[]} */ ([]));
+    /** @type {number[]} */
+    const origins = [];
+    session.req.forEach((req, i) => {
+      if (req.timing.kind === 'origin') origins.push(i);
+      else (req.timing.kind === 'arrival' ? arrival : completion)[req.timing.anchorReq].push(i);
+    });
+    return { arrival, completion, origins, inputTokens: session.req.reduce((n, q) => n + q.in, 0), outputTokens: session.req.reduce((n, q) => n + q.out, 0) };
+  });
+  /** @type {Map<string, any>} */
+  const sessions = new Map();
+  const counters = { arrived: 0, successful: 0, failed: 0, cancelled: 0, infeasible: 0, aborted: 0, anchor_unavailable: 0, completedSessions: 0 };
+  const startedAt = performance.now();
+  function checkWallTime() { budget(performance.now() - startedAt, launcher.limits.maxWallTimeMs, 'replay.wallTimeMs'); }
+  function queueLaunch() { const next = launcher.peek(); if (next) heap.push(next.time, 'session-launch', null); }
+  queueLaunch();
+  /** @param {any} session @param {number} index @param {number} base */
+  function release(session, index, base) {
+    if (session.states[index] !== 0) return;
+    const time = base + bundle.sessions[session.templateIndex].req[index].timing.offsetMs / 1000;
+    heap.push(time, 'request-arrival', { key: session.sessionInstanceKey, index });
+    session.states[index] = 1;
+  }
+  /** @param {any} session */
+  function settleSession(session) {
+    session.remaining--;
+    if (session.remaining === 0) {
+      counters.completedSessions++;
+      sessions.delete(session.sessionInstanceKey);
+    }
+  }
+  /** @param {any} session @param {number[]} roots @param {number} time */
+  function cancel(session, roots, time) {
+    const stack = roots.slice();
+    while (stack.length) {
+      const index = /** @type {number} */ (stack.pop());
+      if (session.states[index] !== 0) continue;
+      session.states[index] = 5;
+      counters.cancelled++; counters.anchor_unavailable++;
+      hooks.cancel?.({ templateIndex: session.templateIndex, launchIndex: session.launchIndex, requestIndex: index }, time);
+      for (const child of templates[session.templateIndex].arrival[index]) stack.push(child);
+      for (const child of templates[session.templateIndex].completion[index]) stack.push(child);
+      settleSession(session);
+    }
+  }
+  /** @param {any} req @param {number} time @param {string | null} reason */
+  function terminal(req, time, reason) {
+    const session = sessions.get(req.sessionInstanceKey);
+    if (!session || session.states[req.requestIndex] !== 2) return false;
+    seconds(time, 'replay.terminal.time');
+    if (time < req.arrive) invalid('replay.terminal.time', 'completion precedes client arrival');
+    session.states[req.requestIndex] = reason === null ? 3 : 4;
+    if (reason === null) {
+      counters.successful++;
+      hooks.complete?.(req);
+      for (const index of templates[session.templateIndex].completion[req.requestIndex]) release(session, index, time);
+    } else {
+      counters.failed++;
+      if (reason === 'infeasible') counters.infeasible++;
+      else counters.aborted++;
+      hooks.fail?.(req, reason);
+      cancel(session, templates[session.templateIndex].completion[req.requestIndex], time);
+    }
+    settleSession(session);
+    return true;
+  }
+  return {
+    launcher, options, heap, sessions, checkWallTime,
+    get nextTime() { return heap.peek()?.time ?? Infinity; },
+    get done() { return heap.size === 0 && sessions.size === 0; },
+    /** @param {number} now @param {(req: any) => void} onArrival */
+    drainEvents(now, onArrival) {
+      seconds(now, 'replay.now');
+      while (heap.size && /** @type {ReplayEvent} */ (heap.peek()).time <= now) {
+        checkWallTime();
+        const event = /** @type {ReplayEvent} */ (heap.pop());
+        if (event.kind === 'session-launch') {
+          const launch = launcher.take();
+          if (!launch || event.time !== launch.time) invalid('replay.scheduler', 'launch event invariant violated');
+          const req = bundle.sessions[launch.templateIndex].req;
+          const session = { ...launch, states: new Uint8Array(req.length), remaining: req.length, baseId: launcher.plannedRequests - req.length };
+          sessions.set(session.sessionInstanceKey, session);
+          const template = templates[session.templateIndex];
+          hooks.launch?.({ time: launch.time, templateIndex: launch.templateIndex, launchIndex: launch.launchIndex, requests: req.length, inputTokens: template.inputTokens, outputTokens: template.outputTokens });
+          for (const index of template.origins) release(session, index, launch.time);
+          queueLaunch();
+        } else {
+          const session = sessions.get(event.data.key);
+          if (!session || session.states[event.data.index] !== 1) invalid('replay.scheduler', 'arrival event invariant violated');
+          const index = event.data.index;
+          session.states[index] = 2;
+          counters.arrived++;
+          const request = createReplayRequest(bundle.sessions[session.templateIndex].req[index], session.baseId + index, event.time,
+            { sessionInstanceKey: session.sessionInstanceKey, templateIndex: session.templateIndex, launchIndex: session.launchIndex, requestIndex: index });
+          hooks.arrive?.(request);
+          for (const child of templates[session.templateIndex].arrival[index]) release(session, child, event.time);
+          onArrival(request);
+        }
+      }
+    },
+    /** @param {any} req @param {number} time */
+    complete(req, time) { return terminal(req, time, null); },
+    /** @param {any} req @param {string} reason @param {number} time */
+    fail(req, reason, time) { return terminal(req, time, reason); },
+    counts() {
+      let arrivedUnfinished = 0, pendingArrival = 0, waitingAnchor = 0;
+      for (const session of sessions.values()) for (const state of session.states) {
+        if (state === 0) waitingAnchor++;
+        else if (state === 1) pendingArrival++;
+        else if (state === 2) arrivedUnfinished++;
+      }
+      return { ...counters, planned: launcher.plannedRequests, launchedSessions: launcher.launches,
+        completeCycles: Math.floor(launcher.launches / bundle.sessions.length), activeSessions: sessions.size,
+        arrivedUnfinished, pendingArrival, waitingAnchor, unfinished: arrivedUnfinished + pendingArrival + waitingAnchor };
+    },
+  };
 }

@@ -5,6 +5,10 @@ test-results/
 playwright-report/
 .playwright-cli/
 .codebuddy/refactor-baseline/
+.runtime/
+.env
+.env.*
+!.env.example
 
 # 工具内部数据: 个人工作日志不入库(回归脚本 .workbuddy/*.js 保留)
 .workbuddy/memory/
@@ -82,9 +86,24 @@ sim_race*.js
 
 # 外部克隆源码(分析用, 不入库)
 sglang/
+
+# ════════════════════════════════════════════════════════════════════
+# 2026-09-17 仓库整理：文档 / 数据 / 外部参考 与代码分离
+#   docs/  结论文档与汇报材料（report / ppt / 思维导图 / 组件盘点真理源）
+#   data/  仿真输入、结果与中间产物（测试所需 fixture 已移入 tests/fixtures/）
+#   refs/  外部参考：论文、上游 sglang 克隆、第三方建模系统（约 800MB）
+#   logs/  运行日志（*.log 已覆盖，此处显式声明目录）
+# 三者均由本地/网盘共享，不入版本库；仓库只保留代码与构建配置。
+# ════════════════════════════════════════════════════════════════════
+docs/
 data/*
 !data/replay/
 data/replay/*
 !data/replay/sample.json
 !data/replay/sample.json.gz
 !data/replay/sample.report.json
+!data/replay/sample-config.json
+refs/
+logs/
+.slidep/
+.codebuddy/

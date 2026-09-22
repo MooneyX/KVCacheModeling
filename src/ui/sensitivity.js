@@ -9,9 +9,7 @@ import { state } from "./state.js";
 import { initChart } from "./charts.js";
 import { collectParamsJson, buildParamMeta } from "./parameters.js";
 import { collectSensSnapshot } from "./snapshots.js";
-import { extractSensMetrics } from "../application/metrics.js";
-import { runSimulation } from "../adapters/browser/simulation.js";
-import { createSimulationWorker } from "../execution/browser/worker-factory.ts";
+import { executeBatch, serverVersion } from '../execution/browser/client.ts';
 
 
 
@@ -113,7 +111,21 @@ export function toggleShapeDim() {
 
 
 
-export function runSensitivity() {
+let sensitivityRunning = false;
+export async function runSensitivity() {
+  if (sensitivityRunning) return;
+  sensitivityRunning = true;
+  try { await runSensitivityRemote(); }
+  catch (error) { $('chartSensitivity').textContent = error.message; }
+  finally {
+    sensitivityRunning = false;
+    const button = $('btnRunSens');
+    if (button) { button.disabled = false; button.textContent = '运行敏感性分析'; }
+  }
+}
+
+async function runSensitivityRemote() {
+  if (state.strategyMode === 'js') throw new Error('服务器暂不支持 JavaScript 策略，请选择 DSL。');
   // 按 id 取运行按钮(2026-08-25): 原先用 '#sensitivityPanel .btn' 取面板内第一个 .btn,
   // 依赖 DOM 顺序 —— 一旦有人在其上方加按钮就会误禁用别的按钮。
   let btn = $('btnRunSens') || document.querySelector('#sensitivityPanel .btn');
@@ -202,7 +214,10 @@ export function runSensitivity() {
   // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑；含扫描档位 values（修复 2026-08-11:
   // 旧版漏 values → 改扫描档位重跑命中旧缓存显示旧曲线）
   let paramsFp = getParams(); // 基础参数指纹（含基础 prefixHit/ssdBW，扫描/对比值经 overrides 注入，不在此指纹内）
-  let cacheKey = JSON.stringify([paramsFp, baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, shapeDim, shapeList, gi('pSeed')]);
+  const snapshot = { baseVals: baseValsOf(), paramsJson: collectParamsJson(), paramMeta: buildParamMeta() };
+  const mode = state.strategyMode;
+  const version = await serverVersion();
+  let cacheKey = JSON.stringify([version, mode, paramsFp, baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, shapeDim, shapeList, paramsFp.seed]);
   let cached = state.sensCache[cacheKey];
 
   let chartEl = $('chartSensitivity');
@@ -503,16 +518,16 @@ export function runSensitivity() {
       // points 则把每个点的**完整参数组合**摊平, 不含任何角色信息 ⇒ 导出页可任意重新分配
       // 横轴/颜色/形状(见 buildSensHtml 的透视面板), 且跨批次可按 params 去重合并。
       // ⚠️ params 只含"被扫描的维度"+"基准值不同于默认的关键参数", 完整基准见 paramsJson。
-      points: buildSensPoints(flatCurves, values, param, compareParam, shapeDim, hasPf, shapeList, baseValsOf()),
+      points: buildSensPoints(flatCurves, values, param, compareParam, shapeDim, hasPf, shapeList, snapshot.baseVals),
       // 本次扫描的三个角色分配(导出页透视面板的初始状态)
       roles: { x: param, cmp: compareParam || null, shape: hasPf ? shapeDim : null },
       descHtml: desc, strategyName: baseStrategy.name,
-      dsl: baseStrategy.dsl || '', seed: gi('pSeed'),
+      dsl: baseStrategy.dsl || '', seed: paramsFp.seed,
       // 全参数快照: 导出的 HTML 附带它, 别人拿到图能复现同一次扫描
-      paramsJson: (function(){ try { return collectParamsJson(); } catch(e) { return ''; } })(),
+      paramsJson: snapshot.paramsJson,
       // 参数元信息(2026-08-26): 让导出页能像平台一样**分组 + 中文标签 + 可读值**地展示
       // 参数, 而不是甩一坨 JSON。运行时从 DOM 抽取, 见 buildParamMeta 的设计说明。
-      paramMeta: (function(){ try { return buildParamMeta(); } catch(e) { return {}; } })(),
+      paramMeta: snapshot.paramMeta,
       // _cacheKey: 快照列表的去重依据(与 metric 合成 key)。加下划线前缀表示"内部字段",
       // 不参与导出页的任何展示。
       _cacheKey: cacheKey,
@@ -549,7 +564,7 @@ export function runSensitivity() {
   //       key 改为 [策略s, overrides排序序列化, seed] —— 即**完整仿真输入指纹**。
   //       ⇒ 角色互换 / 横轴与颜色互换 / 档位范围重叠, 一律命中缓存零重跑。
   // ⚠️ 顺序要求: 必须先构造 s/overrides 再算 key(原实现是先算 key 后构造, 已重排)。
-  let jobs = [], filled = 0, cancelled = false;
+  let jobs = [], filled = 0;
   for (let _ci = 0; _ci < (compareParam ? compareVals.length : 1); _ci++) {
     for (let _pi = 0; _pi < (hasPf ? shapeList.length : 1); _pi++) {
       for (let _idx = 0; _idx < values.length; _idx++) {
@@ -557,7 +572,7 @@ export function runSensitivity() {
         let cv = compareParam ? compareVals[_ci] : null;
         let pf = hasPf ? shapeList[_pi] : null;
         let s = JSON.parse(JSON.stringify(baseStrategy));
-        let overrides = { seed: gi('pSeed') }; // 固定种子保证可比
+        let overrides = { seed: paramsFp.seed }; // 固定种子保证可比
         // 三个视觉角色共用同一个落地函数 —— 落地顺序 横轴 → 颜色 → 形状 与原实现一致
         // (后写覆盖先写; 三者已做互斥判定, 正常不会撞同一字段)
         applyParamVal(s, overrides, param, v);
@@ -576,7 +591,7 @@ export function runSensitivity() {
         // ★ 剔除 s.name: 它是纯展示字段(改个策略名不改任何语义), 留着会让重命名后全部失配。
         //   s.dsl 保留 —— 那才是调度语义的权威来源。
         let sFp = JSON.parse(JSON.stringify(s)); delete sFp.name;
-        let pointKey = sortedJson([paramsFp, sFp, overrides]);
+        let pointKey = sortedJson([version, mode, paramsFp, sFp, overrides]);
         let hit = state.sensPointCache[pointKey];
         if (hit !== undefined) {
           if (hasPf) { if (compareParam) results[_ci][_pi][_idx] = hit; else results[_pi][_idx] = hit; }
@@ -604,139 +619,18 @@ export function runSensitivity() {
     if (keys.length >= 20) delete state.sensCache[keys[0]]; // FIFO 淘汰最旧
     paint(results);
   }
-  let workers = [], doneJobs = 0;
-  function restoreBtn() { if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; } }
-  function killWorker() {
-    workers.forEach(function (w) { try { w.terminate(); } catch (e) {} });
-    workers = [];
-  }
-  function showProg() {
-    let nw = workers.length;
-    chartEl.innerHTML = '<div class="progress-note">⏳ 敏感性分析运行中'
-      + (nw ? '(后台 ' + nw + ' 个 Worker 并行, 页面可操作)' : '') + '... ' + filled + '/' + totalRuns
-      + ' <span style="cursor:pointer;color:var(--accent4);text-decoration:underline" id="sensCancelBtn">✕ 取消</span></div>';
-    let cb = document.getElementById('sensCancelBtn');
-    if (cb) cb.onclick = function() {
-      cancelled = true;
-      killWorker();
-      chartEl.innerHTML = '<div class="progress-note">⚠ 已取消（完成 ' + filled + '/' + totalRuns + '，已完成的点已入点级缓存，重新运行可续用）</div>';
-      restoreBtn();
-    };
-  }
-
-  if (!jobs.length) { finish(); return; } // 全部点级缓存命中: 零仿真
-
-  // 主线程兜底路径(Worker 不可用/JS 策略钩子不可克隆/Worker 运行时报错): setTimeout 逐点让出主线程
-  function runInline(fromJob) {
-    let i = fromJob;
-    function stepFn() {
-      if (cancelled) return;
-      if (i >= jobs.length) { finish(); return; }
-      let job = jobs[i];
-      let rec = null;
-      try { rec = extractSensMetrics(runSimulation(job.s, job.overrides)); } catch(e) { rec = null; }
-      storePoint(job, rec);
-      doneJobs = ++i; filled++;
-      showProg();
-      setTimeout(stepFn, 0);
-    }
-    setTimeout(stepFn, 0);
-  }
-
-  // JS 策略含函数钩子(不可结构化克隆, 且 Worker 内 strategyMode 恒为 dsl 会静默丢钩子) → 回退主线程
-  let canWorker = (typeof Worker !== 'undefined') && (typeof Blob !== 'undefined') && (typeof URL !== 'undefined' && URL.createObjectURL)
-    && state.strategyMode !== 'js';
-
-  // ======================== Worker 池并行扫描(2026-08-27) ========================
-  // 原实现是**单 Worker 串行**: 把整个 jobs 数组丢进去, Worker 内一个 for 循环逐点跑完。
-  // 于是无论机器有多少核, 扫描永远只用 1 个 —— 40 点的典型扫描实测 8 分钟, 7 个核全程空闲。
-  //
-  // ★ 为什么必须**动态派发**而不是静态均分:
-  //   单点耗时与参数强相关, 实测 GLM-5.1@h20x8 in=32k 下从 0.9s(命中95%) 到 26.5s(命中0%),
-  //   差 **30×**。按下标轮转均分会让"分到一堆低命中率点"的那个 Worker 成为长尾,
-  //   其余 Worker 早早空转 ⇒ 实际加速远低于核数。改为"空闲即领下一个"可自然抹平差异。
-  //
-  // ★ 并发数取 min(hardwareConcurrency - 1, jobs 数, POOL_MAX):
-  //   · 留 1 核给主线程/UI —— 全占满会让进度条与取消按钮卡顿, 体验上像"卡死了"
-  //   · 不超过任务数 —— 3 个点开 8 个 Worker 纯属浪费(每个 Worker 要编译 ~370KB 源码)
-  //   · 上限 POOL_MAX: 每个 Worker 都独立编译整份引擎源码, 内存与编译时间线性增长,
-  //     超过 8 个后编译成本开始吃掉并行收益
-  const SENS_POOL_MAX = 8;
-  function sensPoolSize(nJobs) {
-    let hc = 4;   // 取不到时的保守默认(老浏览器/无头环境)
-    try { if (navigator && navigator.hardwareConcurrency) hc = navigator.hardwareConcurrency; } catch (e) {}
-    return Math.max(1, Math.min(hc - 1, nJobs, SENS_POOL_MAX));
-  }
-
-  if (canWorker) {
-    try {
-      let nPool = sensPoolSize(jobs.length);
-      for (let wi = 0; wi < nPool; wi++) workers.push(createSimulationWorker());
-    } catch(e) { canWorker = false; killWorker(); }
-  }
-  showProg();
-  if (!canWorker || !workers.length) { runInline(0); return; }
-
-  // ---- 任务队列 + 动态派发 ----
-  // nextJob 是共享游标; 每个 Worker 回传一个点后立刻领取下一个, 直到队列空。
-  // 与旧实现的协议差异: 旧版一次性 postMessage 全部 jobs, 新版每次只发一个 job。
-  // Worker 消息处理器仍接受 jobs 数组；单发为长度 1 的数组。
-  let nextJob = 0;
-  function dispatch(w) {
-    if (cancelled) return;
-    if (nextJob >= jobs.length) return;   // 队列空 ⇒ 该 Worker 就此空闲(不终止, 留给 done 统一收)
-    let job = jobs[nextJob++];
-    w._job = job;                         // 记住它在跑哪个, 便于 onerror 时把该点退回队列
-    w.postMessage({ type: 'scan', params: paramsFp, jobs: [job] });
-  }
-  function maybeFinish() {
-    // 全部点都已回传 ⇒ 收工。用 doneJobs 计数而非"Worker 都空闲", 后者在
-    // 派发竞态下可能提前为真(某 Worker 刚领到任务还没开始跑)。
-    if (doneJobs >= jobs.length && !cancelled) {
-      killWorker();
-      finish();
-      return true;
-    }
-    return false;
-  }
-  workers.forEach(function (w) {
-    w.onmessage = function (ev) {
-      let m = ev.data;
-      if (!m || cancelled) return;
-      if (m.type === 'point') {
-        // storePoint 用消息里带回的 ci/pi/idx 定位, 与派发顺序无关 ⇒ 乱序回传不会错位。
-        // 这是并行化能安全落地的前提: 结果写入是按坐标寻址, 不是按到达顺序 append。
-        storePoint(m, m.rec);
-        doneJobs++; filled++;
-        showProg();
-      } else if (m.type === 'done') {
-        // 该 Worker 完成本次派发(1 个点) ⇒ 立刻领下一个
-        if (maybeFinish()) return;
-        dispatch(w);
-      }
-    };
-    w.onerror = function () {
-      // 单个 Worker 挂了: 把它正在跑的点退回队列, 由其他 Worker 接手; 池空了才回退主线程。
-      // ⚠️ 不能像旧实现那样直接 runInline(doneJobs) —— 并行下 doneJobs 与 jobs 下标
-      //    不再一一对应(乱序完成), 从 doneJobs 续跑会漏点/重跑。
-      //    改为: 用**点级缓存**判定"哪些点已真正完成"(storePoint 会写缓存), 剩下的重跑。
-      if (cancelled) return;
-      try { w.terminate(); } catch (e) {}
-      let at = workers.indexOf(w);
-      if (at >= 0) workers.splice(at, 1);
-      if (!workers.length) {
-        // 全部 Worker 都失败 ⇒ 主线程兜底跑**尚未完成**的点(按缓存判定, 与派发顺序无关)
-        killWorker();
-        let rest = jobs.filter(function (j) { return state.sensPointCache[j.key] === undefined; });
-        if (!rest.length) { finish(); return; }
-        jobs = rest; nextJob = 0;
-        runInline(0);
-      } else if (w._job && state.sensPointCache[w._job.key] === undefined) {
-        // 还有存活 Worker ⇒ 把这个未完成的点重新排到队尾, 交给下一个空闲者
-        jobs.push(w._job);
-      }
-    };
+  if (!jobs.length) { finish(); return; }
+  const controller = new AbortController();
+  chartEl.replaceChildren();
+  const note = document.createElement("span");
+  const cancel = document.createElement("button");
+  cancel.id = "sensCancelBtn"; cancel.className = "btn btn-sm"; cancel.textContent = "取消服务器计算";
+  cancel.onclick = () => { cancel.disabled = true; controller.abort(); };
+  chartEl.append(note, cancel);
+  await executeBatch(jobs.map(job => ({ params: paramsFp, strategy: job.s, overrides: job.overrides, mode })), "scan", {
+    label: paramLabel + "敏感性扫描", signal: controller.signal,
+    onTask: task => { note.textContent = "服务器任务 " + task.status + " · 已完成 " + filled + "/" + totalRuns + " "; },
+    onPoint: point => { storePoint(jobs[point.index], point.result); filled++; },
   });
-  // 初始派发: 每个 Worker 领一个点起跑
-  workers.forEach(dispatch);
+  finish();
 }
