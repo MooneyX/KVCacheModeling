@@ -4,12 +4,20 @@ import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { once } from 'node:events';
+import { buildSync } from 'esbuild';
 import { runSimulation } from '../../src/core/simulation.js';
+import { calcAll } from '../../src/core/calculations.js';
+import { DEFAULT_REPLAY_RUN_LIMITS, flattenReplaySession, compileReplaySession } from '../../src/core/replay.js';
 import { extractSensMetrics } from '../../src/application/metrics.js';
 
 const require = createRequire(import.meta.url);
 const { createTaskServer } = require('../../dist/node/server-library.cjs');
+const library = require('../../dist/node/library.cjs');
+const { outputFiles } = buildSync({ entryPoints: [resolve('src/execution/server/input.ts')], bundle: true, write: false, format: 'esm', platform: 'node', target: 'node22' });
+const { validateSubmission } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
 const fixtures = JSON.parse(readFileSync(new URL('../fixtures/simulation-baseline.json', import.meta.url), 'utf8'));
+const replayFixture = JSON.parse(readFileSync(new URL('../fixtures/replay/runtime-prefix.json', import.meta.url)));
+const interleaved = JSON.parse(readFileSync(new URL('../fixtures/replay/session-interleaved.json', import.meta.url)));
 const runner = resolve('dist/node/runner.cjs');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -37,6 +45,41 @@ async function waitTask(app, id) {
   throw new Error('Task did not complete');
 }
 const submission = (jobs = [fixtures[0]], kind = 'simulation') => ({ kind, jobs, label: 'regression', requestId: crypto.randomUUID() });
+const replayJob = (bundle = replayFixture.bundle, overrides = {}, options = {}) => ({
+  params: structuredClone(fixtures[0].params), strategy: structuredClone(fixtures[0].strategy), mode: 'dsl',
+  overrides: { seed: 42, qps: bundle.sessions[0].req.length * 2, blockSize: 64, simMaxTime: 5, ...overrides,
+    replay: { bundle: structuredClone(bundle), options: { durationSeconds: 0.2, warmupSeconds: 0, ...options } },
+  },
+});
+const replayRequest = (input, id, kind = 'origin', anchorReq = null, offsetMs = 0) => ({
+  in: input, out: 0, blockRuns: [[id, Math.ceil(input / 64)]], timing: { kind, anchorReq, offsetMs },
+});
+const replayBundle = req => ({ version: 1, blockSize: 64, sessions: [{ req }] });
+const serverReplayLimits = config => ({
+  ...DEFAULT_REPLAY_RUN_LIMITS,
+  maxRequests: Math.min(DEFAULT_REPLAY_RUN_LIMITS.maxRequests, config.maxRequests),
+  maxWallTimeMs: Math.min(DEFAULT_REPLAY_RUN_LIMITS.maxWallTimeMs, config.timeoutMs),
+  maxResultBytes: Math.min(DEFAULT_REPLAY_RUN_LIMITS.maxResultBytes, config.resultBytes),
+});
+function freeze(value) {
+  if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
+  return value;
+}
+async function completedReplay(app, job) {
+  const response = await app.request('/api/tasks', 'POST', submission([job]));
+  assert.equal(response.status, 202, await response.clone().text());
+  const task = await response.json();
+  const finished = await waitTask(app, task.id);
+  assert.equal(finished.status, 'completed', finished.error);
+  assert.equal(finished.completed, 1);
+  const downloaded = await (await app.request(`/api/tasks/${task.id}/download`)).json();
+  const result = downloaded.points[0].result;
+  assert.ok(result.replay);
+  assert.deepEqual(result, JSON.parse(JSON.stringify(library.executeJob(library.parseJob(downloaded.input.jobs[0])))));
+  const points = await (await app.request(`/api/tasks/${task.id}/points`)).json();
+  assert.deepEqual(points.points[0].result, result);
+  return { result, downloaded };
+}
 
 test('server executes identical results, deduplicates submission and scopes task ownership', async () => {
   const app = await setup();
@@ -112,4 +155,247 @@ test('server rejects JS, malformed workload, unauthenticated access and cross-or
     assert.equal((await app.request('/src/core/simulation.js')).status, 404);
     assert.equal((await app.request('/.runtime/tasks/session-secret')).status, 404);
   } finally { await app.dispose(); }
+});
+
+test('M1: replay budgets clamp every limit without mutating frozen submissions', () => {
+  const generous = { maxJobs: 100, maxRequests: Number.MAX_SAFE_INTEGER, timeoutMs: Number.MAX_SAFE_INTEGER, resultBytes: Number.MAX_SAFE_INTEGER };
+  const restricted = { ...generous, maxRequests: 100, timeoutMs: 5000, resultBytes: 1024 * 1024 };
+  for (const config of [generous, restricted]) {
+    const caps = serverReplayLimits(config);
+    const smaller = Object.fromEntries(Object.entries(caps).map(([key, value]) => [key, Math.floor(value / 2)]));
+    const oversized = Object.fromEntries(Object.keys(caps).map(key => [key, Number.MAX_SAFE_INTEGER]));
+    const mixed = Object.fromEntries(Object.entries(caps).map(([key, value], i) => [key, i % 2 ? value * 2 : Math.floor(value / 2)]));
+    for (const requested of [undefined, {}, caps, oversized, smaller, { maxRequests: 1 }, mixed]) {
+      const job = replayJob(undefined, {}, requested === undefined ? {} : { limits: requested });
+      const input = freeze(submission([job]));
+      const before = structuredClone(input);
+      const normalized = validateSubmission(input, freeze(config));
+      const actual = normalized.jobs[0].overrides.replay.options.limits;
+      for (const key of Object.keys(caps)) assert.equal(actual[key], Math.min(requested?.[key] ?? DEFAULT_REPLAY_RUN_LIMITS[key], caps[key]), key);
+      assert.deepEqual(input, before);
+      assert.notStrictEqual(normalized, input);
+      assert.notStrictEqual(normalized.jobs[0], job);
+      assert.notStrictEqual(normalized.jobs[0].overrides, job.overrides);
+      assert.notStrictEqual(normalized.jobs[0].overrides.replay, job.overrides.replay);
+      assert.notStrictEqual(normalized.jobs[0].overrides.replay.options, job.overrides.replay.options);
+      assert.notStrictEqual(actual, requested);
+    }
+  }
+});
+
+test('M1: HTTP worker returns complete deterministic replay results for shared prefix and interleaved anchors', async () => {
+  const app = await setup();
+  try {
+    const { result } = await completedReplay(app, replayJob());
+    assert.equal(result.completed, replayFixture.expected.requests);
+    assert.equal(result.replay.counts.launchedSessions, 1);
+    assert.equal(result.replay.windows.measurement.cache.hitL1Tokens, replayFixture.expected.hitL1Tokens);
+    assert.equal(result.replay.cache.inputPages, replayFixture.expected.residentInputPages);
+    assert.deepEqual(result.replay.state.limits, serverReplayLimits(app.config));
+    assert.ok(result.replay.configuration.bundleDigest);
+    assert.ok(result.replay.samples.series.length > 0);
+    assert.deepEqual(Object.keys(result.replay.windows).sort(), ['drain', 'full', 'measurement', 'warmup']);
+    const compiled = { version: 1, blockSize: 64, sessions: [compileReplaySession(flattenReplaySession(interleaved)).session] };
+    assert.ok(compiled.sessions[0].req.some(req => req.timing.kind === 'arrival'));
+    const replay = await completedReplay(app, replayJob(compiled, {}, { warmupSeconds: 0.1 }));
+    assert.equal(replay.result.completed, 4);
+    assert.equal(replay.result.truncated, false);
+    assert.equal(replay.result.replay.counts.planned, 4);
+    const mixed = replayBundle([replayRequest(128, 0), replayRequest(64, 2, 'arrival', 0), replayRequest(64, 3, 'completion', 0)]);
+    const timeline = (await completedReplay(app, replayJob(mixed))).result.timeline;
+    const requests = new Map(timeline.map(req => [req.id, req]));
+    assert.equal(requests.size, 3);
+    assert.equal(requests.get(1).arrive, requests.get(0).arrive);
+    assert.equal(requests.get(2).arrive, requests.get(0).completeTime);
+  } finally { await app.dispose(); }
+});
+
+test('M1: replay ignores synthetic scale limits, but synthetic simulation, batch and scan retain them', async () => {
+  const app = await setup({ maxRequests: 3 });
+  try {
+    const ignored = { nreq: Number.MAX_SAFE_INTEGER, concurrency: Number.MAX_SAFE_INTEGER, inputLen: -100, outputLen: -100 };
+    const { result } = await completedReplay(app, replayJob(undefined, ignored));
+    assert.equal(result.completed, 3);
+    const withoutNreq = replayJob(undefined, ignored); delete withoutNreq.overrides.nreq;
+    assert.equal((await completedReplay(app, withoutNreq)).result.completed, 3);
+    for (const kind of ['simulation', 'batch', 'scan']) {
+      for (const overrides of [{ nreq: 4 }, { concurrency: 4 }, { nreq: 1, inputLen: 0 }, { nreq: 1, outputLen: -1 }, { nreq: 1, simMaxTime: 0.5 }]) {
+        const response = await app.request('/api/tasks', 'POST', submission([{ ...fixtures[0], overrides }], kind));
+        assert.equal(response.status, 400, `${kind}: ${JSON.stringify(overrides)}`);
+      }
+      const response = await app.request('/api/tasks', 'POST', submission([{ ...fixtures[0], overrides: { nreq: 1 } }], kind));
+      assert.equal(response.status, 202);
+      const task = await response.json();
+      assert.equal((await waitTask(app, task.id)).status, 'completed');
+    }
+    const pool = replayBundle([replayRequest(64, 0)]);
+    pool.sessions.push({ req: [replayRequest(64, 1), replayRequest(64, 2), replayRequest(64, 3)] });
+    const run = await completedReplay(app, replayJob(pool, { qps: 4 }));
+    assert.equal(run.result.replay.source.requests, 4);
+    assert.equal(run.result.replay.counts.planned, 1);
+  } finally { await app.dispose(); }
+});
+
+test('M1: HTTP replay uses default, larger, partial, smaller and mixed budgets with server caps', async () => {
+  const app = await setup({ maxRequests: 100, timeoutMs: 10_000, resultBytes: 2 * 1024 * 1024 });
+  try {
+    const caps = serverReplayLimits(app.config);
+    const huge = Object.fromEntries(Object.keys(caps).map(key => [key, Number.MAX_SAFE_INTEGER]));
+    const smaller = Object.fromEntries(Object.entries(caps).map(([key, value]) => [key, Math.floor(value / 2)]));
+    for (const limits of [undefined, {}, huge, smaller, { maxRequests: 5 }, { ...huge, maxSessions: 2, maxEvents: 10 }]) {
+      const job = replayJob(undefined, {}, limits === undefined ? {} : { limits });
+      const before = structuredClone(job);
+      const { result, downloaded } = await completedReplay(app, job);
+      const expected = Object.fromEntries(Object.entries(caps).map(([key, value]) => [key, Math.min(limits?.[key] ?? DEFAULT_REPLAY_RUN_LIMITS[key], value)]));
+      assert.deepEqual(result.replay.state.limits, expected);
+      assert.deepEqual(downloaded.input.jobs[0].overrides.replay.options.limits, expected);
+      assert.deepEqual(job, before);
+    }
+    for (const seed of [0, 0xffffffff]) {
+      const job = replayJob(undefined, { seed, qps: 1e-12, simMaxTime: 0.7 }, { durationSeconds: 0.3, warmupSeconds: 0.1 });
+      const { result } = await completedReplay(app, job);
+      assert.equal(result.replay.configuration.seed, seed);
+      assert.equal(result.replay.configuration.hardCutoff, 1);
+      assert.equal(result.totalReqs, 0);
+      assert.equal(result.truncated, false);
+    }
+    const inherited = replayJob(undefined, { qps: 1e-12 });
+    Object.assign(inherited.params, { seed: 0, qps: 1e-12, blockSize: 64, simMaxTime: 0.25 });
+    for (const key of ['seed', 'qps', 'blockSize', 'simMaxTime']) delete inherited.overrides[key];
+    assert.equal((await completedReplay(app, inherited)).result.replay.configuration.seed, 0);
+  } finally { await app.dispose(); }
+});
+
+test('M1: HTTP rejects malformed replay bundles, options, configurations and multi-job submissions', async () => {
+  const app = await setup();
+  try {
+    const rejectJob = async (job, pattern) => {
+      const response = await app.request('/api/tasks', 'POST', submission([job]));
+      const body = await response.json();
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.match(body.error, pattern);
+    };
+    for (const [overrides, pattern] of [
+      [{ instances: 2 }, /single instance/], [{ blockSize: 32 }, /64-token/], [{ pdMode: 2 }, /P\/D/],
+      [{ qps: 0 }, /QPS/], [{ qps: -1 }, /QPS/], [{ qps: '2' }, /qps/], [{ qps: null }, /qps/],
+      [{ seed: -1 }, /uint32/], [{ seed: 0x100000000 }, /uint32/], [{ seed: 0.5 }, /uint32/], [{ seed: '0' }, /seed/],
+      [{ simMaxTime: -0.1 }, /drain/], [{ simMaxTime: null }, /simMaxTime/],
+      [{ gpus: 100001 }, /dimensions/], [{ gpus: 0 }, /gpus/], [{ gpus: 1.5 }, /gpus/],
+      [{ layers: 0 }, /layers/], [{ concurrency: 0 }, /concurrency/], [{ nreq: 0 }, /nreq/],
+      [{ nreq: '1000000' }, /nreq/], [{ inputLen: '64' }, /inputLen/], [{ outputLen: null }, /outputLen/], [{ hbmPerGpu: '96' }, /hbmPerGpu/],
+    ]) await rejectJob(replayJob(undefined, overrides), pattern);
+    for (const source of ['params', 'overrides']) {
+      for (const [key, value, pattern] of [['instances', 2, /single instance/], ['blockSize', 32, /64-token/], ['pdMode', 2, /P\/D/], ['qps', 0, /QPS/], ['seed', -1, /uint32/], ['simMaxTime', -1, /drain/]]) {
+        const job = replayJob(); delete job.overrides[key]; job[source][key] = value;
+        await rejectJob(job, pattern);
+      }
+    }
+    for (const size of [0, -1, 1.5, '8', null, Number.MAX_SAFE_INTEGER + 1]) {
+      const job = replayJob(); job.strategy.batching.max_batch_size = size;
+      await rejectJob(job, /batch size/);
+    }
+    const js = replayJob(); js.mode = 'js'; await rejectJob(js, /DSL only/);
+    for (const options of [
+      { durationSeconds: 0 }, { durationSeconds: -1 }, { durationSeconds: null }, { durationSeconds: '1' },
+      { warmupSeconds: -1 }, { warmupSeconds: 0.2 }, { warmupSeconds: 1 }, { warmupSeconds: null },
+      { arrivalModel: 'open' }, { superblocks: true }, { superblocks: 'false' }, { extra: 1 },
+      { limits: null }, { limits: [] }, { limits: { unknown: 1 } },
+    ]) await rejectJob(replayJob(undefined, {}, options), /replay\.options/);
+    for (const key of Object.keys(DEFAULT_REPLAY_RUN_LIMITS)) {
+      for (const value of [0, -1, 1.5, '1', Number.MAX_SAFE_INTEGER + 1]) {
+        await rejectJob(replayJob(undefined, {}, { limits: { [key]: value } }), /replay\.options\.limits/);
+      }
+    }
+    const invalidBundle = JSON.parse(readFileSync(new URL('../fixtures/replay/bundle-invalid.json', import.meta.url)));
+    for (const bundle of [null, {}, { ...replayFixture.bundle, version: 2 }, { ...replayFixture.bundle, blockSize: 32 }, { ...replayFixture.bundle, sessions: [] }, invalidBundle,
+      replayBundle([{ ...replayRequest(128, 0), blockRuns: [[0, 1]] }]), replayBundle([replayRequest(64, 0, 'origin', null, -1)]),
+    ]) {
+      const job = replayJob(); job.overrides.replay.bundle = bundle;
+      await rejectJob(job, /bundle/);
+    }
+    for (const replay of [null, {}, { bundle: replayFixture.bundle }, { ...replayJob().overrides.replay, extra: 1 }]) {
+      const job = replayJob(); job.overrides.replay = replay;
+      await rejectJob(job, /replay/);
+    }
+    for (const kind of ['batch', 'scan']) {
+      for (const jobs of [[replayJob()], [fixtures[0], replayJob()], [replayJob(), fixtures[0]], [{ pBlockSize: '64', overrides: replayJob().overrides }]]) {
+        const response = await app.request('/api/tasks', 'POST', submission(jobs, kind));
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /single simulation/);
+      }
+    }
+    assert.equal((await app.request('/api/tasks', 'POST', submission([replayJob(), replayJob()]))).status, 400);
+    assert.deepEqual(await (await app.request('/api/tasks')).json(), []);
+    for (const key of ['qps', 'seed', 'simMaxTime']) {
+      for (const value of [NaN, Infinity, -Infinity]) {
+        assert.throws(() => validateSubmission(submission([replayJob(undefined, { [key]: value })]), app.config), /finite/);
+      }
+    }
+  } finally { await app.dispose(); }
+});
+
+test('M1: D=0 reaches the worker hard cutoff and failed anchors retain their existing semantics', async () => {
+  const app = await setup();
+  try {
+    const bundle = replayBundle([replayRequest(128, 0), replayRequest(64, 2, 'arrival', 0, 10_000), replayRequest(64, 3, 'completion', 0)]);
+    const { result } = await completedReplay(app, replayJob(bundle, { simMaxTime: 0 }, { durationSeconds: 0.13 }));
+    assert.equal(result.simEnd, 0.13);
+    assert.equal(result.truncated, true);
+    assert.equal(result.replay.state.terminationReason, 'hard_cutoff');
+    assert.equal(result.replay.counts.arrivedUnfinished, 1);
+    assert.equal(result.replay.counts.pendingArrival, 1);
+    assert.equal(result.replay.counts.waitingAnchor, 1);
+    assert.equal(result.replay.counts.unfinished, 3);
+    const capacity = calcAll({ ...fixtures[0].params, blockSize: 64 });
+    const pages = Math.floor(capacity.availHbm / capacity.blockBytes) + 1;
+    const failure = replayBundle([replayRequest(pages * 64, 0), replayRequest(64, pages, 'completion', 0), replayRequest(64, pages + 1, 'arrival', 0)]);
+    const failed = (await completedReplay(app, replayJob(failure))).result;
+    assert.equal(failed.replay.counts.infeasible, 1);
+    assert.equal(failed.replay.counts.failed, 1);
+    assert.equal(failed.replay.counts.cancelled, 1);
+    assert.equal(failed.replay.counts.anchor_unavailable, 1);
+    assert.equal(failed.completed, 1);
+  } finally { await app.dispose(); }
+});
+
+test('M1: worker capacity and runtime resource errors do not produce successful replay results', async () => {
+  const app = await setup({ maxRequests: 3 });
+  try {
+    const hardware = calcAll({ ...fixtures[0].params, blockSize: 64 });
+    const hbmPerGpu = (hardware.modelWeightBytes + hardware.overhead + 2.5 * hardware.blockBytes) / fixtures[0].params.gpus / 1e9;
+    const pressure = replayBundle([replayRequest(128, 0), replayRequest(128, 2, 'completion', 0)]);
+    const jobs = [
+      [replayJob(pressure, { hbmPerGpu }), /replay\.capacity.*HBM pressure/],
+      [replayJob(undefined, { qps: 30 }), /replay\.plannedRequests.*limit/],
+      [replayJob(undefined, { qps: 30 }, { limits: { maxSessions: 1 } }), /replay\.launchedSessions.*limit/],
+      [replayJob(undefined, {}, { limits: { maxRequests: 2 } }), /replay\.plannedRequests.*limit/],
+      [replayJob(replayBundle([replayRequest(64, 0), replayRequest(64, 1)]), {}, { limits: { maxEvents: 1 } }), /replay\.events.*limit/],
+      [replayJob(undefined, {}, { limits: { maxBlockReferences: 1 } }), /replay\.blockReferences.*limit/],
+      [replayJob(undefined, {}, { limits: { maxResultBytes: 1 } }), /replay\.result.*limit/],
+    ];
+    for (const [job, pattern] of jobs) {
+      const response = await app.request('/api/tasks', 'POST', submission([job]));
+      assert.equal(response.status, 202, await response.clone().text());
+      const task = await response.json();
+      const finished = await waitTask(app, task.id);
+      assert.equal(finished.status, 'failed', String(pattern));
+      assert.match(finished.error, pattern);
+      assert.equal(finished.completed, 0);
+      assert.deepEqual((await (await app.request(`/api/tasks/${task.id}/points`)).json()).points, []);
+      assert.deepEqual((await (await app.request(`/api/tasks/${task.id}/download`)).json()).points, []);
+    }
+  } finally { await app.dispose(); }
+  const smallBody = await setup({ bodyBytes: 256 });
+  try {
+    assert.equal((await smallBody.request('/api/tasks', 'POST', submission([replayJob()]))).status, 413);
+    assert.deepEqual(await (await smallBody.request('/api/tasks')).json(), []);
+  } finally { await smallBody.dispose(); }
+  const short = await setup({ timeoutMs: 1 });
+  try {
+    const response = await short.request('/api/tasks', 'POST', submission([replayJob()]));
+    assert.equal(response.status, 202);
+    const task = await waitTask(short, (await response.json()).id);
+    assert.equal(task.status, 'failed');
+    assert.equal(task.completed, 0);
+  } finally { await short.dispose(); }
 });
