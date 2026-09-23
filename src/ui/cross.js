@@ -5,6 +5,7 @@ import { parseDSL } from "../core/strategy.js";
 import { strategyPresets } from "../core/presets.js";
 import { executeBatch } from '../execution/browser/client.ts';
 import { initChart, setFormula } from "./charts.js";
+import { allowSyntheticAnalysis, updateRunControls } from './replay.js';
 
 
 
@@ -15,30 +16,32 @@ export function refreshCrossTab(){
   if (window.__crossAnalyzed) return;
   $('chartHeatmap').innerHTML = '<div class="progress-note" style="padding:28px 16px;text-align:center;line-height:2">'+
     '交叉分析需运行 <b>24</b> 次「策略 × 并发」仿真 + <b>4</b> 次综合评分仿真<br>'+
-    '计算在服务器独立进程执行，任务提交后可关闭页面，在任务列表下载结果<br><br>'+
-    '<button class="btn" onclick="runCrossAnalysis()" style="font-size:.85rem">▶️ 按需运行交叉分析</button></div>';
+    '计算在服务器独立进程执行，任务提交后可关闭页面，在任务列表下载结果</div>';
   $('chartRadar').innerHTML = '';
   $('formulaHeatmap').innerHTML = '';
   $('formulaRadar').innerHTML = '';
+  updateRunControls();
 }
 
 
 export function runCrossAnalysis(){
+  if (!allowSyntheticAnalysis('crossStatus')) return;
   window.__crossAnalyzed = true;
-  drawCrossAnalysis();
+  return drawCrossAnalysis();
 }
 
 
 
 // 热力图+雷达图共用一批真实仿真（异步执行避免阻塞UI）
-let crossRunning = false;
 let crossRequested = '';
 export async function drawCrossAnalysis(){
+  if (!allowSyntheticAnalysis('crossStatus')) return;
   let p=getParams();
   const fingerprint = JSON.stringify([p, state.savedStrategies, state.strategyMode]);
   crossRequested = fingerprint;
-  if (crossRunning) return;
-  crossRunning = true;
+  if (state.crossRunning) return;
+  state.crossRunning = true;
+  updateRunControls();
   let presetNames=['Pure-HBM','HBM+DRAM','Tiered-3L','Aggressive'];
   let strategies=[];
   state.savedStrategies.slice(0,4).forEach(s=>strategies.push(s));
@@ -79,7 +82,8 @@ export async function drawCrossAnalysis(){
       heatEl.textContent = error.message;
       $('chartRadar').textContent = '任务未完成，请查看服务器任务列表。';
     } finally {
-      crossRunning = false;
+      state.crossRunning = false;
+      updateRunControls();
       if (crossRequested !== fingerprint) void drawCrossAnalysis();
     }
   }

@@ -6,11 +6,36 @@ import { sensSnapSelected, sensSnapKeyOf } from "./snapshots.js";
 
 
 
+let sensExportReady = false;
+const replayExportRestriction = '最近一次运行结果为 Replay，旧 HTML 报告和敏感性图片导出不适用；请使用结果区的“下载完整结果 JSON”。切换输入不会改变结果来源。';
+const isReplayResult = () => !!state.simResults[0]?.replay;
+
+export function refreshSensExportControls() {
+  const blocked = isReplayResult();
+  for (const id of ['btnSensExportPng', 'btnSensExportJpg', 'btnSensExportHtml']) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.disabled = blocked || !sensExportReady;
+      if (el.dataset.syntheticTitle === undefined) el.dataset.syntheticTitle = el.title;
+      el.title = blocked ? replayExportRestriction : el.dataset.syntheticTitle;
+    }
+  }
+  const note = document.getElementById('sensExportRestriction');
+  if (note) { note.hidden = !blocked; note.textContent = blocked ? replayExportRestriction : ''; }
+  const status = document.getElementById('sensExportNote');
+  if (!blocked && status?.textContent === replayExportRestriction) status.textContent = '';
+}
+
 export function setSensExportEnabled(on) {
-  ['btnSensExportPng', 'btnSensExportJpg', 'btnSensExportHtml'].forEach(function (id) {
-    let el = document.getElementById(id);
-    if (el) el.disabled = !on;
-  });
+  sensExportReady = !!on;
+  refreshSensExportControls();
+}
+
+function allowSensExport() {
+  if (!isReplayResult()) return true;
+  refreshSensExportControls();
+  sensExportNote(replayExportRestriction, true);
+  return false;
 }
 
 
@@ -54,6 +79,7 @@ export function sensExportNote(msg, isErr) {
 
 // ---- PNG / JPG ----
 export function exportSensImage(type) {
+  if (!allowSensExport()) return;
   let el = document.getElementById('chartSensitivity');
   let ch = (el && window.echarts) ? echarts.getInstanceByDom(el) : null;
   if (!ch || !state.sensExportState) { sensExportNote('⚠ 请先运行一次敏感性分析', true); return; }
@@ -70,11 +96,15 @@ export function exportSensImage(type) {
   }
 }
 
-export function buildSensHtml(snapList) { return renderSensHtml(state.sensExportState, snapList); }
+export function buildSensHtml(snapList) {
+  if (isReplayResult()) throw new Error(replayExportRestriction);
+  return renderSensHtml(state.sensExportState, snapList);
+}
 
 
 
 export function exportSensHtml() {
+  if (!allowSensExport()) return;
   if (!state.sensExportState) { sensExportNote('⚠ 请先运行一次敏感性分析', true); return; }
   try {
     // 快照列表(2026-08-27): 勾选的**全部**扫描一并打包。

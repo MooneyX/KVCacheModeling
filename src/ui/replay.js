@@ -14,6 +14,15 @@ export function replaySelection() {
   return { generation, ...fileSummary };
 }
 
+const analysisRestriction = 'Replay 不支持运行全部策略、敏感性扫描或交叉分析，请使用运行当前策略；如需批量分析，请切换至合成负载。';
+
+export function allowSyntheticAnalysis(statusId) {
+  if (state.workloadSource !== 'replay') return true;
+  const note = element(statusId);
+  if (note) { note.textContent = analysisRestriction; note.hidden = false; }
+  return false;
+}
+
 export function updateRunControls() {
   const running = state.simRunning;
   const replay = state.workloadSource === 'replay';
@@ -23,9 +32,17 @@ export function updateRunControls() {
   document.querySelectorAll('button[onclick="applyStrategies()"]').forEach(button => {
     button.disabled = running || (replay && (reading || !bundle));
   });
-  document.querySelectorAll('button[onclick="runAllStrategies()"]').forEach(button => {
-    button.disabled = running || replay;
-  });
+  for (const [handler, busy] of [['runAllStrategies', running], ['runSensitivity', state.sensitivityRunning], ['runCrossAnalysis', state.crossRunning]]) {
+    document.querySelectorAll(`button[onclick="${handler}()"]`).forEach(button => {
+      button.disabled = busy || replay;
+      if (button.dataset.syntheticTitle === undefined) button.dataset.syntheticTitle = button.title;
+      button.title = replay ? analysisRestriction : button.dataset.syntheticTitle;
+    });
+  }
+  for (const id of ['simulationModeNote', 'sensitivityStatus', 'crossStatus']) {
+    const note = element(id);
+    if (note) { note.hidden = !replay; note.textContent = replay ? analysisRestriction : ''; }
+  }
   element('replayPanel').setAttribute('aria-busy', String(running || reading));
 }
 

@@ -6,6 +6,7 @@ import { $ } from "../adapters/browser/dom.js";
 import { drawGantt, refreshScheduleTab, drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
 import { executeSimulation, executeBatch, serverVersion } from '../execution/browser/client.ts';
 import { createReplayJob, replaySelection, updateRunControls } from './replay.js';
+import { refreshSensExportControls } from './export.js';
 
 const pending = new Map();
 function cacheKey(params, strategy, overrides, mode, version) {
@@ -144,6 +145,7 @@ export function showStrategyResults(){
   $('strategyResults').style.display = 'block';
   updateSimulationSnapshot();
   renderReplayResult();
+  refreshSensExportControls();
   // sensitivityPanel 不再由此解锁 —— 它初始即显示(与单次模拟零依赖)
   drawStrategyMetrics();
   drawStrategyComparisonGantt();

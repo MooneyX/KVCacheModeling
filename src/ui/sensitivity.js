@@ -10,6 +10,7 @@ import { initChart } from "./charts.js";
 import { collectParamsJson, buildParamMeta } from "./parameters.js";
 import { collectSensSnapshot } from "./snapshots.js";
 import { executeBatch, serverVersion } from '../execution/browser/client.ts';
+import { allowSyntheticAnalysis, updateRunControls } from './replay.js';
 
 
 
@@ -111,16 +112,20 @@ export function toggleShapeDim() {
 
 
 
-let sensitivityRunning = false;
 export async function runSensitivity() {
-  if (sensitivityRunning) return;
-  sensitivityRunning = true;
+  if (!allowSyntheticAnalysis('sensitivityStatus') || state.sensitivityRunning) return;
+  state.sensitivityRunning = true;
+  updateRunControls();
   try { await runSensitivityRemote(); }
-  catch (error) { $('chartSensitivity').textContent = error.message; }
+  catch (error) {
+    setSensExportEnabled(false);
+    $('chartSensitivity').textContent = error.message;
+  }
   finally {
-    sensitivityRunning = false;
+    state.sensitivityRunning = false;
     const button = $('btnRunSens');
-    if (button) { button.disabled = false; button.textContent = '运行敏感性分析'; }
+    if (button) button.textContent = '运行敏感性分析';
+    updateRunControls();
   }
 }
 
@@ -537,7 +542,7 @@ async function runSensitivityRemote() {
     // 自动收录进快照列表(2026-08-27): 平台仍只展示当前这一次扫描, 但列表把历次攒起来,
     // 导出 HTML 时可勾选多条打包进同一个文件(见 collectSensSnapshot 的设计说明)。
     try { collectSensSnapshot(state.sensExportState); } catch (e) {}
-    if (btn) { btn.disabled = false; btn.textContent = '📈 运行敏感性分析'; }
+    if (btn) btn.textContent = '运行敏感性分析';
     // 注意: 不要清空 chartEl.innerHTML——echarts.init 已接管元素并渲染 canvas, 清空会销毁图表
   }
 

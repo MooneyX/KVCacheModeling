@@ -5,6 +5,8 @@ export const state = {
   simResults: [],
   simInput: null,
   simRunning: false,
+  sensitivityRunning: false,
+  crossRunning: false,
   workloadSource: 'synthetic',
   strategyMode: 'dsl',
   simCache: {},

@@ -4,6 +4,7 @@ const devPort = process.env.PLAYWRIGHT_DEV_PORT || '4173';
 const apiPort = process.env.PLAYWRIGHT_API_PORT || '8787';
 const devUrl = `http://127.0.0.1:${devPort}`;
 const apiUrl = `http://127.0.0.1:${apiPort}`;
+const taskDataDir = `.runtime/browser-tests/run-${process.pid}-${Date.now()}`;
 
 export default defineConfig({
   testDir: './tests/integration',
@@ -24,6 +25,6 @@ export default defineConfig({
     { command: `npm run dev -- --port ${devPort} --strictPort`, url: devUrl, reuseExistingServer: false,
       env: { SIM_API_URL: apiUrl } },
     { command: 'npm start', url: `${apiUrl}/api/health`, reuseExistingServer: false,
-      env: { HOST: '127.0.0.1', PORT: apiPort, SIM_ACCESS_TOKEN: '', SIM_DATA_DIR: '.runtime/browser-tests', SIM_MAX_TASKS: '1000' } },
+      env: { HOST: '127.0.0.1', PORT: apiPort, SIM_ACCESS_TOKEN: '', SIM_DATA_DIR: taskDataDir, SIM_MAX_TASKS: '1000' } },
   ],
 });

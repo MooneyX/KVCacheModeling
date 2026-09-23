@@ -376,6 +376,7 @@
       <div style="flex:0 0 auto;display:flex;align-items:end;gap:6px"><button class="btn" onclick="applyStrategies()" title="只运行当前配置的策略，不写入保存列表">▶️ 运行当前策略</button><button class="btn btn-sm" onclick="runAllStrategies()" style="background:var(--accent2)" title="运行全部已保存策略（未保存时回退当前策略）">📋 运行全部已保存</button></div>
       <button class="btn btn-sm" id="replayDownload" type="button" disabled>下载完整结果 JSON</button>
     </div>
+    <div id="simulationModeNote" role="status" class="progress-note" style="margin-bottom:8px" hidden></div>
     <div id="simulationStatus" role="status" aria-live="polite" class="progress-note" style="margin-bottom:8px"></div>
     <div id="simulationSnapshot" class="progress-note" style="margin-bottom:8px">请先运行</div>
     <div id="simulationDirty" role="status" aria-live="polite" class="progress-note" style="margin-bottom:8px" hidden>输入已修改，尚未重新运行</div>
@@ -466,6 +467,8 @@
       </select></div>
       <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" id="btnRunSens" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
+    <div id="sensitivityStatus" role="status" class="progress-note" hidden></div>
+    <p class="subtitle">下方保留最近一次合成负载扫描结果，与上方单次运行结果独立；切换输入不重新计算。</p>
     <div id="chartSensitivity" class="chart-container"></div>
     <!-- 图表导出(2026-08-25): 出图后才可用, 故初始 disabled, 由 setSensExportEnabled 解锁 -->
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px">
@@ -475,6 +478,7 @@
       <button class="btn btn-sm" id="btnSensExportHtml" disabled onclick="exportSensHtml()" title="自包含单文件 HTML —— **保留完整交互**(tooltip / 图例开关 / 区域缩放 / 另存为图片)。&#10;★★ 多次扫描一并导出: 下方勾选的**全部**扫描结果打包进同一个 HTML, 页内可切换批次。&#10;★★ 参数透视(2026-08-27): 打开即**摊开列出全部参数**, 可任意指定哪个参数当横轴/颜色/形状, 并勾选参数值筛选 —— 「颜色=命中率 形状=输入长度」与「颜色=输入长度 形状=命中率」本是同一批数据, 无需重跑即可互换。改动任一项才接管图表, 随时可「↺ 恢复原图」。&#10;⚠️ 某参数要可选, 需它在本文件数据里有 ≥2 个取值: 若两次扫描只改了某参数(如输入长度), 必须**同时勾选这两个批次**再导出, 否则它只有一个取值会显示为灰色固定值。&#10;★ 可在页内**切换纵轴指标**(全指标已烧进文件, 切换零重算; 支持 ←/→ 键)。&#10;附带: ①数据表(随指标与筛选同步刷新, 可一键复制为 TSV 粘进 Excel) ②方法说明 ③参数配置(按模型&#47;硬件&#47;负载&#47;策略分组展示, 中文标签 + 可读值, 非默认值高亮; 可切回原始 JSON 粘回平台「导入参数」复现)。&#10;图表渲染需联网加载 echarts; 离线时数据表仍完整可用。">🌐 HTML(可交互)</button>
       <span id="sensExportNote" style="font-size:.72rem;color:var(--accent2)"></span>
     </div>
+    <div id="sensExportRestriction" role="status" class="progress-note" hidden></div>
     <!-- 扫描快照列表(2026-08-27): 平台同时只展示一次扫描, 但历次结果自动攒在这里,
          勾选后可一并导出到同一个 HTML(页内切换批次 / 参数透视) -->
     <div id="sensSnapList" style="margin-top:8px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px"></div>
@@ -545,7 +549,9 @@
 <div class="tab-panel" id="tab-cross">
   <div class="card">
     <h2><span>策略×并发</span> 延迟热力图</h2>
-    <p class="subtitle">每个格子是一次真实仿真：不同Eviction策略在不同并发水平下的P99延迟(ms)</p>
+    <p class="subtitle">最近一次合成负载交叉分析：每个格子是不同Eviction策略在不同并发水平下的P99延迟(ms)，与单次运行结果独立</p>
+    <button class="btn" id="btnRunCross" onclick="runCrossAnalysis()" style="font-size:.85rem;margin-bottom:8px">按需运行交叉分析</button>
+    <div id="crossStatus" role="status" class="progress-note" hidden></div>
     <div id="chartHeatmap" class="chart-tall"></div>
     <div class="formula-box" id="formulaHeatmap"></div>
   </div>
