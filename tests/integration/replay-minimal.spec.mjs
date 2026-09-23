@@ -141,6 +141,38 @@ async function runSynthetic(page) {
   return stored.points[0].result;
 }
 
+test('U1: shared entry preserves synthetic follow-ups, Replay zero-offset dependencies and result isolation', async ({ page }) => {
+  const { errors, posts } = await start(page, 'synthetic');
+  await importControls(page, { ...baseControls, pMultiTurn: '100', pInstances: '2', pRoutePolicy: 'random',
+    sDsl: baseline.strategy.dsl, sName: 'u1-follow-up', pBlockSize: '64', pPdSep: '0' });
+  const synthetic = await runSynthetic(page);
+  expect(synthetic.totalReqs).toBe(16);
+  expect(synthetic.completed).toBe(synthetic.totalReqs);
+  expect(synthetic.truncated).toBe(false);
+  await importControls(page, { pInstances: '1' });
+  await source(page, 'replay');
+  await upload(page, prefix);
+  await settings(page, { replayQps: '6' });
+  const { result } = await run(page);
+  expect(result.replay.counts).toMatchObject({ planned: 3, arrived: 3, successful: 3, waitingAnchor: 0, unfinished: 0 });
+  const timeline = new Map(result.timeline.map(req => [req.id, req]));
+  expect(timeline.get(1).arrive).toBe(timeline.get(0).completeTime);
+  expect(timeline.get(2).arrive).toBe(timeline.get(1).completeTime);
+  expect(result.replay.windows.full.cache).toMatchObject({ inputTokens: 448, hitL1Tokens: 192, missTokens: 256 });
+  expect((await run(page)).result).toEqual(result);
+  for (const snapshot of [synthetic, result]) {
+    const json = JSON.stringify(snapshot);
+    for (const key of ['sessionId', 'routingKey', 'inputContent', 'sessionInstanceKey']) {
+      expect(json).not.toContain(`"${key}":`);
+    }
+    expect(json.match(/"outputIdentity":/g)?.length || 0).toBe(snapshot.replay ? 1 : 0);
+    if (snapshot.replay) expect(snapshot.replay.configuration.outputIdentity).toBe('unmapped');
+  }
+  expect(posts[0].jobs[0].overrides?.replay).toBeUndefined();
+  expect(posts[1].jobs[0].overrides.replay.bundle).toEqual(prefix);
+  expect(errors).toEqual([]);
+});
+
 test('Replay typography matches the legacy interface without changing existing fonts', async ({ page }) => {
   const { errors } = await start(page, 'synthetic');
   const typography = locator => locator.evaluate(el => {

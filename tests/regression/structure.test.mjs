@@ -17,7 +17,7 @@ test('frozen legacy input retains its original checksum', () => {
   assert.equal(createHash('sha256').update(read('../fixtures/legacy/index.html')).digest('hex'), manifest.files['index.html']);
 });
 
-test('synthetic request generator remains token-identical and replay shares the engine', () => {
+test('synthetic sampling and grouping remain token-identical behind the shared source boundary', () => {
   const ast = parse(legacyCode, { ecmaVersion: 'latest' });
   const original = ast.body.find(node => node.type === 'FunctionDeclaration' && node.id.name === 'runSimulation');
   let expected = legacyCode.slice(original.start, original.end)
@@ -30,11 +30,20 @@ test('synthetic request generator remains token-identical and replay shares the 
   const source = read('../../src/core/simulation.js');
   const engine = parse(source, { ecmaVersion: 'latest', sourceType: 'module' }).body.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.id?.name === 'runSimulation');
   assert.equal(engine.declaration.params.length, 4);
-  assert.match(source, /replay\s*\?\s*\{ N: 0, requests: \[\] \}\s*:\s*generateRequests\(p, overrides, rng, prefixGroupMap\)/);
+  assert.match(source, /const source = replay \|\| createSyntheticRuntime\(p, overrides, rng, prefixGroupMap,/);
   assert.match(source, /createReplayRuntime\(overrides\.replay/);
+  for (const call of ['drainEvents', 'complete', 'fail', 'counts']) assert.ok(source.includes(`source.${call}(`));
+  assert.match(source, /let _allDone = source\.done/);
+  assert.doesNotMatch(source, /pending\.push\(fu\)|followUpCount\+\+|rng\(\) < p\.multiTurn/);
   const requestSource = read('../../src/core/requests.js');
   const generator = parse(requestSource, { ecmaVersion: 'latest', sourceType: 'module' }).body.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.id?.name === 'generateRequests');
-  assert.deepEqual(tokenValues(requestSource.slice(generator.start, generator.end)), tokenValues('export function generateRequests(p, overrides, rng, prefixGroupMap) {\n' + requests + '}\nreturn {N, requests};\n}'));
+  const oldInitializer = requests.match(/requests\.push\(\{ id: i,[\s\S]*?_recomputeTok: 0 \}\);/)[0];
+  const sharedInitializer = 'requests.push(createRequest(i, t, inLen, outLen, { sessionId, routingKey: sessionId }));';
+  const generated = requestSource.slice(generator.start, generator.end);
+  assert.ok(generated.includes(sharedInitializer));
+  const normalized = generated.replace('const sessionId = `synthetic:${i}`;', '')
+    .replace(sharedInitializer, oldInitializer).replace('requests.forEach(req => setSyntheticContent(req));', '');
+  assert.deepEqual(tokenValues(normalized), tokenValues('export function generateRequests(p, overrides, rng, prefixGroupMap) {\n' + requests + '}\nreturn {N, requests};\n}'));
 });
 
 test('all calculation and DSL expressions are token-identical to baseline', () => {

@@ -1,3 +1,52 @@
+/** @typedef {{pathId: string, position: number, tokens: number}} ContentSegment */
+
+function createRequest(id, arrive, inputLen, outputLen, fields = {}) {
+  return {
+    id, arrive, inputLen, outputLen,
+    groupId: null, prefixTokLen: 0, isFounder: false, followUp: false, retainIds: null,
+    state: 'wait', tokensGen: 0, admitTime: 0, prefillStart: 0, prefillEnd: 0, decodeStart: 0, completeTime: 0,
+    prefixBlkIds: [], ownBlkIds: [], kvHbm: 0, kvDram: 0, kvSsd: 0, prefillTokens: inputLen,
+    _outAllocTok: 0, _outSeq: 0, _outMerge: 1, _recomputeTok: 0,
+    ...fields,
+  };
+}
+
+function contentPath(history, identity) {
+  return JSON.stringify([history.map(({ pathId, position, tokens }) => [pathId, position, tokens]), identity]);
+}
+
+function prefixContent(groupId, tokens) {
+  return { pathId: `synthetic:prefix:${groupId}`, position: 0, tokens };
+}
+
+function setContent(req, inputContent, outputPath) {
+  // Both sources expose a read-only iterable of ContentSegment; Replay keeps RLE lazy.
+  req.inputContent = Array.isArray(inputContent)
+    ? Object.freeze(inputContent.map(segment => Object.freeze(segment))) : Object.freeze(inputContent);
+  req.outputIdentity = Object.freeze({ pathId: outputPath, position: req.inputLen, tokens: req.outputLen });
+  return req;
+}
+
+function setSyntheticContent(req, history = []) {
+  const content = [];
+  let position = 0;
+  for (const segment of history) {
+    const tokens = Math.min(segment.tokens, req.inputLen - position);
+    if (tokens <= 0) break;
+    content.push({ pathId: segment.pathId, position, tokens });
+    position += tokens;
+  }
+  if (!history.length && req.groupId && req.prefixTokLen > 0) {
+    position = Math.min(req.inputLen, req.prefixTokLen);
+    content.push(prefixContent(req.groupId, position));
+  }
+  if (position < req.inputLen) {
+    content.push({ pathId: contentPath(content, ['synthetic', req.sessionId, req.id, 'input']),
+      position, tokens: req.inputLen - position });
+  }
+  return setContent(req, content, contentPath(content, ['synthetic', req.sessionId, req.id, 'output']));
+}
+
 export function generateRequests(p, overrides, rng, prefixGroupMap) {
   let N = overrides.nreq || Math.min(p.concurrency, 256);
   let requests = [], t = 0, lambda = Math.max(p.qps, 1e-9); // qps 真实生效; 仅防 0/负导致除零(极小值→无请求到达)
@@ -17,11 +66,8 @@ export function generateRequests(p, overrides, rng, prefixGroupMap) {
     t += p.arrivalDist === 'uniform' ? 1 / lambda : -Math.log(Math.max(rng(), 1e-9)) / lambda;
     let inLen = sampleLen(p.inputLen, muL);
     let outLen = sampleLen(p.outputLen, muO);
-    requests.push({ id: i, arrive: t, inputLen: inLen, outputLen: outLen,
-      groupId: null, prefixTokLen: 0, isFounder: false, followUp: false, retainIds: null,
-      state: 'wait', tokensGen: 0, admitTime: 0, prefillStart: 0, prefillEnd: 0, decodeStart: 0, completeTime: 0,
-      prefixBlkIds: [], ownBlkIds: [], kvHbm: 0, kvDram: 0, kvSsd: 0, prefillTokens: inLen,
-      _outAllocTok: 0, _outSeq: 0, _outMerge: 1, _recomputeTok: 0 });
+    const sessionId = `synthetic:${i}`;
+    requests.push(createRequest(i, t, inLen, outLen, { sessionId, routingKey: sessionId }));
   }
   requests.sort((a, b) => a.arrive - b.arrive);
 
@@ -91,17 +137,116 @@ export function generateRequests(p, overrides, rng, prefixGroupMap) {
     requests.sort((a, b) => a.arrive - b.arrive);
 
   }
+  requests.forEach(req => setSyntheticContent(req));
   return { N, requests };
 }
 
 /** @param {import('../contracts/replay').ReplayRequest} template @param {number} id @param {number} arrive @param {any} identity */
 export function createReplayRequest(template, id, arrive, identity) {
+  const sessionId = identity.sessionId ?? identity.sessionInstanceKey ?? `replay:${id}`;
+  const req = createRequest(id, arrive, template.in, template.out,
+    { replayTemplate: template, sessionId, routingKey: sessionId, ...identity });
+  const runs = template.blockRuns.map(([start, count]) => [start, count]);
+  const inputLen = template.in;
+  const pathId = blockId => JSON.stringify(['replay', sessionId, 'input', blockId]);
+  const content = {
+    *[Symbol.iterator]() {
+      let position = 0;
+      for (const [start, count] of runs) {
+        for (let offset = 0; offset < count; offset++) {
+          const tokens = Math.min(64, inputLen - position);
+          yield Object.freeze({ pathId: pathId(start + offset), position, tokens });
+          position += tokens;
+        }
+      }
+    },
+  };
+  const last = runs.at(-1);
+  return setContent(req, content, JSON.stringify(['replay', sessionId, 'output', req.requestIndex ?? id,
+    last ? pathId(last[0] + last[1] - 1) : null, inputLen]));
+}
+
+/**
+ * U1 adapters only: retainedBlocks reads the old cache; onFollowUp transfers old ownership.
+ * Neither content identity nor the event drain depends on those physical block handles.
+ */
+export function createSyntheticRuntime(p, overrides, rng, prefixGroupMap = {}, adapters = {}) {
+  const { N, requests: pending } = generateRequests(p, overrides, rng, prefixGroupMap);
+  const active = new Set();
+  const counters = { arrived: 0, successful: 0, failed: 0, infeasible: 0, aborted: 0,
+    launchedSessions: 0, completedSessions: 0, followUps: 0 };
+  let initialCache = [];
+  if (p.prefixCache === 'radix' && p.prefixWarm && p.prefixHit > 0.001) {
+    initialCache = Object.entries(prefixGroupMap).map(([groupId, group]) => {
+      const tokens = group.prefixTokLen;
+      const l2 = p.prefixWarmL2 > 0.001
+        ? Math.min(tokens, Math.max(0, Math.round(tokens * p.prefixWarmL2 / Math.max(p.prefixHit, 1e-9)))) : 0;
+      return Object.freeze({ groupId,
+        content: Object.freeze([Object.freeze(prefixContent(groupId, tokens))]),
+        placements: Object.freeze([
+          Object.freeze({ tier: 'dram', position: 0, tokens: l2 }),
+          Object.freeze({ tier: 'ssd', position: l2, tokens: tokens - l2 }),
+        ]),
+      });
+    });
+  }
+  function terminal(req, time, reason) {
+    if (!active.has(req)) return false;
+    if (!Number.isFinite(time) || time < req.arrive) throw new RangeError('Synthetic terminal time precedes arrival or is not finite');
+    active.delete(req);
+    let followUp = null;
+    if (reason === null) {
+      counters.successful++;
+      if (!req.followUp && !p.singleBatch && p.multiTurn > 0 && rng() < p.multiTurn) {
+        const retainIds = adapters.retainedBlocks?.(req) || [];
+        if (retainIds.length > 0) {
+          const id = N + counters.followUps++;
+          const arrive = time + 1 + rng() * 4;
+          const inputLen = Math.round(req.inputLen * (1.1 + 0.3 * rng()));
+          const outputLen = Math.max(64, Math.round(req.outputLen * (0.8 + 0.4 * rng())));
+          followUp = createRequest(id, arrive, inputLen, outputLen, {
+            followUp: true, retainIds, prevTotalTok: req.inputLen, prefillTokens: 0,
+            sessionId: req.sessionId, routingKey: req.routingKey,
+          });
+          const outputTokens = Math.min(req.outputLen, Math.max(0, Math.floor(req.tokensGen)));
+          const history = req.inputContent.concat(outputTokens > 0 ? [{ ...req.outputIdentity, tokens: outputTokens }] : []);
+          setSyntheticContent(followUp, history);
+          pending.push(followUp);
+          pending.sort((a, b) => a.arrive - b.arrive);
+          adapters.onFollowUp?.(req, followUp);
+        }
+      }
+    } else {
+      counters.failed++;
+      if (reason === 'infeasible') counters.infeasible++;
+      else counters.aborted++;
+    }
+    if (!followUp) counters.completedSessions++;
+    return true;
+  }
   return {
-    id, arrive, inputLen: template.in, outputLen: template.out,
-    groupId: null, prefixTokLen: 0, isFounder: false, followUp: false, retainIds: null,
-    state: 'wait', tokensGen: 0, admitTime: 0, prefillStart: 0, prefillEnd: 0, decodeStart: 0, completeTime: 0,
-    prefixBlkIds: [], ownBlkIds: [], kvHbm: 0, kvDram: 0, kvSsd: 0, prefillTokens: template.in,
-    _outAllocTok: 0, _outSeq: 0, _outMerge: 1, _recomputeTok: 0,
-    replayTemplate: template, ...identity,
+    initialCount: N,
+    // Snapshots keep the legacy drain estimate without exposing the mutable event queue.
+    pendingRequests: () => pending.slice(),
+    takeInitialCache() { const description = initialCache; initialCache = []; return description; },
+    get nextTime() { return pending[0]?.arrive ?? Infinity; },
+    get done() { return pending.length === 0 && active.size === 0; },
+    drainEvents(now, onArrival) {
+      while (pending.length && pending[0].arrive <= now) {
+        const req = pending.shift();
+        active.add(req);
+        counters.arrived++;
+        if (!req.followUp) counters.launchedSessions++;
+        onArrival(req);
+      }
+    },
+    complete(req, time) { return terminal(req, time, null); },
+    fail(req, reason, time) { return terminal(req, time, reason); },
+    counts() {
+      return { ...counters, planned: N + counters.followUps, cancelled: 0, anchor_unavailable: 0,
+        activeSessions: counters.launchedSessions - counters.completedSessions,
+        arrivedUnfinished: active.size, pendingArrival: pending.length, waitingAnchor: 0,
+        unfinished: active.size + pending.length };
+    },
   };
 }

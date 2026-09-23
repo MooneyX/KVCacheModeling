@@ -1,4 +1,4 @@
-import { generateRequests } from "./requests.js";
+import { createSyntheticRuntime } from "./requests.js";
 import { hwPresets } from "./presets.js";
 import { mulberry32, pctOf, unionSpanSec } from "./math.js";
 import { calcAll, estimatePrefillParams, effL2LinkBW, prefillIntegral, prefillTau, perReqMs } from "./calculations.js";
@@ -412,7 +412,19 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // evictThreshold('dram')(读 s.eviction), 原声明在预热段之后 ⇒ TDZ 报错。
   // 'ssd' 分支恰好不读 s(直接 return 0.98)才一直没暴露。
   let s = strategy;
-  let { N, requests } = replay ? { N: 0, requests: [] } : generateRequests(p, overrides, rng, prefixGroupMap);
+  const source = replay || createSyntheticRuntime(p, overrides, rng, prefixGroupMap, {
+    retainedBlocks(req) {
+      const retainIds = [], seen = {};
+      (req.ownBlkIds || []).concat(req.prefixBlkIds || [], req.groupBlkIds || []).forEach(id => {
+        if (!seen[id] && findBlock(id)) { seen[id] = 1; retainIds.push(id); }
+      });
+      return retainIds;
+    },
+    onFollowUp(req) { req.ownBlkIds = []; },
+  });
+  const N = replay ? 0 : source.initialCount;
+  const requests = replay ? [] : source.pendingRequests();
+  const initialCache = source.takeInitialCache?.() || [];
   if (replay) rng = replay.launcher.routeRandom;
   if (p.prefixHit > 0.001) {
     // S4: 把前缀组表分发给各实例。
@@ -446,20 +458,18 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     // L2 命中按"免费"口径(不进 fetchTime/不占拉取带宽; decode 侧 L2 读本就有 busyUntil 排队)。
     // 容量回退: dram 放不下 L2 段 → L2 段并入 ssd(全量 L3, 主语义保住); ssd 放不下 → 整组跳过。
     // prefixWarmL2=0(默认) 时 l2Tok=0 走原路径, 与原实现逐位一致(零回归保证)。
-    if (p.prefixCache === 'radix' && p.prefixWarm && p.prefixHit > 0.001) {
+    if (initialCache.length) {
       // 预热到指定实例(亲和关时只有 instances[0] 这一份全局池)
       function warmInto(target, gmap) {
         let prevInst = inst;
         usePools(target);                    // 切到目标实例的池/容量视图(仅资源, 不碰波次状态)
-        Object.keys(gmap).forEach(gid => {
+        initialCache.forEach(description => {
+          const gid = description.groupId;
           let g = gmap[gid];
-          let nTok = g.prefixTokLen;
+          if (!g) return;
+          let nTok = description.content.reduce((sum, segment) => sum + segment.tokens, 0);
           if (nTok <= 0) return;
-          // 双层预热: l2Tok = 组前缀的 h_l2/h 比例段(请求口径 h_l2×inputLen ⇒ 组口径 P×h_l2/h)
-          let l2Tok = 0;
-          if (p.prefixWarmL2 > 0.001) {
-            l2Tok = Math.min(nTok, Math.max(0, Math.round(nTok * p.prefixWarmL2 / Math.max(p.prefixHit, 1e-9))));
-          }
+          let l2Tok = description.placements.find(segment => segment.tier === 'dram')?.tokens || 0;
           let needBytes = nTok * kvPerTok;
           // C3 修复(2026-08-12): 注入容量口径与正常写入一致(evictThreshold=0.98),
           // 不再按 100% 填满——避免注入即满触发后续强制淘汰(prewarmed 无淘汰保护时被误伤)
@@ -892,20 +902,24 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   const replayCache = replay ? createReplayCache({ pool: pools.hbm, blockBytes, add: poolAdd, remove: poolRemove,
     maxBlockReferences: replay.launcher.limits.maxBlockReferences }) : null;
 
-  function admitReplayRequests() {
-    replay.drainEvents(now, req => {
+  function drainSourceEvents() {
+    source.drainEvents(now, req => {
       const target = routeRequest(req);
       req.instId = target.id;
       target.nRouted++;
       target.waitQueue.push(req);
     });
+  }
+
+  function admitReplayRequests() {
+    drainSourceEvents();
     for (let i = 0; i < waitQueue.length; i++) {
       const req = waitQueue[i];
       const hit = replayCache.place(req, now);
       waitQueue.splice(i--, 1);
       if (!hit) {
         req.state = 'infeasible'; req.completeTime = now;
-        replay.fail(req, 'infeasible', now);
+        source.fail(req, 'infeasible', now);
         req.replayTemplate = null;
         continue;
       }
@@ -1207,8 +1221,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // load_back 按需搬运, 不存在"水位线触发的后台预取"。两档 DSL 关键字同步移除。
 
   // ---------- 完成与释放 ----------
-  let pending = requests;
-  let timeline = [], followUpCount = 0;
+  let timeline = [];
   const replayCompletions = [];
 
   function completeRequest(req) {
@@ -1329,35 +1342,10 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     if (!replay && timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
       prefillStart: req.prefillStart, prefillEnd: req.prefillEnd, completeTime: now });
 
+    source.complete(req, now);
     if (replay) {
-      replay.complete(req, now);
       replayCache.release(req, now);
       return;
-    }
-    // 多轮会话：保留KV，安排后续轮次复用（真实前缀命中）
-    // 单批模式: 不产生后续轮次——仿真范围严格限定为"单批 prefill"
-    let retain = (!req.followUp && !p.singleBatch && p.multiTurn > 0 && rng() < p.multiTurn);
-    if (retain) {
-      // 双路径合并：会话延续同时保留 ①自有块(历史对话+输出) ②共享前缀块(系统提示/公共前缀，
-      // sharer 存于 prefixBlkIds、founder 存于 groupBlkIds，指向同一批公共块)。
-      // 之前只保留 ownBlkIds → followUp 的系统提示段被当作新 token 重算（TTFT 高估）。
-      let retainIds = [];
-      let seen = {};
-      (req.ownBlkIds || []).concat(req.prefixBlkIds || [], req.groupBlkIds || []).forEach(id => {
-        if (!seen[id] && findBlock(id)) { seen[id] = 1; retainIds.push(id); }
-      });
-      if (retainIds.length > 0) {
-        let fu = { id: N + followUpCount++, arrive: now + 1 + rng() * 4,
-          inputLen: Math.round(req.inputLen * (1.1 + 0.3 * rng())),
-          outputLen: Math.max(64, Math.round(req.outputLen * (0.8 + 0.4 * rng()))),
-          groupId: null, prefixTokLen: 0, isFounder: false, followUp: true,
-          retainIds: retainIds, prevTotalTok: req.inputLen,
-          state: 'wait', tokensGen: 0, admitTime: 0, prefillStart: 0, prefillEnd: 0, decodeStart: 0, completeTime: 0,
-          prefixBlkIds: [], ownBlkIds: [], kvHbm: 0, kvDram: 0, kvSsd: 0, prefillTokens: 0,
-          _outAllocTok: 0, _outSeq: 0, _outMerge: 1, _recomputeTok: 0 };
-        pending.push(fu); pending.sort((a, b) => a.arrive - b.arrive);
-        req.ownBlkIds = []; // 所有权移交给保留集
-      }
     }
     req.ownBlkIds.forEach(id => { ['hbm','dram','ssd'].forEach(t0 => poolRemove(t0, id)); });
     req.prefixBlkIds.forEach(id => {
@@ -1369,14 +1357,14 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   }
 
   // ---------- 主循环 ----------
-  let lastArrive = pending.length ? pending[pending.length - 1].arrive : 0;
+  let lastArrive = requests.length ? requests[requests.length - 1].arrive : 0;
   // 自适应仿真窗口（初始值）：覆盖全部 prefill 工作 + 分波 decode 排水时间的估计；
   // 触顶时不截断，由 estimateRemainingDrain 按剩余负载自动延长，直至全部请求排空
   // （estPass 需含 decode 每请求开销，与 perReqMs 校准一致——旧公式低估导致
   //   Aggressive 静态批高并发场景 0 完成、P99 显示 0；权重项保守按总权重）
   // P0-2: 位置感知 prefill 的窗口估计——per-token 成本 τ(i)（稠密 a+b·i / 稀疏含 topk 截断）
   //（线性公式 2P·L/F 低估长上下文 prefill，导致重负载场景仿真窗口截断、0 完成）
-  let totalPrefillEst = pending.reduce((s2, q) => s2 + prefillIntegral(p, q.inputLen), 0);
+  let totalPrefillEst = requests.reduce((s2, q) => s2 + prefillIntegral(p, q.inputLen), 0);
   let estN = Math.min(s.batching.max_batch_size || 8, N);
   // decode 单 pass 排水估计（与仿真引擎同口径的 KV 分层减速，2541-2550 行）：
   // 批 KV = n×avgLifetimeKv，按 快层(availHbm) → DRAM → SSD 水注分层；
@@ -1415,7 +1403,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   // 剩余排水估计：基于当前未完成请求（排队/在飞/decode），供窗口自动延长使用。
   // 与 drainEst 同口径（位置感知 prefill + 分波 decode），保证延长量覆盖剩余工作
   function estimateRemainingDrain() {
-    let all = pending.slice();
+    let all = source.pendingRequests();
     for (let ii = 0; ii < instances.length; ii++) {
       let xi = instances[ii];
       all = all.concat(xi.waitQueue, xi.prefillQ, xi.prefilling, xi.kvXfer, xi.decodeWait, xi.decoding);
@@ -1531,10 +1519,10 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
         || xi.kvXfer.length || xi.decodeWait.length || xi.decoding.length) { allIdle = false; break; }
     }
     if (replay && allIdle && !replayCompletions.length) {
-      let next = replay.nextTime;
+      let next = source.nextTime;
       for (const transfer of inFlight) next = Math.min(next, transfer.arriveAt);
-      if (!Number.isFinite(next) && !replay.done) throw new Error('Replay scheduling invariant: unresolved anchors without future events');
-      const target = Math.min(simCap, next, replay.done ? Math.max(now, replay.options.durationSeconds) : Infinity);
+      if (!Number.isFinite(next) && !source.done) throw new Error('Replay scheduling invariant: unresolved anchors without future events');
+      const target = Math.min(simCap, next, source.done ? Math.max(now, replay.options.durationSeconds) : Infinity);
       if (target > now) {
         sampleReplayConcurrency(now);
         step = Math.ceil(target / DT);
@@ -1542,8 +1530,8 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
         replayIdleLanding = true;
       }
     }
-    if (!replay && pending.length && allIdle) {
-      let nextEv = pending[0].arrive;
+    if (!replay && source.nextTime < Infinity && allIdle) {
+      let nextEv = source.nextTime;
       for (let ei = 0; ei < inFlight.length; ei++) nextEv = Math.min(nextEv, inFlight[ei].arriveAt);
       if (nextEv > now) {
         let skip = Math.ceil((nextEv - now) / DT);   // 落到首个 now >= nextEv 的步
@@ -1567,17 +1555,11 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
 
     // ---- 路由: 请求到达 → 选实例(策略集对齐 sgl-router, 见 parseDSL 的 ROUTE 注释) ----
     // 决策只用**当前可观测量**(队列长度/KV 占用), 不读未来 —— 保证因果性。
-    while (pending.length && pending[0].arrive <= now) {
-      let req0 = pending.shift();
-      let tgt = routeRequest(req0);
-      req0.instId = tgt.id;
-      tgt.nRouted++;
-      tgt.waitQueue.push(req0);
-    }
+    if (!replay) drainSourceEvents();
 
     // 均衡度采样窗: 本步系统整体是否仍有在途负载(或还有未到达请求)。
     // 排空后的长尾不计入 —— 否则先完成的实例被 0 值拉低, CV 失真(见下方采样处注释)。
-    let _busyPhase = pending.length > 0;
+    let _busyPhase = !replay && source.nextTime < Infinity;
     for (let ii = 0; !_busyPhase && ii < instances.length; ii++) {
       let xi = instances[ii];
       if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
@@ -2269,7 +2251,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       stats.l3Series.push([+now.toFixed(2), +(_sSsd / 1e9).toFixed(2)]);
     }
 
-    let _allDone = !pending.length && (!replay || (replay.done && !inFlight.length && now >= replay.options.durationSeconds));
+    let _allDone = source.done && (!replay || (!inFlight.length && now >= replay.options.durationSeconds));
     for (let ii = 0; _allDone && ii < instances.length; ii++) {
       let xi = instances[ii];
       if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
@@ -2574,8 +2556,8 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       miss: stats.missTok, total: stats.reqTokTotal },
     prefixGroups: Object.keys(prefixGroupMap).length,
     fragPct: r.fragPct,
-    completed: stats.completed, totalReqs: replay ? replay.launcher.plannedRequests : N + followUpCount,
-    ...(replay ? { replay: replayMetrics.finish(now, { ...replay.counts(), truncated, terminationReason: truncated ? 'hard_cutoff' : 'drained' }) } : {}),
+    completed: stats.completed, totalReqs: source.counts().planned,
+    ...(replay ? { replay: replayMetrics.finish(now, { ...source.counts(), truncated, terminationReason: truncated ? 'hard_cutoff' : 'drained' }) } : {}),
     truncated: truncated, simEnd: simEnd, drainEst: drainEst, // 截断标志 + 仿真结束时间 + 排水估计(截断时建议上限值)
     latencies: stats.latencies, timeline: timeline, concTimeline: stats.concSamples,
     incomplete: incomplete,   // (simEnd 已在上一行给出, 此处原有重复 key 已删 —— 2026-08-20)
