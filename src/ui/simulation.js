@@ -3,7 +3,7 @@ import { state } from "./state.js";
 
 import { getCurrentStrategy } from "./strategy.js";
 import { $ } from "../adapters/browser/dom.js";
-import { drawGantt, drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
+import { drawGantt, refreshScheduleTab, drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
 import { executeSimulation, executeBatch, serverVersion } from '../execution/browser/client.ts';
 
 const pending = new Map();
@@ -89,7 +89,9 @@ export function showStrategyResults(){
   drawStrategyMetrics();
   drawStrategyComparisonGantt();
   drawStrategyTierDemand();
-  if (!state.simResults.length || $('tab-schedule').classList.contains('active')) {
+  if ($('tab-schedule').classList.contains('active')) {
+    refreshScheduleTab();
+  } else if (!state.simResults.length) {
     drawGantt(state.simResults[0], state.simInput);
   }
 }

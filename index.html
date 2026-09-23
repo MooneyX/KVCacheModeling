@@ -467,19 +467,19 @@
 <div class="tab-panel" id="tab-storage">
   <div class="card">
     <h2><span>存储层级</span> 总览</h2>
-    <p class="subtitle">HBM → DRAM → SSD 三级存储的容量、带宽与延迟对比</p>
+    <p class="subtitle">理论估算（当前编辑参数，非运行结果）· HBM → DRAM → SSD 三级存储的容量、带宽与延迟对比</p>
     <div id="chartTierOverview" class="chart-container"></div>
     <div class="formula-box" id="formulaTier"></div>
   </div>
   <div class="card">
     <h2><span>KV Cache</span> 膨胀曲线</h2>
-    <p class="subtitle">单请求KV Cache随序列长度增长的占用变化，多模型叠加对比（MLA模型按压缩后维度计算）</p>
+    <p class="subtitle">理论估算（当前编辑参数，非运行结果）· 单请求KV Cache随序列长度增长的占用变化，多模型叠加对比（MLA模型按压缩后维度计算）</p>
     <div id="chartKvCurve" class="chart-container"></div>
     <div class="formula-box" id="formulaKvCurve"></div>
   </div>
   <div class="card">
     <h2><span>并发容量</span> 阶梯分析</h2>
-    <p class="subtitle">不同并发级别下的生命周期KV需求（含输出增长、块碎片、前缀共享抵扣）与三级分布</p>
+    <p class="subtitle">理论估算（当前编辑参数，非运行结果）· 不同并发级别下的生命周期KV需求（含输出增长、块碎片、前缀共享抵扣）与三级分布</p>
     <div id="chartConcurrency" class="chart-container"></div>
     <div class="formula-box" id="formulaConcurrency"></div>
   </div>
@@ -490,9 +490,15 @@
   <div class="card">
     <h2><span>请求生命周期</span> 甘特图</h2>
     <p class="subtitle">最近一次成功运行的首个策略 · 与指标卡共用结果和执行快照 · 排队→等算力→Prefill→Decode，含跨层传输等待</p>
+    <div id="ganttPagination" hidden>
+      <button id="ganttPrev" type="button">上一页</button>
+      <span id="ganttPageStatus" role="status" aria-live="polite"></span>
+      <button id="ganttNext" type="button">下一页</button>
+    </div>
     <div id="chartGantt" class="chart-tall"></div>
     <h3 style="font-size:.85rem;color:var(--accent);margin:14px 0 4px">批次并发占用时间线</h3>
-    <p class="subtitle" style="margin-bottom:4px">每个时刻同时在 Decode 的请求数（并行计算的直观证据）、Prefill 占用与排队深度</p>
+    <p class="subtitle" style="margin-bottom:4px">定时采样的 Decode / Prefill 并发与排队深度，非逐事件记录</p>
+    <div class="formula-box" id="formulaBatchOcc"></div>
     <div id="chartBatchOcc" style="width:100%;min-height:200px;height:26vh;max-height:280px"></div>
     <div class="formula-box" id="formulaGantt"></div>
   </div>

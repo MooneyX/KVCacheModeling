@@ -18,6 +18,49 @@ function resultInputs() {
   };
 }
 
+const ganttPages = new WeakMap();
+const GANTT_PAGE_SIZE = 100;
+const numberText = (value, digits = 3, unit = '') => Number.isFinite(value) ? value.toFixed(digits) + unit : '无样本';
+const chartNumber = (value, digits = 1) => Number.isFinite(value) ? +value.toFixed(digits) : null;
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function resultCaption(r, input) {
+  const strategy = escapeHtml(input?.strategies?.[0]?.name || r.name || '当前策略');
+  const range = '全程 [0, ' + numberText(r.simEnd) + '] s · ' + (r.truncated ? '截断' : '未截断');
+  if (!r.replay) return '来源：合成负载 · 策略 ' + strategy + ' · ' + range;
+  const c = r.replay.configuration;
+  return '来源：Replay · 策略 ' + strategy + ' · T=' + numberText(c.durationSeconds) + 's / W=' + numberText(c.warmupSeconds) +
+    's / D=' + numberText(c.hardCutoff - c.durationSeconds) + 's · ' + range;
+}
+
+function truncationNotice(r) {
+  if (!r.truncated) return '';
+  if (r.replay) {
+    const c = r.replay.configuration, n = r.replay.counts;
+    return '硬截止截断：T=' + numberText(c.durationSeconds) + 's，D=' + numberText(c.hardCutoff - c.durationSeconds) +
+      's，截止 ' + numberText(c.hardCutoff) + 's；已到达未完成 ' + n.arrivedUnfinished + '，全部未完成 ' + n.unfinished +
+      '。延迟仅含成功样本，未完成请求不计入延迟分布。';
+  }
+  return '仿真窗口截断：完成请求数不足，TTFT/P99 基于不完整样本。' + (Number.isFinite(r.drainEst)
+    ? '排水估计 ' + r.drainEst.toFixed(0) + 's，建议将「仿真窗口上限」调大至 ≥' + (r.drainEst * 1.5).toFixed(0) + 's。'
+    : '排水估计无样本。');
+}
+
+function showChartMessage(id, message) {
+  const el = $(id);
+  if (!el) return;
+  disposeChart(el);
+  el.textContent = message;
+}
+
+function replayTheoryUnavailable(chartId, formulaId) {
+  if (!state.simResults[0]?.replay) return false;
+  const message = '不适用：此理论估算依赖合成负载假设，不代表本次 Replay 运行。';
+  showChartMessage(chartId, message);
+  setFormula(formulaId, message);
+  return true;
+}
+
 function disposeChart(el) {
   const old = echarts.getInstanceByDom(el);
   if (!old) return;
@@ -151,6 +194,7 @@ export function drawKvCurve(){
 
 
 export function drawConcurrency(){
+  if (replayTheoryUnavailable('chartConcurrency', 'formulaConcurrency')) return;
   let p=getParams(), r=calcAll(p);
   let levels=[],hbmVals=[],dramVals=[],ssdVals=[];
   let step=Math.max(1,Math.floor(p.concurrency/8));
@@ -200,44 +244,64 @@ export function refreshScheduleTab(){
 
 
 
-export function drawGantt(r = state.simResults[0], input = state.simInput){
+export function drawGantt(r = state.simResults[0], input = state.simInput, pageIndex){
+  const pager = $('ganttPagination');
+  if (pager) {
+    pager.hidden = true;
+    $('ganttPrev').onclick = null;
+    $('ganttNext').onclick = null;
+  }
   if (!r || !input?.params || !input?.strategies?.length) {
-    showRunPlaceholder(['chartGantt', 'chartBatchOcc'], ['formulaGantt']);
+    showRunPlaceholder(['chartGantt', 'chartBatchOcc'], ['formulaGantt', 'formulaBatchOcc']);
     return;
   }
   const p = input.params;
   const s = input.strategies[0];
-  drawBatchOccupancy(r);
-  let simEnd = r.simEnd || 1;
-  // 合并已完成 + 未完成请求（未完成的最终阶段用浅色显示，截至仿真结束时刻）
-  let timeline = (r.timeline || []).map(t => Object.assign({}, t, { state: 'done' }))
+  const replay = !!r.replay;
+  drawBatchOccupancy(r, input);
+  const simEnd = r.simEnd;
+  const allRows = (r.timeline || []).map(t => ({ ...t, state: 'done' }))
     .concat(r.incomplete || [])
-    .sort((a, b) => a.arrive - b.arrive);
-  // 容器高度随行数增长（每行22px，页面自然滚动），避免多请求被压扁成不可见的细线
-  let ganttEl = $('chartGantt');
-  let contH = Math.min(4400, Math.max(320, timeline.length * 22));
-  ganttEl.style.height = contH + 'px';
-  ganttEl.style.maxHeight = 'none';
-  let ch = initChart('chartGantt');
-  if (timeline.length === 0) {
-    ch.setOption({title:{text:'仿真窗口内无完成的请求（试试提高QPS/降低输出长度）',left:'center',top:'center',textStyle:{color:'#9ca0b0',fontSize:13}}});
-    setFormula('formulaGantt','无完成请求');
-    return;
+    .sort((a, b) => a.arrive - b.arrive || String(a.id).localeCompare(String(b.id), 'en', { numeric: true }));
+  const pages = Math.max(1, Math.ceil(allRows.length / GANTT_PAGE_SIZE));
+  const page = replay ? Math.max(0, Math.min(pages - 1, Math.trunc(pageIndex ?? ganttPages.get(r) ?? 0))) : 0;
+  ganttPages.set(r, page);
+  const offset = replay ? page * GANTT_PAGE_SIZE : 0;
+  const timeline = replay ? allRows.slice(offset, offset + GANTT_PAGE_SIZE) : allRows;
+  if (pager) {
+    pager.hidden = !replay;
+    if (replay) {
+      const n = r.replay.counts;
+      $('ganttPageStatus').textContent = `${allRows.length ? offset + 1 : 0}–${offset + timeline.length} / ${n.arrived} · 第 ${page + 1}/${pages} 页 · 成功 ${n.successful} / 失败 ${n.failed} / 已到达未完成 ${n.arrivedUnfinished}`;
+      $('ganttPrev').disabled = page === 0;
+      $('ganttNext').disabled = page === pages - 1;
+      $('ganttPrev').onclick = () => drawGantt(r, input, page - 1);
+      $('ganttNext').onclick = () => drawGantt(r, input, page + 1);
+    }
   }
-  const FADE = { opacity: 0.35 };
-  let categories = timeline.map(t => 'Req #' + t.id + (t.state !== 'done' ? ' ⏸' : ''));
-  let queueData = [], waitComputeData = [], prefillData = [], decodeData = [];
-  timeline.forEach(t => {
-    if (t.admitTime != null) queueData.push([t.id, t.arrive, t.admitTime]);
-    else queueData.push({ value: [t.id, t.arrive, simEnd], itemStyle: FADE });
-    if (t.prefillStart != null) waitComputeData.push([t.id, t.admitTime, t.prefillStart]);
-    else if (t.state === 'prefillQ') waitComputeData.push({ value: [t.id, t.admitTime, simEnd], itemStyle: FADE });
-    if (t.prefillEnd != null) prefillData.push([t.id, t.prefillStart, t.prefillEnd]);
-    else if (t.state === 'prefilling') prefillData.push({ value: [t.id, t.prefillStart, simEnd], itemStyle: FADE });
-    if (t.completeTime != null) decodeData.push([t.id, t.prefillEnd, t.completeTime]);
-    else if (t.state === 'decoding' || t.state === 'decodeWait') decodeData.push({ value: [t.id, t.prefillEnd, simEnd], itemStyle: FADE });
+  const ganttEl = $('chartGantt');
+  ganttEl.style.height = Math.min(4400, Math.max(320, timeline.length * 22)) + 'px';
+  ganttEl.style.maxHeight = 'none';
+  const ch = initChart('chartGantt');
+  const status = t => t.state === 'done' ? '成功' : t.state === 'failed' ? '失败' : '截止未完成 (' + t.state + ')';
+  const categories = timeline.map(t => 'Req #' + t.id + (replay || t.state !== 'done' ? ' · ' + status(t) : ''));
+  const queueData = [], waitComputeData = [], prefillData = [], decodeData = [], failedData = [];
+  timeline.forEach((t, row) => {
+    const end = t.state === 'done' ? t.completeTime : t.state === 'failed' ? t.failedAt : simEnd;
+    const segment = (data, start, stop) => {
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+      const finish = Math.min(stop ?? end, end);
+      if (finish < start || (replay && finish === start)) return;
+      const value = [row, start, finish];
+      data.push(stop == null ? { value, itemStyle: { opacity: 0.35 } } : value);
+    };
+    segment(queueData, t.arrive, t.admitTime);
+    segment(waitComputeData, t.admitTime, t.prefillStart);
+    segment(prefillData, t.prefillStart, t.prefillEnd);
+    segment(decodeData, t.prefillEnd, t.completeTime);
+    if (t.state === 'failed') failedData.push([row, end, end]);
   });
-  let maxT = Math.max(simEnd, ...timeline.map(t => t.completeTime || 0), 0.01);
+  const maxT = replay ? simEnd : Math.max(simEnd, ...timeline.map(t => t.completeTime || 0), 0.01);
 
   function makeGanttSeries(name, color, data) {
     return { name: name, type: 'custom', renderItem: function(params, api) {
@@ -248,11 +312,16 @@ export function drawGantt(r = state.simResults[0], input = state.simInput){
   }
 
   ch.setOption({
+    title: timeline.length ? undefined : { text: replay ? '全程无实际到达请求' : '无请求记录', left: 'center', top: 'center', textStyle: { color: '#9ca0b0', fontSize: 13 } },
     tooltip: { trigger: 'item', formatter: p => {
-      let d = p.data; return p.seriesName + '<br/>开始: ' + d[1].toFixed(3) + 's<br/>结束: ' + d[2].toFixed(3) + 's<br/>持续: ' + (d[2] - d[1]).toFixed(3) + 's';
+      const d = Array.isArray(p.data) ? p.data : p.data.value;
+      const t = timeline[d[0]];
+      const detail = t.state === 'failed' ? '<br/>失败原因: ' + escapeHtml(t.reason) : '';
+      return 'Req #' + escapeHtml(t.id) + ' · ' + escapeHtml(status(t)) + detail + '<br/>' + escapeHtml(p.seriesName) +
+        '<br/>开始: ' + numberText(d[1], 3, 's') + '<br/>结束: ' + numberText(d[2], 3, 's') + '<br/>持续: ' + numberText(d[2] - d[1], 3, 's');
     }},
-    legend: { data: ['Queue(等槽位/显存)', 'Wait(等算力)', 'Prefill', 'Decode'], top: 0, textStyle: { color: '#9ca0b0' } },
-    grid: { left: 80, right: 46, top: 40, bottom: 20 },
+    legend: { data: ['Queue(等槽位/显存)', 'Wait(等算力)', 'Prefill', 'Decode', ...(failedData.length ? ['失败'] : [])], top: 0, textStyle: { color: '#9ca0b0' } },
+    grid: { left: replay ? 220 : 80, right: 46, top: 40, bottom: 20 },
     // 只用 slider 缩放：移除 inside dataZoom——它即使 zoomOnMouseWheel:'shift' 仍会拦截滚轮事件，导致页面无法滚动
     dataZoom: [
       { type: 'slider', yAxisIndex: 0, right: 4, width: 14,
@@ -261,39 +330,51 @@ export function drawGantt(r = state.simResults[0], input = state.simInput){
         fillerColor: 'rgba(108,99,255,.25)', handleStyle: { color: '#6c63ff' },
         textStyle: { color: '#9ca0b0' } }
     ],
-    xAxis: { type: 'value', name: '时间(s)', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' }, max: maxT },
+    xAxis: { type: 'value', name: '时间(s)', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' }, min: 0, max: maxT },
     yAxis: { type: 'category', data: categories, axisLabel: { color: '#e4e4e7', fontSize: 9 } },
     series: [
       makeGanttSeries('Queue(等槽位/显存)', 'rgba(228,228,235,0.55)', queueData),
       makeGanttSeries('Wait(等算力)', '#fbbf24', waitComputeData),
       makeGanttSeries('Prefill', '#fb923c', prefillData),
       makeGanttSeries('Decode', '#6c63ff', decodeData),
+      ...(failedData.length ? [{ name: '失败', type: 'scatter', symbol: 'diamond', symbolSize: 10, encode: { x: 1, y: 0 }, data: failedData, itemStyle: { color: '#f87171' } }] : []),
     ]
   });
 
+  if (replay) {
+    const n = r.replay.counts;
+    setFormula('formulaGantt', resultCaption(r, input) + '<br>总到达 ' + n.arrived + ' · 成功 ' + n.successful + ' / 失败 ' + n.failed +
+      ' / 已到达未完成 ' + n.arrivedUnfinished + '；按到达时间、请求 ID 排序，每页 100 行。未到达请求仅保留摘要计数。<br>' +
+      'Queue = 到达→准入；Wait = 准入→Prefill 开始；Prefill = 开始→结束；Decode = Prefill 结束→成功完成（含期间等待，不提供逐 token 或细粒度等待事件）。<br>' +
+      '失败段止于 failedAt，未完成段止于 simEnd；浅色表示该阶段未结束，菱形表示失败时刻，未发生阶段不绘制。<br>' + truncationNotice(r));
+    return;
+  }
   setFormula('formulaGantt',
-    '<b>📐 计算方式 — 仿真引擎真实事件（两级排队）</b><br>'+
+    resultCaption(r, input) + '<br><b>计算方式 — 仿真引擎阶段记录（两级排队）</b><br>'+
     '• <b>Queue(灰)</b> = 到达 → 准入：等 batch 槽位(≤max_batch_size) + 显存可放置(含淘汰/传输耗时)<br>'+
-    '• <b>Wait(黄)</b> = 准入 → prefill开始：等算力——prefill 串行，同一时刻只有一个请求在做 prefill，排在前面的 prefill 全部完成才轮到<br>'+
-    '• <b>Prefill(橙)</b> = 并行计算：<code>per-token τ(i)=a+b·i μs</code>（位置感知；a/b 即引擎的速度权威来源，'+(p.mfuAuto?'Roofline 自动判瓶颈':'MFU='+(p.mfu*100).toFixed(0)+'% 计算瓶颈口径')+'；sharer 跳过已缓存前缀；当前 a='+p.prefillA+', b='+p.prefillB+'）<br>'+
-    '• <b>Decode(紫)</b> = 批次前向：<code>passTime = max[(权重+批次KV)/HBM带宽, Σ下层KV/链路带宽, 算力下限]</code>，KV在下层时批次整体变慢<br>'+
-    '• "Queue短+黄段长" = 槽位/显存充裕但 prefill 是瓶颈的典型形态 · 策略 <code>'+(s.name||'当前策略')+'</code> · 完成 <code>'+r.completed+'/'+r.totalReqs+'</code> · 平均排队 <code>'+r.avgQueue.toFixed(2)+'s</code><br>'+
-    '• 共 <code>'+timeline.length+'</code> 行（完成 '+r.completed+' + 未完成 '+(r.incomplete||[]).length+'，按到达排序；浅色段=仿真结束时仍滞留在该阶段 ⏸）<br>'+
-    (r.truncated ? '• <b style="color:var(--accent4)">⚠ 仿真窗口截断</b>：'+(r.totalReqs-r.completed)+' 个请求未完成（窗口 '+r.simEnd.toFixed(0)+'s 触顶），TTFT/P99 基于不完整样本，跨配置比较会失真——排水估计 '+r.drainEst.toFixed(0)+'s，建议将「仿真窗口上限」调大至 ≥'+(r.drainEst*1.5).toFixed(0)+'s 跑完全部请求<br>' : '')+
-    '• 下方并发占用图: Decode并发数>1 的时段即多请求并行计算（同一批次共享一次前向）；Prefill 串行为建模简化（期间 decode 减速×2 近似 chunked-prefill 竞争）'
+    '• <b>Wait(黄)</b> = 准入 → Prefill 开始，记录准入后的等待区间，不细分等待事件<br>'+
+    '• <b>Prefill(橙)</b> = 开始 → 结束的墙钟区间（可含竞争等待）；计算模型 <code>per-token τ(i)=a+b·i μs</code>（'+(p.mfuAuto?'Roofline 自动判瓶颈':'MFU='+(p.mfu*100).toFixed(0)+'% 计算瓶颈口径')+'；当前 a='+p.prefillA+', b='+p.prefillB+'）<br>'+
+    '• <b>Decode(紫)</b> = Prefill 结束 → 成功完成，含期间等待；不提供逐 token 或细粒度等待事件<br>'+
+    '• 策略 <code>'+escapeHtml(s.name||'当前策略')+'</code> · 完成 <code>'+r.completed+'/'+r.totalReqs+'</code> · 平均排队 <code>'+r.avgQueue.toFixed(2)+'s</code><br>'+
+    '• 共 <code>'+timeline.length+'</code> 行（完成 '+r.completed+' + 未完成 '+(r.incomplete||[]).length+'，按到达时间、请求 ID 排序；浅色段=仿真结束时仍滞留在该阶段）<br>'+
+    (r.truncated ? truncationNotice(r) + '<br>' : '')+
+    '• 下方并发占用图为定时采样的 Prefill / Decode 活动请求数，不是逐事件执行轨迹'
   );
 }
 
 
 
-function drawBatchOccupancy(r) {
+function drawBatchOccupancy(r, input) {
   const occ = r.concTimeline || [];
+  const interval = r.replay?.samples.legacy.concurrencySampleIntervalSeconds ?? 0.01;
+  setFormula('formulaBatchOcc', resultCaption(r, input) + '<br>活跃期约 ' + numberText(interval * 1000, 0) +
+    'ms 定时采样，空闲跳步由边界点表示；非完整事件流。排队深度 = 等准入 + 等 Prefill，不含 Decode 等待。');
   const ch = initChart('chartBatchOcc');
   ch.setOption({
     tooltip: { trigger: 'axis' },
     legend: { data: ['Decode并发数', 'Prefill占用', '排队深度'], top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } },
     grid: { left: 60, right: 30, top: 30, bottom: 25 },
-    xAxis: { type: 'value', name: '时间(s)', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
+    xAxis: { type: 'value', name: '时间(s)', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' }, min: 0, max: r.simEnd },
     yAxis: { type: 'value', name: '请求数', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' }, minInterval: 1 },
     series: [
       { name: 'Decode并发数', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[1]]),
@@ -307,6 +388,7 @@ function drawBatchOccupancy(r) {
 }
 
 export function drawBatching(){
+  if (replayTheoryUnavailable('chartBatching', 'formulaBatching')) return;
   let p=getParams(), r=calcAll(p);
   let batchSizes=[1,2,4,8,16,32,64,128,256];
   let avgKv = r.avgLifetimeKv;
@@ -347,6 +429,7 @@ export function drawBatching(){
 
 
 export function drawPrefixSharing(){
+  if (replayTheoryUnavailable('chartPrefix', 'formulaPrefix')) return;
   let p=getParams(), r=calcAll(p);
   let hitRates=[0,10,20,30,40,50,60,70,80,90,100];
   let groupRatios=PREFIX_RATIOS;
@@ -383,6 +466,7 @@ export function drawPrefixSharing(){
 
 
 export function drawEviction(){
+  if (replayTheoryUnavailable('chartEviction', 'formulaEviction')) return;
   let p=getParams();
   let cacheSizes_pct=[5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95];
   let nBlocks=200,nRequests=5000;
@@ -482,6 +566,47 @@ export function drawEviction(){
 
 
 
+function replayMetricItems(sr) {
+  const m = sr.replay.windows.measurement, n = sr.replay.counts, cache = m.cache;
+  const items = [];
+  for (const [name, key, unit] of [['TTFT', 'ttft', ' ms'], ['TPOT', 'tpot', ' ms/token'], ['E2E', 'endToEnd', ' ms']]) {
+    const d = m.latency[key];
+    for (const [label, field] of [['均值', 'mean'], ['P50', 'p50'], ['P99', 'p99']]) {
+      items.push([name + '(' + label + ')', numberText(d[field], 3, unit), 'accent']);
+    }
+    items.push([name + '(样本数)', numberText(d.count, 0), 'accent']);
+  }
+  items.push(
+    ['到达 QPS', numberText(m.arrivalQps, 3, ' 请求/秒'), 'green'],
+    ['完成 QPS', numberText(m.completionQps, 3, ' 请求/秒'), 'green'],
+    ['Token 命中率', numberText(cache.hitRate == null ? null : cache.hitRate * 100, 2, '%'), 'green'],
+    ['命中 token 数', numberText(cache.hitL1Tokens + cache.hitL2Tokens + cache.hitL3Tokens, 0), 'green'],
+    ['未命中 token 数', numberText(cache.missTokens, 0), 'orange'],
+    ['输入 token 数', numberText(cache.inputTokens, 0), 'accent'],
+  );
+  for (const [label, key] of [['计划请求', 'planned'], ['到达请求', 'arrived'], ['完成请求', 'successful'], ['失败请求', 'failed'],
+    ['取消请求', 'cancelled'], ['未完成请求', 'unfinished'], ['已到达未完成', 'arrivedUnfinished'], ['待到达', 'pendingArrival'], ['等待前置触发', 'waitingAnchor']]) {
+    items.push([label + '(全程)', numberText(n[key], 0), 'accent']);
+  }
+  items.push(
+    ['输出吞吐(全程)', numberText(sr.throughput, 3, ' tok/s'), 'green'],
+    ['显存利用率峰值(全程)', numberText(sr.memUtilPeak, 1, '%'), 'accent'],
+    ['显存利用率平均(全程)', numberText(sr.memUtilAvg, 1, '%'), 'accent'],
+    ['平均排队(全程成功请求)', numberText(n.successful ? sr.avgQueue : null, 3, ' s'), 'orange'],
+    ['Prefill 计算残差(全程)', numberText(sr.ttftBreakdown?.compute, 3, ' ms'), 'accent'],
+    ['Prefill 纯计算(全程)', numberText(sr.ttftBreakdown?.computeNet, 3, ' ms'), 'accent'],
+    ['算力竞争等待(全程)', numberText(sr.ttftBreakdown?.computeWait, 3, ' ms'), 'orange'],
+    ['Prefill GPU忙碌(全程)', numberText(sr.ttftBreakdown?.computeBusyMs, 3, ' ms'), 'accent'],
+    ['并发计算请求数(全程)', numberText(sr.ttftBreakdown?.computeConc, 1), 'accent'],
+    ['Decode 计算/pass(全程)', numberText(sr.passMs ? sr.passMs.hbm + sr.passMs.cmp + sr.passMs.comm : null, 3, ' ms/pass'), 'accent'],
+    ['瓶颈归因(全程)', sr.ptSamples ? bottleneckLabel(sr) : '无样本', 'accent'],
+  );
+  for (const name of ['L2读带宽', 'L3读带宽', 'L2驻留', 'L3驻留', '分层缓存能力', '物理 P/D 分离', '多实例分析']) {
+    items.push([name, '不适用', 'accent']);
+  }
+  return items;
+}
+
 export function drawStrategyMetrics() {
   const input = resultInputs();
   let grid = $('strategyMetricsGrid');
@@ -489,8 +614,11 @@ export function drawStrategyMetrics() {
   const { gv } = input;
   let rows = [];
   state.simResults.forEach(sr => {
-    rows.push('<div style="grid-column:1/-1;font-size:.78rem;color:var(--accent);margin-bottom:2px;border-bottom:1px solid var(--border);padding-bottom:4px;margin-top:8px">📌 '+sr.name+'</div>');
-    let items = [
+    const m = sr.replay?.windows.measurement;
+    const heading = sr.replay ? resultCaption(sr, { strategies: [{ name: sr.name }] }) + '<br>核心指标：measurement [' +
+      numberText(m.start) + ', ' + numberText(m.end) + ') s；延迟按成功请求到达归窗，完成 QPS 按完成事件归窗。全程分析单独标注。' : escapeHtml(sr.name);
+    rows.push('<div style="grid-column:1/-1;font-size:.78rem;color:var(--accent);margin-bottom:2px;border-bottom:1px solid var(--border);padding-bottom:4px;margin-top:8px">'+heading+'</div>');
+    let items = sr.replay ? replayMetricItems(sr) : [
       ['HBM命中率', (sr.hbmHitRate != null ? sr.hbmHitRate : 0).toFixed(1)+'%', 'green'],
       ['TTFT(均值)', sr.avgTtft.toFixed(0)+' ms', 'accent'],
       ['TTFT(P50)', sr.p50Ttft.toFixed(0)+' ms', 'accent'],
@@ -609,10 +737,8 @@ export function drawStrategyMetrics() {
       ['完成请求', sr.completed+'/'+sr.totalReqs+' ('+(sr.totalReqs>0?(sr.completed/sr.totalReqs*100).toFixed(0):0)+'%)', sr.truncated?'red':(sr.completed<sr.totalReqs?'orange':'green')],
       ['仿真窗口', sr.simEnd.toFixed(0)+' s'+(sr.truncated?' · ⚠截断':' · 排空'), sr.truncated?'red':'green'],
     ];
-    // 截断警示条：窗口触顶未排空 → TTFT/P99 基于不完整样本, 不可跨配置比较；给出建议上限值
-    if (state.simResults.some(s => s.truncated)) {
-      let worst = state.simResults.reduce((a, b) => (a.drainEst > b.drainEst ? a : b), state.simResults[0]);
-      rows.unshift('<div style="grid-column:1/-1;background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.4);border-radius:6px;padding:8px 12px;font-size:.75rem;color:var(--accent4);margin-bottom:4px">⚠ 仿真窗口截断：完成请求数不足，TTFT/P99 基于不完整样本（跨配置比较会失真）。排水估计 '+worst.drainEst.toFixed(0)+'s，建议将「仿真窗口上限」调大至 ≥'+(worst.drainEst*1.5).toFixed(0)+'s 或对比 TPOT/吞吐。</div>');
+    if (sr.truncated) {
+      rows.push('<div style="grid-column:1/-1;color:var(--accent4)">' + truncationNotice(sr) + '</div>');
     }
     items.forEach(it => {
       rows.push('<div class="result-item"><div class="rl">'+it[0]+'</div><div class="rv '+it[2]+'">'+it[1]+'</div></div>');
@@ -643,9 +769,10 @@ export function drawStrategyTierDemand(){
     return;
   }
   const p = input.params;
+  const replay = !!state.simResults[0]?.replay;
   let colors = {hbm:'#6c63ff', l2:'#fb923c', l3:'#f87171', cmp:'#34d399', comm:'#9ca0b0'};
   let names = {hbm:'HBM读', l2:'L2读', l3:'L3读', cmp:'算力下限', comm:'TP通信'};
-  let keys = ['hbm','l2','l3','cmp','comm'];
+  let keys = replay ? ['hbm','cmp','comm'] : ['hbm','l2','l3','cmp','comm'];
   // 图1: TTFT 分解 + passTime 分解（各 100% 堆叠，每策略两条）
   // TTFT 条 = prefill 段时间账（到达排队/准入排队/L3拉取/计算）；passTime 条 = decode 每 token 前向账
   // ——区分「TTFT 时间花在哪」vs「延迟(每前向)时间花在哪」，L3 拉取与 L3 读的落点一目了然
@@ -655,11 +782,19 @@ export function drawStrategyTierDemand(){
   let ttftNames = ['TTFT·到达排队','TTFT·prefill排队','TTFT·L3拉取','TTFT·纯计算','TTFT·算力竞争等待'];
   let ttftKeys = ['queue','prefillQ','fetch','computeNet','computeWait'];
   let ttftColors = ['#B5D4F4','#85B7EB','#FAC775','#185FA5','#C8341F'];
+  if (replay) {
+    ttftNames.splice(2, 1);
+    ttftKeys.splice(2, 1);
+    ttftColors.splice(2, 1);
+  }
   let ycats = [];
-  state.simResults.forEach(s => { ycats.push(s.name + ' · TTFT'); ycats.push(s.name + ' · 每token前向'); });
+  state.simResults.forEach(s => {
+    ycats.push(s.name + ' · TTFT' + (replay ? ' (全程)' + (!s.ttftBreakdown ? ' 无样本' : '') : ''));
+    ycats.push(s.name + ' · 每token前向' + (replay ? ' (全程)' + (!s.ptSamples ? ' 无样本' : '') : ''));
+  });
   let ch = initChart('chartStrategyPt');
   ch.setOption({
-    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},valueFormatter:v=>v.toFixed(1)+'%'},
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},valueFormatter:v=>numberText(v,1,'%')},
     legend:{data:[...ttftNames, ...keys.map(k=>names[k])],top:0,textStyle:{color:'#9ca0b0',fontSize:9}},
     grid:{left:120,right:30,top:46,bottom:24},
     xAxis:{type:'value',name:'占比(%)',max:100,nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
@@ -667,22 +802,30 @@ export function drawStrategyTierDemand(){
     series:[
       ...ttftKeys.map((k,i)=>({
         name:ttftNames[i],type:'bar',stack:'ttft',barMaxWidth:22,
-        data:state.simResults.map(s=>{ let b=s.ttftBreakdown; if(!b) return 0;
+        data:state.simResults.flatMap(s=>{ let b=s.ttftBreakdown; if(!b) return [null, null];
           let t=b.queue+b.prefillQ+b.fetch+b.compute;
-          // 旧结果无二级拆分字段 ⇒ 整块 compute 归入"纯计算", 竞争段为 0(口径向后兼容)
           let v = (b.computeNet == null)
             ? (k==='computeNet' ? b.compute : (k==='computeWait' ? 0 : b[k]))
             : b[k];
-          return t>0?+((v||0)/t*100).toFixed(1):0; }),
+          return [t > 0 && Number.isFinite(v) ? chartNumber(v / t * 100) : null, null]; }),
         itemStyle:{color:ttftColors[i]}
       })),
       ...keys.map(k=>({
         name:names[k],type:'bar',stack:'pt',barMaxWidth:22,
-        data:state.simResults.map(s=>+(s.ptBreakdown ? s.ptBreakdown[k] : 0).toFixed(1)),
+        data:state.simResults.flatMap(s=>[null, chartNumber(s.ptBreakdown?.[k])]),
         itemStyle:{color:colors[k]}
       }))
     ]
   });
+  if (replay) {
+    const message = '不适用：当前 Replay 未仿真 L2/L3 读带宽、驻留及分层缓存能力。';
+    showChartMessage('chartStrategyBwReq', message);
+    showChartMessage('chartStrategyResident', message);
+    setFormula('formulaStrategyTier', resultCaption(state.simResults[0], state.simInput) +
+      '<br>延迟分解为全程统计（顶层 ttftBreakdown，均值单位 ms；ptBreakdown，名义前向分量占比 %），不是 measurement。<br>' +
+      'TTFT 分解 = 到达排队 + Prefill 排队 + 纯计算 + 算力竞争等待；纯计算与等待是 compute 残差的拆分。前向分解展示 HBM 读、算力下限和 TP 通信的名义分量，不等于可相加的实际延迟。无样本序列留空。<br>' + message);
+    return;
+  }
   // 图2: L2/L3 带宽需求 P99/峰值 vs 配置带宽
   let ch2 = initChart('chartStrategyBwReq');
   ch2.setOption({
@@ -736,23 +879,37 @@ export function drawStrategyComparisonGantt() {
     return;
   }
   const { control: $, gv, gi } = input;
+  const replay = !!state.simResults[0]?.replay;
+  const hitName = replay ? 'Token命中率(measurement,%)' : 'HBM命中率(%)';
+  const memoryName = replay ? '显存利用率峰值(全程,%)' : '显存利用率峰值(%)';
+  const latency = (s, key) => replay ? chartNumber(s.replay.windows.measurement.latency.endToEnd[key], 3) : chartNumber(s[key], 0);
   let ch = initChart('chartStrategyGantt');
   ch.setOption({
-    tooltip: { trigger: 'axis' },
-    legend: { data: ['HBM命中率(%)', 'P50延迟(ms)', 'P99延迟(ms)', '显存利用率峰值(%)'], top: 0, textStyle: { color: '#9ca0b0' } },
+    tooltip: { trigger: 'axis', valueFormatter: v => numberText(v) },
+    legend: { data: [hitName, 'P50延迟(ms)', 'P99延迟(ms)', memoryName], top: 0, textStyle: { color: '#9ca0b0' } },
     grid: { left: 100, right: 70, top: 50, bottom: 30 },
     xAxis: { type: 'category', data: state.simResults.map(s => s.name), axisLabel: { color: '#e4e4e7', rotate: 20, fontSize: 10 } },
     yAxis: [
-      { type: 'value', name: '百分比/延迟', axisLabel: { color: '#9ca0b0' } },
+      { type: 'value', name: '百分比(%)', axisLabel: { color: '#9ca0b0' } },
       { type: 'value', name: '延迟(ms)', axisLabel: { color: '#9ca0b0' } }
     ],
     series: [
-      { name: 'HBM命中率(%)', type: 'bar', data: state.simResults.map(s => +(s.hbmHitRate || 0).toFixed(1)), itemStyle: { color: '#34d399' } },
-      { name: '显存利用率峰值(%)', type: 'bar', data: state.simResults.map(s => +s.memUtilPeak.toFixed(1)), itemStyle: { color: '#fb923c' } },
-      { name: 'P50延迟(ms)', type: 'line', yAxisIndex: 1, data: state.simResults.map(s => +s.p50.toFixed(0)), itemStyle: { color: '#6c63ff' }, lineStyle: { color: '#6c63ff', width: 2 } },
-      { name: 'P99延迟(ms)', type: 'line', yAxisIndex: 1, data: state.simResults.map(s => +s.p99.toFixed(0)), itemStyle: { color: '#f87171' }, lineStyle: { color: '#f87171', width: 2 } },
+      { name: hitName, type: 'bar', data: state.simResults.map(s => {
+        const rate = replay ? s.replay.windows.measurement.cache.hitRate : s.hbmHitRate;
+        return chartNumber(rate == null ? null : rate * (replay ? 100 : 1), replay ? 2 : 1);
+      }), itemStyle: { color: '#34d399' } },
+      { name: memoryName, type: 'bar', data: state.simResults.map(s => chartNumber(s.memUtilPeak)), itemStyle: { color: '#fb923c' } },
+      { name: 'P50延迟(ms)', type: 'line', yAxisIndex: 1, data: state.simResults.map(s => latency(s, 'p50')), itemStyle: { color: '#6c63ff' }, lineStyle: { color: '#6c63ff', width: 2 } },
+      { name: 'P99延迟(ms)', type: 'line', yAxisIndex: 1, data: state.simResults.map(s => latency(s, 'p99')), itemStyle: { color: '#f87171' }, lineStyle: { color: '#f87171', width: 2 } },
     ]
   });
+  if (replay) {
+    const r = state.simResults[0], m = r.replay.windows.measurement;
+    setFormula('formulaStrategySim', resultCaption(r, state.simInput) + '<br>核心指标：measurement [' + numberText(m.start) + ', ' + numberText(m.end) +
+      ') s。Token 命中率来自 token 前缀复用（比率 ×100%），不是 HBM 访问命中率。P50/P99 为成功请求端到端延迟 (ms)，按到达归窗。<br>' +
+      '完成 QPS 按完成事件归窗；输出吞吐 tok/s 为全程分析，不是请求 QPS。显存利用率峰值为全程统计；空项表示无样本。<br>' + truncationNotice(r));
+    return;
+  }
   setFormula('formulaStrategySim',
     '<b>📐 仿真说明（事件驱动，全部指标来自真实统计）</b><br>'+
     '• 请求生成: <code>N = 请求数 = '+Math.min(gi('pConcurrency'),256)+'</code> 个 · 到达: '+($('pArrivalDist')&&$('pArrivalDist').value==='uniform'

@@ -55,7 +55,10 @@ async function run(page, selector = runButton) {
 
 function expectTimeline(snapshot, result) {
   const [gantt, occupancy] = snapshot.charts.slice(-2);
-  expect(gantt.series.find(s => s.name === 'Decode').data).toEqual([...result.timeline].sort((a, b) => a.arrive - b.arrive).map(t => [t.id, t.prefillEnd, t.completeTime]));
+  expect(result.incomplete).toHaveLength(0);
+  const rows = [...result.timeline].sort((a, b) => a.arrive - b.arrive || a.id - b.id);
+  expect(gantt.yAxis[0].data).toEqual(rows.map(t => `Req #${t.id}`));
+  expect(gantt.series.find(s => s.name === 'Decode').data).toEqual(rows.map((t, row) => [row, t.prefillEnd, t.completeTime]));
   expect(occupancy.series.map(s => s.data)).toEqual([1, 2, 3].map(index => result.concTimeline.map(point => [point[0], point[index]])));
   expect(snapshot.metrics).toContain(`${result.avgTtft.toFixed(0)} ms`);
   expect(snapshot.formulas[2]).toContain(`${result.completed}/${result.totalReqs}`);
