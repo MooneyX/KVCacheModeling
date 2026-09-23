@@ -38,11 +38,35 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   }
   for (let k in overrides) { if (k !== 'seed' && k !== 'nreq' && k !== 'hwPreset' && k !== 'replay') p[k] = overrides[k]; }
   let replayMetrics = null;
+  const replayActive = overrides.replay === undefined ? null : new Map();
+  const replayIncomplete = [];
+  function replayTimelineRecord(req, reason) {
+    // 阶段时刻初始为 0，Replay 的实际到达严格晚于 0；未发生阶段不能作为时间 0 绘制。
+    const phaseTime = time => Number.isFinite(time) && time >= req.arrive ? time : null;
+    return {
+      id: req.id, templateIndex: req.templateIndex, launchIndex: req.launchIndex, requestIndex: req.requestIndex,
+      arrive: req.arrive, admitTime: phaseTime(req.admitTime),
+      prefillStart: phaseTime(req.prefillStart), prefillEnd: phaseTime(req.prefillEnd),
+      completeTime: !reason && req.state === 'done' ? req.completeTime : null,
+      state: reason ? 'failed' : ({ wait: 'queued', prefill: 'prefilling', decode: 'decoding' }[req.state] || req.state),
+      ...(reason ? { failedAt: req.completeTime, reason } : {}),
+    };
+  }
   const replay = overrides.replay === undefined ? null : createReplayRuntime(overrides.replay, {
     qps: p.qps, seed: overrides.seed ?? p.seed,
     hooks: {
-      launch: event => replayMetrics.launch(event), arrive: req => replayMetrics.arrive(req),
-      complete: req => replayMetrics.complete(req), fail: (req, reason) => replayMetrics.fail(req, reason),
+      launch: event => replayMetrics.launch(event),
+      arrive: req => { replayMetrics.arrive(req); replayActive.set(req.id, req); },
+      complete: req => {
+        replayMetrics.complete(req);
+        timeline.push(replayTimelineRecord(req));
+        replayActive.delete(req.id);
+      },
+      fail: (req, reason) => {
+        replayMetrics.fail(req, reason);
+        replayIncomplete.push(replayTimelineRecord(req, reason));
+        replayActive.delete(req.id);
+      },
       cancel: (req, time) => replayMetrics.cancel(req, time),
     },
   });
@@ -1302,7 +1326,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     stats.completed++; stats.outTokens += req.outputLen;
     // 每实例完成计数(S2): 按请求被路由到的实例归属(不用当前 inst, 更稳)
     if (instances[req.instId || 0]) instances[req.instId || 0].nCompleted++;
-    if (timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
+    if (!replay && timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
       prefillStart: req.prefillStart, prefillEnd: req.prefillEnd, completeTime: now });
 
     if (replay) {
@@ -1465,7 +1489,19 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     });
   }
 
+  function sampleReplayConcurrency(time) {
+    const point = [time, 0, 0, 0];
+    for (const xi of instances) {
+      point[1] += xi.decoding.length;
+      point[2] += xi.prefilling.length;
+      point[3] += xi.waitQueue.length + xi.prefillQ.length;
+    }
+    if (stats.concSamples.at(-1)?.[0] === time) stats.concSamples[stats.concSamples.length - 1] = point;
+    else stats.concSamples.push(point);
+  }
+
   for (let step = 0; step < maxSteps; step++) {
+    let replayIdleLanding = false;
     now = replay ? Math.min(step * DT, simCap) : step * DT;
     if (replay) {
       if (step % 1024 === 0) replay.checkWallTime();
@@ -1500,8 +1536,10 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
       if (!Number.isFinite(next) && !replay.done) throw new Error('Replay scheduling invariant: unresolved anchors without future events');
       const target = Math.min(simCap, next, replay.done ? Math.max(now, replay.options.durationSeconds) : Infinity);
       if (target > now) {
+        sampleReplayConcurrency(now);
         step = Math.ceil(target / DT);
         now = Math.min(step * DT, simCap);
+        replayIdleLanding = true;
       }
     }
     if (!replay && pending.length && allIdle) {
@@ -2219,8 +2257,13 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     // 传输差分基准：本步末的累计值 → 下一步初的差分起点
     stats._prevL2 = stats.transferL2Bytes;
     stats._prevL3 = stats.transferL3Bytes;
-    if (step % 5 === 0 && (!replay || stats.concSamples.length < 20_000)) {
-      stats.concSamples.push([+now.toFixed(2), _sDec, _sPf, _sQ]);
+    if (replay) {
+      const becameIdle = _sDec + _sPf + _sQ === 0 && !replayCompletions.length
+        && stats.concSamples.at(-1)?.slice(1).some(count => count > 0);
+      if (step % 5 === 0 || replayIdleLanding || becameIdle) sampleReplayConcurrency(now);
+    }
+    if (step % 5 === 0 && (!replay || stats.l2Series.length < 20_000)) {
+      if (!replay) stats.concSamples.push([+now.toFixed(2), _sDec, _sPf, _sQ]);
       // L2/L3 驻留时间序列（GB）——策略行为的瞬态画像（预取/淘汰波次可见）
       stats.l2Series.push([+now.toFixed(2), +(_sDram / 1e9).toFixed(2)]);
       stats.l3Series.push([+now.toFixed(2), +(_sSsd / 1e9).toFixed(2)]);
@@ -2247,6 +2290,7 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     }
   }
   let simEnd = Math.max(now, 1e-6);
+  if (replay) sampleReplayConcurrency(simEnd);
   let truncated = !drained; // 未排空即结束 ⇒ 窗口截断（实际排水超上限；调大「仿真窗口上限」可跑完）
 
   // ---------- 指标 ----------
@@ -2273,9 +2317,13 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   let avgQueue = stats.queueWaits.length ? stats.queueWaits.reduce((a, b) => a + b, 0) / stats.queueWaits.length : 0;
 
   // 未完成请求：记录截至仿真结束的部分生命周期（甘特图浅色显示）
-  let incomplete = [];
+  let incomplete = replay ? replayIncomplete : [];
+  if (replay) {
+    for (const req of replayActive.values()) incomplete.push(replayTimelineRecord(req));
+    replayActive.clear();
+  }
   // 未完成请求列表: 跨全部实例汇总(S2)
-  instances.forEach(xi => {
+  if (!replay) instances.forEach(xi => {
     xi.waitQueue.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: null, prefillStart: null, prefillEnd: null, completeTime: null, state: 'queued' }));
     xi.prefillQ.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: null, prefillEnd: null, completeTime: null, state: 'prefillQ' }));
     xi.kvXfer.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'kvXfer' }));
@@ -2284,7 +2332,6 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
     xi.decoding.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decoding' }));
   });
 
-  if (replay) incomplete = incomplete.slice(0, 320);
   const result = {
     name: strategy.name || autoNameStrategy(strategy),
     hbmHitRate, p50, p99, avgLatency: mean, avgTtft, p50Ttft, p99Ttft, avgTpot, p50Tpot, p99Tpot, avgQueue, fairnessCV,
@@ -2537,9 +2584,11 @@ export function runSimulation(params, strategy, overrides, strategyMode = "dsl")
   if (replay) {
     Object.assign(result.replay.cache, replayCache.snapshot());
     result.replay.samples.legacy = {
-      maxSeriesSamples: 20_000, maxTimelineSamples: 320,
-      concurrencyCoverage: stats.concSamples.length ? [stats.concSamples[0][0], stats.concSamples.at(-1)[0]] : null,
+      requestCoverage: 'all-arrived-requests',
+      concurrencySampling: 'periodic-with-idle-boundaries', concurrencySampleIntervalSeconds: DT * 5,
+      concurrencyCoverage: [stats.concSamples[0][0], stats.concSamples.at(-1)[0]],
       completedTimelineSamples: timeline.length, incompleteTimelineSamples: incomplete.length,
+      residentMaxSeriesSamples: 20_000, residentSampling: 'first-20000-periodic-samples',
       bandwidthSamples: stats.l2Inst.length, bandwidthSampling: 'first-20000-decode-steps',
       requestArrayLimit: replay.launcher.limits.maxRequests,
     };

@@ -9,6 +9,7 @@ import { runSimulation } from '../../src/core/simulation.js';
 import { calcAll } from '../../src/core/calculations.js';
 import { DEFAULT_REPLAY_RUN_LIMITS, flattenReplaySession, compileReplaySession } from '../../src/core/replay.js';
 import { extractSensMetrics } from '../../src/application/metrics.js';
+import { visualizationCases } from '../fixtures/replay-visualization.mjs';
 
 const require = createRequire(import.meta.url);
 const { createTaskServer } = require('../../dist/node/server-library.cjs');
@@ -355,6 +356,36 @@ test('M1: D=0 reaches the worker hard cutoff and failed anchors retain their exi
     assert.equal(failed.replay.counts.cancelled, 1);
     assert.equal(failed.replay.counts.anchor_unavailable, 1);
     assert.equal(failed.completed, 1);
+  } finally { await app.dispose(); }
+});
+
+test('V2: worker returns complete drawing arrays and rejects over-budget results without success points', async () => {
+  const app = await setup();
+  try {
+    for (const name of ['manySuccessful', 'manyUnfinished', 'mixed', 'longActive']) {
+      const { result } = await completedReplay(app, visualizationCases[name]);
+      const counts = result.replay.counts;
+      assert.equal(result.timeline.length, counts.successful);
+      assert.equal(result.incomplete.length, counts.failed + counts.arrivedUnfinished);
+      assert.equal(result.timeline.length + result.incomplete.length, counts.arrived);
+      assert.equal(result.concTimeline.at(-1)[0], result.simEnd);
+      if (name === 'manySuccessful') assert.equal(result.timeline.length, 400);
+      if (name === 'manyUnfinished') assert.equal(result.incomplete.length, 400);
+      if (name === 'longActive') assert.ok(result.concTimeline.length > 20_000);
+    }
+    for (const name of ['manySuccessful', 'longActive']) {
+      const job = structuredClone(visualizationCases[name]);
+      job.overrides.replay.options.limits = { maxResultBytes: 1024 };
+      const response = await app.request('/api/tasks', 'POST', submission([job]));
+      assert.equal(response.status, 202);
+      const id = (await response.json()).id;
+      const finished = await waitTask(app, id);
+      assert.equal(finished.status, 'failed');
+      assert.match(finished.error, /replay\.result.*resource limit/);
+      assert.equal(finished.completed, 0);
+      assert.deepEqual((await (await app.request(`/api/tasks/${id}/points`)).json()).points, []);
+      assert.deepEqual((await (await app.request(`/api/tasks/${id}/download`)).json()).points, []);
+    }
   } finally { await app.dispose(); }
 });
 
