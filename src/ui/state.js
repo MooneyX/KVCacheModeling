@@ -4,6 +4,8 @@ export const state = {
   savedStrategies: [],
   simResults: [],
   simInput: null,
+  simRunning: false,
+  workloadSource: 'synthetic',
   strategyMode: 'dsl',
   simCache: {},
   sensExportState: null,

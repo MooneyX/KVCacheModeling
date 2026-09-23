@@ -1,5 +1,10 @@
 import { defineConfig } from '@playwright/test';
 
+const devPort = process.env.PLAYWRIGHT_DEV_PORT || '4173';
+const apiPort = process.env.PLAYWRIGHT_API_PORT || '8787';
+const devUrl = `http://127.0.0.1:${devPort}`;
+const apiUrl = `http://127.0.0.1:${apiPort}`;
+
 export default defineConfig({
   testDir: './tests/integration',
   timeout: 60_000,
@@ -12,12 +17,13 @@ export default defineConfig({
     headless: true,
   },
   projects: [
-    { name: 'development', use: { baseURL: 'http://127.0.0.1:4173' } },
-    { name: 'production', use: { baseURL: 'http://127.0.0.1:8787' } },
+    { name: 'development', use: { baseURL: devUrl } },
+    { name: 'production', use: { baseURL: apiUrl } },
   ],
   webServer: [
-    { command: 'npm run dev -- --port 4173 --strictPort', url: 'http://127.0.0.1:4173', reuseExistingServer: false },
-    { command: 'npm start', url: 'http://127.0.0.1:8787/api/health', reuseExistingServer: false,
-      env: { HOST: '127.0.0.1', PORT: '8787', SIM_ACCESS_TOKEN: '', SIM_DATA_DIR: '.runtime/browser-tests', SIM_MAX_TASKS: '1000' } },
+    { command: `npm run dev -- --port ${devPort} --strictPort`, url: devUrl, reuseExistingServer: false,
+      env: { SIM_API_URL: apiUrl } },
+    { command: 'npm start', url: `${apiUrl}/api/health`, reuseExistingServer: false,
+      env: { HOST: '127.0.0.1', PORT: apiPort, SIM_ACCESS_TOKEN: '', SIM_DATA_DIR: '.runtime/browser-tests', SIM_MAX_TASKS: '1000' } },
   ],
 });

@@ -45,31 +45,6 @@
   <div id="serverTaskList"></div>
 </section>
 
-<section class="card" id="replayPanel" aria-labelledby="replayTitle">
-  <h2 id="replayTitle">真实数据集 Replay</h2>
-  <p class="subtitle">上传已构建的 UTF-8 bundle v1 JSON，使用当前模型、硬件、batch 和 DSL 策略在服务器运行。上传后不会自动执行。</p>
-  <div class="form-row">
-    <div><label for="replayFile">Replay bundle（单个 .json，最多 8 MiB）</label><input id="replayFile" type="file" accept=".json,application/json"></div>
-  </div>
-  <p id="replayFileInfo">尚未选择文件；可选择仓库 data/replay/sample.json。</p>
-  <div class="form-row">
-    <div><label for="replayQps">目标 QPS</label><input id="replayQps" type="number" step="any" value="5"></div>
-    <div><label for="replaySeed">seed（uint32，允许 0）</label><input id="replaySeed" type="number" min="0" max="4294967295" step="1" value="42"></div>
-    <div><label for="replayDuration">投放时长 T（秒）</label><input id="replayDuration" type="number" step="any" value="2"></div>
-    <div><label for="replayWarmup">暖机时长 W（秒）</label><input id="replayWarmup" type="number" min="0" step="any" value="0"></div>
-    <div><label for="replayDrain">排空上限 D（秒）</label><input id="replayDrain" type="number" min="0" step="any" value="600"></div>
-  </div>
-  <p class="subtitle">仅支持单计算实例（8 张 GPU 不等于 8 个实例）、DSL、非物理 P/D 分离。Replay 显式覆盖为 64-token 页，不修改原页粒度控件；到达模型固定 closed，超级块关闭。</p>
-  <p class="subtitle">[0,T) 按泊松过程投放 session，T 后继续已投放 session，最迟 T+D 停止；并非把模板池完整回放一遍。仅支持 HBM 连续前缀缓存且容量充足的运行；低 QPS 不保证容量安全，不支持 L2/L3 回读及容量恢复。输出身份 unmapped，完成依赖为推断所得；稳定性和理想缓存未评估。</p>
-  <p class="subtitle">仅接受已构建 bundle，不接受原始 trace、构建报告或配置文件。旧参数导入导出不包含 Replay 数据；上传内容不持久化，刷新后需重新选择。整任务体及实际运行仍受服务端限额约束。</p>
-  <div class="form-row">
-    <button class="btn btn-sm" id="replayRun" type="button" disabled>运行 Replay</button>
-    <button class="btn btn-sm" id="replayDownload" type="button" disabled>下载完整结果 JSON</button>
-  </div>
-  <p id="replayStatus" role="status" aria-live="polite">请选择 Replay bundle。</p>
-  <div id="replaySummary" hidden></div>
-</section>
-
 <!-- ====== TAB 1: 基础参数 ====== -->
 <div class="tab-panel active" id="tab-params">
   <div class="card">
@@ -181,43 +156,81 @@
 
   <div class="card">
     <h2><span>推理负载</span> 配置</h2>
-    <p class="subtitle">请求特征（可选长尾分布）、请求规模、多轮会话复用与可复现随机种子 · 仿真请求数 N = 请求数</p>
+    <p class="subtitle">选择合成负载或数据集 Replay，共用模型、硬件、系统设置和策略；切换来源不会执行仿真或清空最近一次结果。</p>
+    <div class="form-row" style="margin-bottom:10px">
+      <div><label for="workloadSource">负载来源</label><select id="workloadSource">
+        <option value="synthetic" selected>合成负载</option>
+        <option value="replay">数据集 Replay</option>
+      </select></div>
+    </div>
+    <div id="syntheticPanel">
+      <p class="subtitle">请求特征（可选长尾分布）、请求规模、多轮会话复用与可复现随机种子 · 仿真请求数 N = 请求数</p>
+      <div class="row2">
+        <div>
+          <div class="form-row">
+            <div><label id="lblConcurrency">请求数</label><input type="number" id="pConcurrency" value="32" min="1" title="仿真请求总数(1:1 直接对应)。峰值并发由 QPS×延迟(Little 定律)自然形成; 需求推导的 KV 容量/批大小按'请求数=峰值并发'保守估算。&#10;单批Prefill基准模式下: 此值 = 单批 batch 规模(全部请求 t=0 同时进 prefill), 是该模式下唯一决定 batch 的旋钮"></div>
+            <div><label>平均输入长度(tok)</label><input type="number" id="pInputLen" value="4096" min="1"></div>
+            <div><label>平均输出长度(tok)</label><input type="number" id="pOutputLen" value="1024" min="1"></div>
+          </div>
+          <div class="form-row" style="margin-top:6px">
+            <div><label>到达率QPS</label><input type="number" id="pQps" value="8" min="0" step="0.001" title="请求到达率。低 qps(如 0.001)表示近乎串行无并发; 注意配合仿真窗口上限——qps 太低时窗口内到达的请求数会很少, 统计样本不足"></div>
+            <div><label>到达分布</label><select id="pArrivalDist">
+              <option value="poisson" selected>泊松(有突发)</option>
+              <option value="uniform">均匀(等间隔)</option>
+            </select></div>
+            <div><label>长度分布</label><select id="pLenDist">
+              <option value="uniform" selected>均匀 (0.5~1.5×)</option>
+              <option value="lognormal">对数正态 (长尾)</option>
+              <option value="fixed">严格固定 (=均值)</option>
+            </select></div>
+            <div><label>随机种子</label><input type="number" id="pSeed" value="42" min="0"></div>
+          </div>
+        </div>
+        <div>
+          <div class="form-row">
+            <div><label>仿真窗口上限(秒)</label><input type="number" id="pSimMaxTime" value="1200" min="60" step="60" title="仿真窗口 = min(排水估计, 此上限)。排水估计已含 KV 下沉减速(与引擎同口径)。重负载(长输入/高并发)下窗口触顶会截断, 完成请求数<总请求数, TTFT/P99 基于不完整样本——截断时结果会显示警示与实际排水建议值, 调大此值即可跑完全部请求"></div>
+            <div><label>多轮复用比例(%)</label><input type="number" id="pMultiTurn" value="0" min="0" max="100"></div>
+          </div>
+          <div class="form-row" style="margin-top:6px">
+            <div><label>前缀命中比例(%)</label><div style="display:flex;align-items:center;gap:8px"><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="flex:1" title="入组请求的前缀命中比例: 共享前缀长度 = 平均输入×此值, 命中请求跳过对应比例的前缀 prefill (h=99 → 命中请求跳过 ~99% prefill)"><input type="number" id="pPrefixHitNum" value="40" min="0" max="100" style="width:62px;padding:4px 6px;font-size:.78rem" title="与滑块双向同步: 直接输入数值或拖动滑块均可"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">%</span></div></div>
+            <div><label>L2预热命中率(%)</label><input type="range" id="pPrefixWarmL2" value="0" min="0" max="100" style="width:100%" title="双层预热(2026-08-28): 嵌套语义, ≤前缀命中比例。前缀的该比例段放入 L2(DRAM), 剩余命中段放 L3(SSD)。例: 命中95% + L2命中15% ⇒ 前缀前15%在DRAM(命中免费), 15%~95%在SSD(付拉取时间)。0(默认)=全部命中段在L3, 与原行为逐位一致。需勾选「前缀预热」生效"><span id="pPrefixWarmL2Val" style="font-size:.75rem;color:var(--accent)">0%</span></div>
+            <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
+            <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="单批 prefill 微基准(2026-08-19): 隔离观察 batchsize 对 prefill 计算/传输时间占比的影响——①全部请求 t=0 同时到达(忽略 qps/到达分布) ②跳过准入容量与槽位门控, 所有请求立即进入 prefill(并发=请求数, 即单批 batch) ③prefill 完成即结束, 不进 decode(TPOT/延迟口径无意义, 多轮失效)。&#10;⚠️ batch 规模由「并发请求数」决定, 不是 Max Batch Size ——后者只作用于 decode, 而单批模式不跑 decode(勾选后会置灰提示)。&#10;用法: 并发请求数=batch 规模; 敏感性面板选「并发请求数」扫描 × L3聚合带宽对比 × L3拉取时间占比指标, 即可得到 batch-占比曲线(queue≈0 受控)"><input type="checkbox" id="pSingleBatch" style="width:auto" onchange="toggleSingleBatchHints()"><label style="margin:0;font-size:.75rem" for="pSingleBatch">单批Prefill基准(无排队/无decode)</label></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <section id="replayPanel" aria-labelledby="replayTitle" hidden>
+      <h3 id="replayTitle">真实数据集 Replay</h3>
+      <p class="subtitle">上传已构建的 UTF-8 bundle v1 JSON，使用当前模型、硬件、batch 和 DSL 策略在服务器运行。上传后不会自动执行，请使用结果区的运行当前策略按钮。</p>
+      <div class="form-row">
+        <div><label for="replayFile">Replay bundle（单个 .json，最多 8 MiB）</label><input id="replayFile" type="file" accept=".json,application/json"></div>
+      </div>
+      <p id="replayFileInfo">尚未选择文件；可选择仓库 data/replay/sample.json。</p>
+      <div class="form-row">
+        <div><label for="replayQps">目标 QPS</label><input id="replayQps" type="number" step="any" value="5"></div>
+        <div><label for="replaySeed">seed（uint32，允许 0）</label><input id="replaySeed" type="number" min="0" max="4294967295" step="1" value="42"></div>
+        <div><label for="replayDuration">投放时长 T（秒）</label><input id="replayDuration" type="number" step="any" value="2"></div>
+        <div><label for="replayWarmup">暖机时长 W（秒）</label><input id="replayWarmup" type="number" min="0" step="any" value="0"></div>
+        <div><label for="replayDrain">排空上限 D（秒）</label><input id="replayDrain" type="number" min="0" step="any" value="600"></div>
+      </div>
+      <p class="subtitle">仅支持单计算实例（8 张 GPU 不等于 8 个实例）、DSL、非物理 P/D 分离。必须手动将共享 Block Size 设置为 64-token 页，不会自动覆盖共享配置；到达模型固定 closed，超级块关闭。</p>
+      <p class="subtitle">[0,T) 按泊松过程投放 session，T 后继续已投放 session，最迟 T+D 停止；并非把模板池完整回放一遍。仅支持 HBM 连续前缀缓存且容量充足的运行；低 QPS 不保证容量安全，不支持 L2/L3 回读及容量恢复。输出身份 unmapped，完成依赖为推断所得；稳定性和理想缓存未评估。</p>
+      <p class="subtitle">仅接受已构建 bundle，不接受原始 trace、构建报告或配置文件。旧参数导入导出不包含 Replay 数据；上传内容不持久化，刷新后需重新选择。整任务体及实际运行仍受服务端限额约束。</p>
+      <p id="replayStatus" role="status" aria-live="polite">请选择 Replay bundle。</p>
+    </section>
+    <h3 style="font-size:.82rem;color:var(--accent);margin:14px 0 8px">共享推理与系统设置</h3>
+    <p class="subtitle">以下设置供两种负载共用，切换负载来源不会修改这些配置。</p>
     <div class="row2">
       <div>
         <div class="form-row">
-          <div><label id="lblConcurrency">请求数</label><input type="number" id="pConcurrency" value="32" min="1" title="仿真请求总数(1:1 直接对应)。峰值并发由 QPS×延迟(Little 定律)自然形成; 需求推导的 KV 容量/批大小按'请求数=峰值并发'保守估算。&#10;单批Prefill基准模式下: 此值 = 单批 batch 规模(全部请求 t=0 同时进 prefill), 是该模式下唯一决定 batch 的旋钮"></div>
-          <div><label>平均输入长度(tok)</label><input type="number" id="pInputLen" value="4096" min="1"></div>
-          <div><label>平均输出长度(tok)</label><input type="number" id="pOutputLen" value="1024" min="1"></div>
-        </div>
-        <div class="form-row" style="margin-top:6px">
-          <div><label>到达率QPS</label><input type="number" id="pQps" value="8" min="0" step="0.001" title="请求到达率。低 qps(如 0.001)表示近乎串行无并发; 注意配合仿真窗口上限——qps 太低时窗口内到达的请求数会很少, 统计样本不足"></div>
-          <div><label>到达分布</label><select id="pArrivalDist">
-            <option value="poisson" selected>泊松(有突发)</option>
-            <option value="uniform">均匀(等间隔)</option>
-          </select></div>
           <div><label>MFU(%)</label><input type="number" id="pMfu" value="50" min="0" max="100" placeholder="留空=自动判瓶颈" oninput="applyEstimatedParams()" title="算子时间合成口径(2026-08-19 改为 Roofline, 不再计算+访存求和):&#10;• 填值(如50): 计算瓶颈假设——prefill 时间 = FLOPs ÷ (峰值算力×MFU), 完全忽略访存(访存被计算 overlap)。attention 的 KV 读也不计时。&#10;• 留空: 自动逐项 Roofline 判定——计算侧按峰值算力, 访存侧按 HBM 带宽(KV 读按 chunk 摊薄, flash-attention 语义), 每项取较慢者(max), 不求和。&#10;两种模式下 TP 通信固定延迟都单独相加(无法 overlap)。decode 始终走 max(访存, 算力) 的 Roofline, MFU 只影响其中的算力项。"></div>
-          <div><label>长度分布</label><select id="pLenDist">
-            <option value="uniform" selected>均匀 (0.5~1.5×)</option>
-            <option value="lognormal">对数正态 (长尾)</option>
-            <option value="fixed">严格固定 (=均值)</option>
-          </select></div>
-          <div><label>随机种子</label><input type="number" id="pSeed" value="42" min="0"></div>
-        </div>
-      </div>
-      <div>
-        <div class="form-row">
           <div><label id="lblMaxBatch">Max Batch Size</label><input type="number" id="pMaxBatch" value="8" min="1" onchange="syncMaxBatchFromInput()" title="与 DSL 的 BATCH: max(N) 双向同步(2026-08-14): 改这里自动更新 DSL 的 BATCH 行(仿真唯一生效来源); 改 DSL 也会回填这里"></div>
           <div><label>Block Size (PageAttn)</label><input type="number" id="pBlockSize" value="16" min="1"></div>
-          <div><label>仿真窗口上限(秒)</label><input type="number" id="pSimMaxTime" value="1200" min="60" step="60" title="仿真窗口 = min(排水估计, 此上限)。排水估计已含 KV 下沉减速(与引擎同口径)。重负载(长输入/高并发)下窗口触顶会截断, 完成请求数<总请求数, TTFT/P99 基于不完整样本——截断时结果会显示警示与实际排水建议值, 调大此值即可跑完全部请求"></div>
-          <div><label>多轮复用比例(%)</label><input type="number" id="pMultiTurn" value="0" min="0" max="100"></div>
         </div>
         <div class="form-row" style="margin-top:6px">
-          <div><label>前缀命中比例(%)</label><div style="display:flex;align-items:center;gap:8px"><input type="range" id="pPrefixHit" value="40" min="0" max="100" style="flex:1" title="入组请求的前缀命中比例: 共享前缀长度 = 平均输入×此值, 命中请求跳过对应比例的前缀 prefill (h=99 → 命中请求跳过 ~99% prefill)"><input type="number" id="pPrefixHitNum" value="40" min="0" max="100" style="width:62px;padding:4px 6px;font-size:.78rem" title="与滑块双向同步: 直接输入数值或拖动滑块均可"><span id="pPrefixHitVal" style="font-size:.75rem;color:var(--accent)">%</span></div></div>
-          <div><label>L2预热命中率(%)</label><input type="range" id="pPrefixWarmL2" value="0" min="0" max="100" style="width:100%" title="双层预热(2026-08-28): 嵌套语义, ≤前缀命中比例。前缀的该比例段放入 L2(DRAM), 剩余命中段放 L3(SSD)。例: 命中95% + L2命中15% ⇒ 前缀前15%在DRAM(命中免费), 15%~95%在SSD(付拉取时间)。0(默认)=全部命中段在L3, 与原行为逐位一致。需勾选「前缀预热」生效"><span id="pPrefixWarmL2Val" style="font-size:.75rem;color:var(--accent)">0%</span></div>
-          <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><input type="checkbox" id="pPrefixWarm" style="width:auto"><label style="margin:0;font-size:.75rem" for="pPrefixWarm">前缀预热(L3常驻, HiCache)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="两档对应 sglang HiCache 的两种真实时序:&#10;勾选(默认)=并发重复预取: sglang 的 prefetch_from_storage 按 rid 独立发起、无跨请求单飞去重 —— 同前缀的**并发**请求各自从 L3 重读一份(前缀尚未插入 host radix tree, 谁也命中不了谁)。&#10;不勾选=完成后 host 命中: 第一个请求拉完即插入 host tree, 后续请求直接命中不再读 L3(前缀在请求间持续驻留快层的理想口径)。&#10;sglang 真实行为介于两者之间(并发期重复 + 完成后命中), 此开关用于把两种极端分开量化。"><input type="checkbox" id="pFetchRepull" checked style="width:auto"><label style="margin:0;font-size:.75rem" for="pFetchRepull">Prefill 每请求重复拉取(并发重复预取)</label></div>
           <div style="display:flex;align-items:center;gap:6px;padding-top:18px"><span style="font-size:.72rem;color:var(--accent);line-height:1.5" title="prefill 按 token 预算组波次执行(sglang chunked-prefill): 每波总 token ≤ Prefill token预算, 长请求按 Prefill Chunk 切分跨波, 整波算完才组下一波, 筹备波的 L3 拉取与执行波计算重叠(overlap 事件循环); 准入无请求数槽位上限。&#10;四档预取策略全部走此路径 —— sglang 里它们共用同一条 chunked-prefill 代码路径。&#10;2026-09-03: 原「波次组批」开关与「连续流体模型」对照基线已删除 —— sglang 只有 chunked-prefill 一种组批方式。">组批: 波次(sglang chunked-prefill)</span></div>
-          <div style="display:flex;align-items:center;gap:6px;padding-top:18px" title="单批 prefill 微基准(2026-08-19): 隔离观察 batchsize 对 prefill 计算/传输时间占比的影响——①全部请求 t=0 同时到达(忽略 qps/到达分布) ②跳过准入容量与槽位门控, 所有请求立即进入 prefill(并发=请求数, 即单批 batch) ③prefill 完成即结束, 不进 decode(TPOT/延迟口径无意义, 多轮失效)。&#10;⚠️ batch 规模由「并发请求数」决定, 不是 Max Batch Size ——后者只作用于 decode, 而单批模式不跑 decode(勾选后会置灰提示)。&#10;用法: 并发请求数=batch 规模; 敏感性面板选「并发请求数」扫描 × L3聚合带宽对比 × L3拉取时间占比指标, 即可得到 batch-占比曲线(queue≈0 受控)"><input type="checkbox" id="pSingleBatch" style="width:auto" onchange="toggleSingleBatchHints()"><label style="margin:0;font-size:.75rem" for="pSingleBatch">单批Prefill基准(无排队/无decode)</label></div>
         </div>
         <div class="form-row" style="margin-top:6px">
           <div><label>Prefill位置成本a(μs/tok)</label><input type="number" id="pPrefillA" value="79.5" min="0" step="0.1" title="位置感知 prefill: τ_rec(i)=a+b·i。a=固定项。推导值见右侧按钮: 权重读/chunk + 算力/mfu + TP通信"></div>
@@ -231,6 +244,8 @@
           <div style="flex:0 0 auto;display:flex;align-items:end"><button class="btn btn-sm" onclick="toggleDerivationPanel()" title="展开逐项推导明细: 每一项的 FLOPs/访存字节/计算时间/访存时间/算术强度/瓶颈判定与代入值。公式与引擎计算同源(不是手写文案)">🔬 推导明细</button></div>
         </div>
         <div id="derivPanel" style="display:none;margin-top:8px"></div>
+      </div>
+      <div>
         <div class="form-row" style="margin-top:6px">
           <div><label>推理引擎</label><span style="font-size:.75rem;color:var(--accent);line-height:1.7">sglang（默认, 2026-08-12 起固定）<br>RadixAttention 渐进前缀</span></div>
           <div><label>前缀缓存</label><span style="font-size:.75rem;color:var(--accent);line-height:1.7" title="2026-09-02: 原「整段哈希(vLLM 兼容)」档已删 —— 引擎已固定 sglang, 其 RadixAttention 是前缀树渐进匹配(match_prefix 逐块命中, 部分前缀也能复用), 不存在 vLLM 式「整段 block hash 全命中才复用」的语义。">RadixAttention 前缀树·渐进<br>(逐块渐进命中)</span></div>
@@ -356,11 +371,15 @@
   <!-- Simulation Results（结果区：运行入口在结果卡片内，与交叉分析/敏感性交互模式一致） -->
   <div class="card" id="strategyResults">
     <h2><span>策略仿真</span> 对比结果</h2>
-    <p class="subtitle">最近一次成功运行的结果与执行配置 · 编辑参数或策略不会改变旧结果，点击运行后更新 · 相同输入复用缓存</p>
+    <p class="subtitle">最近一次运行成功返回的结果与执行配置 · 切换负载或编辑参数、策略不会改变旧结果，运行成功后整体更新 · 合成负载相同输入复用缓存，Replay 每次提交新任务</p>
     <div class="form-row" style="margin-bottom:8px">
       <div style="flex:0 0 auto;display:flex;align-items:end;gap:6px"><button class="btn" onclick="applyStrategies()" title="只运行当前配置的策略，不写入保存列表">▶️ 运行当前策略</button><button class="btn btn-sm" onclick="runAllStrategies()" style="background:var(--accent2)" title="运行全部已保存策略（未保存时回退当前策略）">📋 运行全部已保存</button></div>
+      <button class="btn btn-sm" id="replayDownload" type="button" disabled>下载完整结果 JSON</button>
     </div>
     <div id="simulationStatus" role="status" aria-live="polite" class="progress-note" style="margin-bottom:8px"></div>
+    <div id="simulationSnapshot" class="progress-note" style="margin-bottom:8px">请先运行</div>
+    <div id="simulationDirty" role="status" aria-live="polite" class="progress-note" style="margin-bottom:8px" hidden>输入已修改，尚未重新运行</div>
+    <div id="replaySummary" hidden></div>
     <div id="strategyMetricsGrid" class="result-grid" style="margin-bottom:16px"></div>
     <div id="chartStrategyGantt" class="chart-tall"></div>
     <div class="row2" style="margin-top:14px">

@@ -61,7 +61,7 @@ export function toggleSparseFields(){
 // 实测: 单批开时 pMaxBatch 4→256 / pPrefillSlots 1→64 的 TTFT/拉取/计算逐点不变;
 // 只有 pConcurrency 4→64 会让 TTFT 747→10160ms。此前无提示, 极易误调 max_batch 后以为引擎有 bug。
 export function toggleSingleBatchHints(){
-  let on = !!(document.getElementById('pSingleBatch') && document.getElementById('pSingleBatch').checked);
+  let on = state.workloadSource !== 'replay' && !!(document.getElementById('pSingleBatch') && document.getElementById('pSingleBatch').checked);
   // 置灰失效项 + 标注原因
   // 2026-09-03 第4批: 单批已移植到波次路径(组波预算/chunk 放开为 ∞, 一波=整个 batch) ——
   // token 预算旋钮失效的原因从"强制流体"变为"预算 ∞", 提示文案同步更新。
@@ -298,7 +298,7 @@ export function collectParamsJson() {
   let els = panel ? panel.querySelectorAll('input[id], select[id], textarea[id]') : [];
   let data = {};
   els.forEach(el => {
-    if (el.id === 'paramsIo') return; // 跳过导入导出框自身
+    if (el.id === 'paramsIo' || el.id === 'workloadSource' || el.closest('#replayPanel')) return;
     if (el.id === 'pPrefixHitNum') return; // 跳过滑块的数字镜像框(2026-09-02): 值与 pPrefixHit 恒等, 不污染导出 JSON
     data[el.id] = el.type === 'checkbox' ? el.checked : el.value;
   });
@@ -450,7 +450,7 @@ export function importParamsFromBox() {
   let els = panel ? panel.querySelectorAll('input[id], select[id], textarea[id]') : [];
   let applied = 0, wroteDsl = false;
   els.forEach(el => {
-    if (!(el.id in data) || el.id === 'paramsIo') return;
+    if (!(el.id in data) || el.id === 'paramsIo' || el.id === 'workloadSource' || el.closest('#replayPanel')) return;
     if (el.type === 'checkbox') el.checked = !!data[el.id];
     else el.value = String(data[el.id]);
     if (el.id === 'sDsl') wroteDsl = true;
@@ -799,6 +799,7 @@ export function updateTierDemand(){
 
 
 export function recalcAll(){
+  document.dispatchEvent(new Event('simulation-input-change'));
   updateQuickResults();
   let active=document.querySelector('.tab-panel.active');
   if(active) refreshActiveTab();
