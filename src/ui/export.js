@@ -1,29 +1,26 @@
 import { state } from "./state.js";
 import { SENS_PARAM_LABEL } from "../application/labels.js";
 import { echarts } from "./echarts.js";
-import { renderSensHtml } from "../reports/html.js";
+import { renderSensHtml, reportExportRestriction } from "../reports/html.js";
 import { sensSnapSelected, sensSnapKeyOf } from "./snapshots.js";
 
 
 
 let sensExportReady = false;
-const replayExportRestriction = '最近一次运行结果为 Replay，旧 HTML 报告和敏感性图片导出不适用；请使用结果区的“下载完整结果 JSON”。切换输入不会改变结果来源。';
-const isReplayResult = () => !!state.simResults[0]?.replay;
 
 export function refreshSensExportControls() {
-  const blocked = isReplayResult();
+  const restriction = state.sensExportState ? reportExportRestriction(state.sensExportState) : '';
+  const blocked = !!restriction;
   for (const id of ['btnSensExportPng', 'btnSensExportJpg', 'btnSensExportHtml']) {
     const el = document.getElementById(id);
     if (el) {
       el.disabled = blocked || !sensExportReady;
       if (el.dataset.syntheticTitle === undefined) el.dataset.syntheticTitle = el.title;
-      el.title = blocked ? replayExportRestriction : el.dataset.syntheticTitle;
+      el.title = restriction || el.dataset.syntheticTitle;
     }
   }
   const note = document.getElementById('sensExportRestriction');
-  if (note) { note.hidden = !blocked; note.textContent = blocked ? replayExportRestriction : ''; }
-  const status = document.getElementById('sensExportNote');
-  if (!blocked && status?.textContent === replayExportRestriction) status.textContent = '';
+  if (note) { note.hidden = !blocked; note.textContent = restriction; }
 }
 
 export function setSensExportEnabled(on) {
@@ -32,9 +29,10 @@ export function setSensExportEnabled(on) {
 }
 
 function allowSensExport() {
-  if (!isReplayResult()) return true;
+  const restriction = reportExportRestriction(state.sensExportState);
+  if (!restriction) return true;
   refreshSensExportControls();
-  sensExportNote(replayExportRestriction, true);
+  sensExportNote(restriction, true);
   return false;
 }
 
@@ -97,8 +95,7 @@ export function exportSensImage(type) {
 }
 
 export function buildSensHtml(snapList) {
-  if (isReplayResult()) throw new Error(replayExportRestriction);
-  return renderSensHtml(state.sensExportState, snapList);
+  return renderSensHtml(snapList?.[0] || state.sensExportState, snapList);
 }
 
 
@@ -115,8 +112,9 @@ export function exportSensHtml() {
     // 当前图对应的快照必须在列表里且**排首位** —— 导出页的初始图/参数区取自 snaps[0] 之外的
     // st(=sensExportState), 若当前扫描没被勾选, 初始图与点云会来自不同批次, 令人困惑。
     let curKey = (function () { try { return sensSnapKeyOf(state.sensExportState); } catch (e) { return null; } })();
-    let hasCur = snaps.some(function (s) { try { return sensSnapKeyOf(s) === curKey; } catch (e) { return false; } });
-    if (!hasCur) snaps = [state.sensExportState].concat(snaps);
+    snaps = [state.sensExportState].concat(snaps.filter(function (s) {
+      try { return sensSnapKeyOf(s) !== curKey; } catch (e) { return true; }
+    }));
     let html = buildSensHtml(snaps);
     let url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
     triggerDownload(url, sensExportFileName('html'), true);

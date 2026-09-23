@@ -19,7 +19,8 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
     ? `${configuration.execution?.instances > 1 ? 'instance-private' : 'single-instance'}/${configuration.blockMapping?.physical ?? 64}-token/finite-capacity-tiered-four-configurations${physicalPd ? '/physical-pd' : ''}`
     : 'single-instance/64-token/HBM-capacity-sufficient';
   const emptyGauges = () => Object.fromEntries(GAUGES.map(key => [key, 0]));
-  const width = Math.max(0.002, hardCutoff / 20_000);
+  const maxBuckets = Math.max(1, Math.floor(20_000 * BASE_GAUGES.length / GAUGES.length));
+  const width = Math.max(0.002, hardCutoff / maxBuckets);
   const windows = Object.fromEntries(['full', 'warmup', 'measurement', 'drain'].map(name => [name, {
     arrivals: 0, completions: 0, failed: 0, cancelled: 0, admitted: 0, successfulArrivals: 0, launches: 0,
     tokens: emptyTokens(), ttft: [], tpot: [], latency: [],
@@ -36,18 +37,18 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
   function eachWindow(time, fn) { fn(windows.full); fn(windows[eventWindow(time)]); }
   function identity(req) { return `${req.launchIndex}:${req.requestIndex}`; }
   function bucket(time) {
-    let index = Math.min(19999, Math.floor(time / width));
-    if (index < 19999 && (index + 1) * width <= time) index++;
+    let index = Math.min(maxBuckets - 1, Math.floor(time / width));
+    if (index < maxBuckets - 1 && (index + 1) * width <= time) index++;
     if (!buckets.has(index)) buckets.set(index, { index, arrivals: 0, completions: 0, duration: 0,
       integral: emptyGauges(), peak: emptyGauges(), last: emptyGauges() });
     return buckets.get(index);
   }
-  function observe(time, state) {
+  function observe(time, state, recordState = true) {
     if (time < observedAt || time > hardCutoff + 1e-9) throw new Error('Replay metrics clock invariant violated');
     let cursor = observedAt;
     while (cursor < time) {
       const b = bucket(cursor);
-      const end = Math.min(time, (b.index + 1) * width);
+      const end = Math.min(time, b.index === maxBuckets - 1 ? hardCutoff : (b.index + 1) * width);
       if (end <= cursor) break;
       const dt = end - cursor;
       b.duration += dt;
@@ -62,14 +63,22 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
     }
     observedAt = time;
     gauges = { ...gauges, ...state };
-    for (const key of GAUGES) peak[key] = Math.max(peak[key], gauges[key]);
+    if (!recordState) return;
+    const current = bucket(time);
+    for (const key of GAUGES) {
+      peak[key] = Math.max(peak[key], gauges[key]);
+      current.peak[key] = Math.max(current.peak[key], gauges[key]);
+      current.last[key] = gauges[key];
+    }
   }
   function summary(req, state, reason) {
     if (requests.length >= 320) return;
     requests.push({ id: req.id, templateIndex: req.templateIndex, launchIndex: req.launchIndex, requestIndex: req.requestIndex,
       inputTokens: req.inputLen, outputTokens: req.outputLen, arrive: req.arrive ?? null,
       admitTime: admitted.has(identity(req)) ? req.admitTime : null,
-      prefillEnd: state === 'successful' ? req.prefillEnd : null, completeTime: req.completeTime ?? null, state, ...(reason ? { reason } : {}) });
+      prefillEnd: state === 'successful' ? req.prefillEnd : null,
+      firstTokenTime: req.firstTokenTime ?? null, decodeStart: req.decodeStart ?? null,
+      completeTime: req.completeTime ?? null, state, ...(reason ? { reason } : {}) });
   }
   function countRequest(req) {
     if (arrived.size >= limits.maxRequests) throw new Error('Replay metrics request resource limit exceeded');
@@ -104,8 +113,10 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
       if (terminal.has(key)) return;
       if (!admitted.has(key)) throw new Error('Replay metrics completion before admission');
       const firstToken = req.firstTokenTime ?? (physicalPd && req.outputLen > 0 ? req._kvXferEnd : req.prefillEnd);
-      if (physicalPd && (!Number.isFinite(firstToken) || firstToken < req.arrive || firstToken > req.completeTime))
-        throw new Error('Replay metrics invalid P/D first-token event');
+      if (!Number.isFinite(firstToken) || firstToken < req.arrive || firstToken > req.completeTime)
+        throw new Error('Replay metrics invalid first-token event');
+      if (req.outputLen > 0 && (!Number.isFinite(req.decodeStart) || req.decodeStart < req.arrive || req.decodeStart > req.completeTime))
+        throw new Error('Replay metrics invalid decode-start event');
       terminal.add(key); counts.successful++; counts.outputTokens += req.outputLen;
       eachWindow(req.completeTime, w => w.completions++);
       bucket(req.completeTime).completions++;
@@ -146,7 +157,7 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
     },
     observe,
     finish(end, runtime) {
-      observe(end, gauges);
+      observe(end, gauges, false);
       const ranges = { full: [0, end], warmup: [0, Math.min(warmup, end)], measurement: [Math.min(warmup, end), Math.min(T, end)], drain: [Math.min(T, end), end] };
       const reportWindows = {};
       for (const [name, w] of Object.entries(windows)) {
@@ -162,16 +173,20 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
           latency: { unit: 'ms', ttft: distribution(ttft), tpot: distribution(tpot), endToEnd: distribution(latency) } };
       }
       const series = [...buckets.values()].sort((a, b) => a.index - b.index).map(b => {
-        const start = b.index * width, stop = Math.min(end, (b.index + 1) * width);
+        const start = b.index * width, stop = Math.min(end, b.index === maxBuckets - 1 ? hardCutoff : (b.index + 1) * width);
         return { start, end: stop, arrivals: b.arrivals, completions: b.completions,
           arrivalQps: ratio(b.arrivals, stop - start), completionQps: ratio(b.completions, stop - start),
           mean: Object.fromEntries(GAUGES.map(key => [key, ratio(b.integral[key], b.duration)])), peak: b.peak, last: b.last };
       });
       return { configuration: { ...configuration, seed, arrivalModel: 'closed', outputIdentity: 'unmapped', superblocks: false,
-          durationSeconds: T, warmupSeconds: warmup, hardCutoff, targetQps: qps, lambdaSession },
+          durationSeconds: T, warmupSeconds: warmup, hardCutoff, targetQps: qps, lambdaSession,
+          windows: ranges, metricWindows: { latency: 'arrival-cohort/successful-only', cache: 'first-admission/arrival-cohort',
+            completionQps: 'completion-event', throughput: 'full/output-tokens-per-second', ttftBreakdown: 'full/successful-only' } },
         source: { ...stats }, counts: { ...counts, ...runtime }, windows: reportWindows,
         cache: reportWindows.measurement.cache,
-        samples: { series, requests, launches, bucketWidth: width, maxBuckets: 20000, coverage: [0, end],
+        samples: { series, requests, launches, bucketWidth: width, maxBuckets, coverage: [0, end],
+          gaugeCount: GAUGES.length, sampling: 'time-weighted-full-window-buckets',
+          bucketPolicy: '120000-gauge-cells/mean-peak-last',
           requestCoverage: { total: counts.successful + counts.failed + counts.cancelled, sampled: requests.length, complete: counts.successful + counts.failed + counts.cancelled <= 320 },
           launchCoverage: { total: counts.launchedSessions, sampled: launches.length, complete: counts.launchedSessions <= 320 },
           timeWeightedMean: Object.fromEntries(GAUGES.map(key => [key, ratio(integral[key], end)])), peak },

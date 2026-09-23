@@ -63,7 +63,7 @@ async function main() {
     seen.add(token.name);
   }
   if (values.help) {
-    process.stdout.write('Usage: npm run replay -- --bundle bundle.json[.gz] --config params.json [--output result.json]\nOptions: --qps N --duration SECONDS --warmup SECONDS --drain SECONDS --seed N --allow-js --help\nConfig: exported control-ID JSON or normalized {params,strategy,overrides,mode}.\nFlags override config. Defaults: duration=5, warmup=0; QPS, drain (simMaxTime), and seed use config.\nClosed-loop Replay currently supports single-instance, 64-token pages, no superblocks, sufficient HBM capacity.\nWithout --output, JSON is written to stdout. Existing output files are never overwritten.\nRun limits: overrides.replay.options.limits. --allow-js requires trusted code; Replay JS cache hooks are not yet supported.\n');
+    process.stdout.write('Usage: npm run replay -- --bundle bundle.json[.gz] --config params.json [--output result.json]\nOptions: --qps N --duration SECONDS --warmup SECONDS --drain SECONDS --seed N --allow-js --help\nConfig: exported control-ID JSON or normalized {params,strategy,overrides,mode}.\nFlags override config. Defaults: duration=5, warmup=0; QPS, drain (simMaxTime), and seed use config.\nClosed-loop Replay supports finite tiered capacity, physical pages dividing or divisible by 64, multiple instances or single-instance physical P/D (not both), and no superblocks. Exported workload summaries require the matching bundle.\nWithout --output, JSON is written to stdout. Existing output files are never overwritten.\nRun limits: overrides.replay.options.limits. --allow-js requires trusted code; Replay JS cache hooks are not yet supported.\n');
     return;
   }
   if (!values.bundle || !values.config) throw new Error('--bundle and --config are required. Use --help for usage.');
@@ -72,7 +72,10 @@ async function main() {
   const overrides = config.overrides === undefined ? {} : { ...object(config.overrides, 'overrides') };
   const replay = overrides.replay === undefined ? {} : object(overrides.replay, 'overrides.replay');
   const configuredOptions = replay.options === undefined ? {} : object(replay.options, 'overrides.replay.options');
-  const options = { durationSeconds: 5, warmupSeconds: 0, ...configuredOptions };
+  const workload = config.workload === undefined ? undefined : object(config.workload, 'workload');
+  const workloadOptions = workload?.source === 'replay' ? object(workload.options, 'workload.options') : {};
+  const options = { durationSeconds: workloadOptions.durationSeconds ?? 5,
+    warmupSeconds: workloadOptions.warmupSeconds ?? 0, ...configuredOptions };
   if (values.qps !== undefined) overrides.qps = numberFlag(values.qps, 'qps', true);
   if (values.seed !== undefined) overrides.seed = numberFlag(values.seed, 'seed', false, true);
   if (values.drain !== undefined) overrides.simMaxTime = numberFlag(values.drain, 'drain');

@@ -3,14 +3,14 @@ import { getCurrentStrategy } from "./strategy.js";
 import { hwPresets } from "../core/presets.js";
 import { SENS_LEVELS, sensParamUnit, SENS_METRIC_LABEL, SENS_PARAM_LABEL, isTtftStack, TTFT_STACK_PARTS } from "../application/labels.js";
 import { setSensExportEnabled } from "./export.js";
-import { parseRangeOrList, buildSensPoints, applyParamVal, sortedJson } from "../application/sweep.js";
+import { parseRangeOrList, buildSensPoints, buildSweepJob, assertReplaySweepParameter, sortedJson } from "../application/sweep.js";
 import { getParams } from "../adapters/browser/params.js";
 import { state } from "./state.js";
-import { initChart } from "./charts.js";
+import { initChart, escapeHtml } from "./charts.js";
 import { collectParamsJson, buildParamMeta } from "./parameters.js";
 import { collectSensSnapshot } from "./snapshots.js";
 import { executeBatch, serverVersion } from '../execution/browser/client.ts';
-import { allowSyntheticAnalysis, updateRunControls } from './replay.js';
+import { allowSyntheticAnalysis, updateRunControls, createReplayJob, replayControls, getReplayWorkloadConfig } from './replay.js';
 
 
 
@@ -118,8 +118,10 @@ export async function runSensitivity() {
   updateRunControls();
   try { await runSensitivityRemote(); }
   catch (error) {
-    setSensExportEnabled(false);
-    $('chartSensitivity').textContent = error.message;
+    setSensExportEnabled(!!state.sensExportState);
+    const note = $('sensitivityStatus');
+    note.hidden = false;
+    note.textContent = `任务未完成，保留上次结果：${error.message}`;
   }
   finally {
     state.sensitivityRunning = false;
@@ -135,12 +137,13 @@ async function runSensitivityRemote() {
   // 依赖 DOM 顺序 —— 一旦有人在其上方加按钮就会误禁用别的按钮。
   let btn = $('btnRunSens') || document.querySelector('#sensitivityPanel .btn');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 分析中...'; }
-  // 新扫描开始 ⇒ 旧图即将被进度提示覆盖(chartEl.innerHTML 被替换会销毁 echarts 实例),
-  // 此时导出会取到已销毁的画布, 故先禁用导出, 由 paint() 成功后重新解锁。
   setSensExportEnabled(false);
 
-  let baseStrategy = getCurrentStrategy(); // 敏感性基准 = 当前配置的策略（与甘特图/运行当前一致）
+  let baseStrategy = structuredClone(getCurrentStrategy());
+  if (!baseStrategy) throw new Error('当前 DSL 策略解析失败。');
+  const isReplay = state.workloadSource === 'replay';
   let param = $('sSweepParam').value, metric = $('sSweepMetric').value;
+  if (isReplay) for (const key of [param, $('sSweepCompareParam')?.value, $('sShapeDim')?.value]) assertReplaySweepParameter(key);
   // 扫描档位：优先「扫描范围(起,止,步长 或 逗号列表)」，空则用参数默认档位
   let values = null;
   let rangeRaw = ($('sSweepRange') ? $('sSweepRange').value : '').trim();
@@ -160,8 +163,8 @@ async function runSensitivityRemote() {
   }
   let labels = values.map(v => sensParamUnit(param, v));
 
-  let metricLabel = SENS_METRIC_LABEL[metric];
-  let paramLabel = SENS_PARAM_LABEL[param];
+  let metricLabel = SENS_METRIC_LABEL[metric] || $('sSweepMetric').selectedOptions[0]?.textContent || metric;
+  let paramLabel = isReplay && param === 'qps' ? '目标 QPS' : SENS_PARAM_LABEL[param];
 
   // ===== ③ 第三维 = 节点形状(2026-08-25 改造: 由「固定预取策略」改为「可绑定」) =====
   // 动机: 原设计把形状硬编码给预取策略, 于是"颜色+形状"两个**非策略**自变量无法同时表达
@@ -172,12 +175,12 @@ async function runSensitivityRemote() {
   //    既控颜色又控形状, 图例自相矛盾且白跑 N² 次仿真)。
   const SHAPE_SYMBOLS = ['circle', 'square', 'triangle', 'diamond', 'roundRect', 'pin'];
   let shapeDim = ($('sShapeDim') ? $('sShapeDim').value : 'prefetch') || 'prefetch';
-  const PF_SYMBOL = { wait_complete: 'circle', best_effort: 'square', race: 'triangle' };
-  const PF_TYPE = { wait_complete: 'none', best_effort: 'best_effort', race: 'race' };
+  const PF_SYMBOL = { wait_complete: 'circle', best_effort: 'square', timeout: 'diamond', race: 'triangle' };
 
   let prefetchList = [];
   if ($('sPfWait') && $('sPfWait').checked) prefetchList.push('wait_complete');
   if ($('sPfBest') && $('sPfBest').checked) prefetchList.push('best_effort');
+  if ($('sPfTimeout') && $('sPfTimeout').checked) prefetchList.push('timeout');
   if ($('sPfRace') && $('sPfRace').checked) prefetchList.push('race');
 
   // 对比参数（第二维=颜色）：显式下拉选择，档位从输入框读取（自动填充默认，可编辑）
@@ -218,16 +221,25 @@ async function runSensitivityRemote() {
   // 缓存 key：全参数指纹（策略 + 全局参数 + 扫描参数 + 扫描档位 + 对比参数/档位 + 种子），不含 metric——
   // 同一扫描切换纵轴直接复用同一批全指标记录，零仿真重跑；含扫描档位 values（修复 2026-08-11:
   // 旧版漏 values → 改扫描档位重跑命中旧缓存显示旧曲线）
-  let paramsFp = getParams(); // 基础参数指纹（含基础 prefixHit/ssdBW，扫描/对比值经 overrides 注入，不在此指纹内）
-  const snapshot = { baseVals: baseValsOf(), paramsJson: collectParamsJson(), paramMeta: buildParamMeta() };
+  let paramsFp = structuredClone(getParams());
   const mode = state.strategyMode;
+  const baseJob = isReplay ? createReplayJob({ params: paramsFp, controls: replayControls(), strategies: [baseStrategy], mode })
+    : { params: paramsFp, strategy: baseStrategy, mode, overrides: { seed: paramsFp.seed } };
+  paramsFp = baseJob.params;
+  const snapshot = { baseVals: baseValsOf(), paramsJson: collectParamsJson(), paramMeta: buildParamMeta(), workload: getReplayWorkloadConfig() };
+  if (isReplay) {
+    for (const key of ['prefix_hit', 'prefix_warm_l2', 'input_len', 'concurrency']) delete snapshot.baseVals[key];
+    snapshot.baseVals.qps = paramsFp.qps;
+  }
   const version = await serverVersion();
-  let cacheKey = JSON.stringify([version, mode, paramsFp, baseStrategy.dsl || baseStrategy.name || '', param, values, compareParam, compareVals, shapeDim, shapeList, paramsFp.seed]);
-  let cached = state.sensCache[cacheKey];
+  let cacheKey = JSON.stringify([version, mode, paramsFp, baseStrategy, snapshot.workload, param, values, compareParam, compareVals, shapeDim, shapeList, paramsFp.seed]);
+  let cached = isReplay ? undefined : state.sensCache[cacheKey];
 
-  let chartEl = $('chartSensitivity');
   let formulaEl = $('formulaSensitivity');
-  function metricOf(rec) { return rec && rec[metric] != null ? rec[metric] : 0; }
+  function metricOf(rec) {
+    if (isReplay && /^(ttft|tpot|latency|p99_latency|compute_|fetch_ratio)/.test(metric) && !rec?.workload?.counts?.successful) return null;
+    return rec && Number.isFinite(rec[metric]) ? +rec[metric].toFixed(3) : null;
+  }
 
   // 统一绘图：results 元素 = 全指标记录(rec) 或 null；按当前 metric 提取
   function paint(results) {
@@ -353,8 +365,9 @@ async function runSensitivityRemote() {
           itemStyle: { color: part.color },
           emphasis: { focus: 'series' },
           data: stackScenes.map(function (sc) {
-            let v = (sc.rec && sc.rec[part.key] != null && isFinite(sc.rec[part.key])) ? sc.rec[part.key] : 0;
-            return +v.toFixed(1);
+            if (isReplay && (!Number.isFinite(sc.rec?.ttft) || !sc.rec?.workload?.counts?.successful)) return null;
+            let v = sc.rec?.[part.key];
+            return Number.isFinite(v) ? +v.toFixed(1) : null;
           })
         });
       });
@@ -362,17 +375,17 @@ async function runSensitivityRemote() {
       // ⚠️ 不能挂在第一个 —— 那样标签会画在最底层分段的顶部, 落在柱子中间。
       // 值用 Σ 而非 series 自身 value, 否则显示的是最后一个分量而非总高。
       let totals = stackScenes.map(function (sc) {
-        return TTFT_STACK_PARTS.reduce(function (a, p) {
-          let v = (sc.rec && isFinite(sc.rec[p.key])) ? sc.rec[p.key] : 0; return a + v;
-        }, 0);
+        if (isReplay && (!Number.isFinite(sc.rec?.ttft) || !sc.rec?.workload?.counts?.successful)) return null;
+        return TTFT_STACK_PARTS.every(part => Number.isFinite(sc.rec?.[part.key]))
+          ? TTFT_STACK_PARTS.reduce((sum, part) => sum + sc.rec[part.key], 0) : null;
       });
       let lastSer = series[series.length - 1];
       lastSer.label = {
         show: stackScenes.length <= 24,   // 场景过多时标签会糊成一片 ⇒ 自动隐藏, 靠 tooltip 看
         position: 'top', color: '#e4e4e7', fontSize: 9, fontWeight: 600,
         formatter: function (p) {
-          let t = totals[p.dataIndex] || 0;
-          return t >= 10000 ? (t / 1000).toFixed(1) + 's' : t.toFixed(0);
+          let t = totals[p.dataIndex];
+          return t == null ? '无样本' : t >= 10000 ? (t / 1000).toFixed(1) + 's' : t.toFixed(0);
         }
       };
       // 供 tooltip / 导出复用
@@ -381,7 +394,7 @@ async function runSensitivityRemote() {
       flatCurves.forEach(function (fc) {
         series.push({
           name: fc.name, type: 'line', smooth: true,
-          data: fc.recs.map(rec => +metricOf(rec).toFixed(1)),
+          data: fc.recs.map(rec => metricOf(rec)),
           lineStyle: { color: palette[fc.ci % palette.length], width: 2 },
           itemStyle: { color: palette[fc.ci % palette.length] },
           symbol: hasPf ? shapeSymbolOf(fc.pi, shapeList[fc.pi]) : 'circle',
@@ -389,7 +402,7 @@ async function runSensitivityRemote() {
         });
       });
     } else {
-      series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(rec => +metricOf(rec).toFixed(1)),
+      series.push({ name: metricLabel, type: 'line', smooth: true, data: results.map(rec => metricOf(rec)),
         lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.1)' },
         itemStyle: { color: '#6c63ff' }, label: { show: true, color: '#9ca0b0', fontSize: 9 } });
     }
@@ -422,7 +435,17 @@ async function runSensitivityRemote() {
         formatter: function(params) {
           if (!params || !params.length) return '';
           let html = '<div style="font-weight:600;margin-bottom:4px">' + (params[0].axisValueLabel || params[0].name) + '</div>';
+          function workloadNote(rec) {
+            if (rec?.workload?.source !== 'replay') return '';
+            const w = rec.workload, m = w.windows.measurement;
+            const value = n => Number.isFinite(n) ? n.toFixed(3) : '无样本';
+            return '<div>measurement 到达 / 完成 QPS: ' + value(m?.arrivalQps) + ' / ' + value(m?.completionQps)
+              + ' · 失败 / 取消: ' + w.counts.failed + ' / ' + w.counts.cancelled
+              + ' · 截断: ' + (w.state.truncated ? '是' : '否') + (w.eligibleForComparison ? '' : ' · 不参与最佳点比较') + '</div>';
+          }
           if (stackMode) {
+            html += workloadNote(stackScenes[params[0].dataIndex]?.rec);
+            if (totals[params[0].dataIndex] == null) return html + '<div>TTFT：无样本</div>';
             // 堆叠柱: 显示 分量 / 绝对值 / 占比, 末行给总计 —— 占比是"时间花在哪"的核心读数。
             // 分母用当前柱的 Σ(而非全局最大值), 因此每根柱的百分比各自归一到 100%。
             let tot = params.reduce(function (a, p) { return a + (+p.value || 0); }, 0);
@@ -443,7 +466,8 @@ async function runSensitivityRemote() {
           }
           params.forEach(function(p) {
             let sym = (series[p.seriesIndex] && series[p.seriesIndex].symbol) || 'circle';
-            html += '<div style="display:flex;align-items:center;line-height:18px">' + symbolMarker(sym, p.color) + '<span style="color:#9ca0b0;margin-right:8px">' + p.seriesName + '</span><span style="margin-left:auto;color:#9ca0b0">' + p.value + '</span></div>';
+            html += '<div style="display:flex;align-items:center;line-height:18px">' + symbolMarker(sym, p.color) + '<span style="color:#9ca0b0;margin-right:8px">' + p.seriesName + '</span><span style="margin-left:auto;color:#9ca0b0">' + (p.value == null || p.value === '-' ? '无样本' : p.value) + '</span></div>';
+            html += workloadNote(flatCurves[p.seriesIndex]?.recs?.[p.dataIndex]);
           });
           return html;
         }
@@ -486,13 +510,15 @@ async function runSensitivityRemote() {
     else if (hasPf) desc = '双维敏感性：横轴 <code>'+paramLabel+'</code> × 形状「'+shapeLabel+'」('+shapeList.map(shapeLabelOf).join(' / ')+')，纵轴 <code>'+metricLabel+'</code>';
     else desc = '固定其他策略参数与随机种子（共同随机数法），扫描 <code>'+paramLabel+'</code>，观察 <code>'+metricLabel+'</code>';
     formulaEl.innerHTML = '<b>📐 敏感度分析方法</b><br>'+desc+
-      '<br>基准策略: <code>'+baseStrategy.name+'</code> · 同一扫描切换纵轴即时（缓存）'+
+      '<br>基准策略: <code>'+escapeHtml(baseStrategy.name)+'</code> · ' + (isReplay ? 'Replay 每次提交新任务，不使用结果缓存；延迟无样本保持空值，失败/截断点不参与最佳点比较。measurement 指标使用测量窗口；吞吐与 TTFT 分解保持全程。' : '同一扫描切换纵轴即时（缓存）') +
       (cached ? ' · <span style="color:var(--accent)">⚡ 缓存命中，未重跑仿真（切换纵轴即时）</span>' : '');
     // ---- 导出快照(2026-08-25): 供 PNG/JPG/HTML 三种导出复用 ----
     // 存 option 与元信息, 而不是重新算一遍 —— 保证"导出的就是你看到的那张图"。
     // ⚠️ opt.tooltip.formatter 是闭包函数, JSON 序列化会丢失; HTML 导出时单独重建等价实现
     //    (见 buildSensHtml 里内联的 formatter), 故此处只需原样保留 opt 供位图导出用。
     state.sensExportState = {
+      workloadSource: isReplay ? 'replay' : 'synthetic', workload: snapshot.workload,
+      configuration: structuredClone(baseJob.params), engineVersion: version,
       opt: opt, labels: labels, series: series,
       param: param, paramLabel: paramLabel, metric: metric, metricLabel: metricLabel,
       compareParam: compareParam, compareVals: compareVals,
@@ -554,7 +580,6 @@ async function runSensitivityRemote() {
   if (hasPf) results = compareParam ? compareVals.map(() => shapeList.map(() => new Array(values.length))) : shapeList.map(() => new Array(values.length));
   else results = compareParam ? compareVals.map(() => new Array(values.length)) : new Array(values.length);
   let totalRuns = (compareParam ? compareVals.length : 1) * (hasPf ? shapeList.length : 1) * values.length;
-  formulaEl.innerHTML = '';
 
   // ===== 任务列表(与旧 setTimeout 循环同顺序 ci→pi→idx): 点级缓存命中直接填充, 未命中进 jobs =====
   //
@@ -576,18 +601,11 @@ async function runSensitivityRemote() {
         let v = values[_idx];
         let cv = compareParam ? compareVals[_ci] : null;
         let pf = hasPf ? shapeList[_pi] : null;
-        let s = JSON.parse(JSON.stringify(baseStrategy));
-        let overrides = { seed: paramsFp.seed }; // 固定种子保证可比
-        // 三个视觉角色共用同一个落地函数 —— 落地顺序 横轴 → 颜色 → 形状 与原实现一致
-        // (后写覆盖先写; 三者已做互斥判定, 正常不会撞同一字段)
-        applyParamVal(s, overrides, param, v);
-        if (compareParam) applyParamVal(s, overrides, compareParam, cv);
-        if (hasPf) {
-          // 'prefetch' 是唯一的非扫描参数维度(改策略对象的 prefetch.type), 单独分派;
-          // 其余任意参数走与横轴/颜色**完全相同**的落地路径
-          if (shapeDim === 'prefetch') s.prefetch.type = PF_TYPE[pf]; // wait_complete→none（命中即等拉取）, best_effort/race 直接用其类型
-          else applyParamVal(s, overrides, shapeDim, pf);
-        }
+        const dimensions = [[param, v]];
+        if (compareParam) dimensions.push([compareParam, cv]);
+        if (hasPf) dimensions.push([shapeDim, pf]);
+        const pointJob = buildSweepJob(baseJob, dimensions);
+        const s = pointJob.strategy, overrides = pointJob.overrides;
         // 角色无关的点级缓存 key = 完整仿真输入指纹(全局参数 + 策略 + 参数覆盖 + 种子)。
         // ★ paramsFp 必须在内: s/overrides 只含**被扫描的**参数, 模型/dtype/卡数等全局参数
         //   不在其中 —— 少了它, 换个模型重跑会误命中上个模型的结果(静默给出错误曲线)。
@@ -596,8 +614,8 @@ async function runSensitivityRemote() {
         // ★ 剔除 s.name: 它是纯展示字段(改个策略名不改任何语义), 留着会让重命名后全部失配。
         //   s.dsl 保留 —— 那才是调度语义的权威来源。
         let sFp = JSON.parse(JSON.stringify(s)); delete sFp.name;
-        let pointKey = sortedJson([version, mode, paramsFp, sFp, overrides]);
-        let hit = state.sensPointCache[pointKey];
+        let pointKey = isReplay ? null : sortedJson([version, mode, paramsFp, sFp, overrides]);
+        let hit = isReplay ? undefined : state.sensPointCache[pointKey];
         if (hit !== undefined) {
           if (hasPf) { if (compareParam) results[_ci][_pi][_idx] = hit; else results[_pi][_idx] = hit; }
           else if (compareParam) results[_ci][_idx] = hit; else results[_idx] = hit;
@@ -610,7 +628,8 @@ async function runSensitivityRemote() {
   }
 
   function storePoint(job, rec) {
-    if (rec) {
+    if (!job || !rec || (isReplay && (rec.workload?.source !== 'replay' || !rec.workload?.configuration || !rec.workload?.windows?.measurement))) throw new Error('服务器扫描结果缺少点数据或 Replay 执行快照。');
+    if (!isReplay) {
       state.sensPointCache[job.key] = rec;
       let pkeys = Object.keys(state.sensPointCache);
       if (pkeys.length >= 1000) delete state.sensPointCache[pkeys[0]]; // 点级 FIFO 淘汰（上限1000点）
@@ -619,23 +638,32 @@ async function runSensitivityRemote() {
     else if (compareParam) results[job.ci][job.idx] = rec; else results[job.idx] = rec;
   }
   function finish() {
-    state.sensCache[cacheKey] = results; // 全指标记录入缓存（后续切纵轴/重跑直接复用）
-    let keys = Object.keys(state.sensCache);
-    if (keys.length >= 20) delete state.sensCache[keys[0]]; // FIFO 淘汰最旧
+    if (filled !== totalRuns) throw new Error('扫描结果不完整，保留上次成功结果。');
+    if (!isReplay) {
+      state.sensCache[cacheKey] = results;
+      let keys = Object.keys(state.sensCache);
+      if (keys.length >= 20) delete state.sensCache[keys[0]];
+    }
     paint(results);
   }
   if (!jobs.length) { finish(); return; }
   const controller = new AbortController();
-  chartEl.replaceChildren();
-  const note = document.createElement("span");
-  const cancel = document.createElement("button");
-  cancel.id = "sensCancelBtn"; cancel.className = "btn btn-sm"; cancel.textContent = "取消服务器计算";
+  const status = $('sensitivityStatus');
+  status.hidden = false;
+  status.replaceChildren();
+  const note = document.createElement('span');
+  const cancel = document.createElement('button');
+  cancel.id = 'sensCancelBtn'; cancel.className = 'btn btn-sm'; cancel.textContent = '取消服务器计算';
   cancel.onclick = () => { cancel.disabled = true; controller.abort(); };
-  chartEl.append(note, cancel);
-  await executeBatch(jobs.map(job => ({ params: paramsFp, strategy: job.s, overrides: job.overrides, mode })), "scan", {
-    label: paramLabel + "敏感性扫描", signal: controller.signal,
-    onTask: task => { note.textContent = "服务器任务 " + task.status + " · 已完成 " + filled + "/" + totalRuns + " "; },
-    onPoint: point => { storePoint(jobs[point.index], point.result); filled++; },
-  });
-  finish();
+  status.append(note, cancel);
+  try {
+    await executeBatch(jobs.map(job => ({ params: structuredClone(paramsFp), strategy: job.s, overrides: job.overrides, mode })), 'scan', {
+      label: paramLabel + '敏感性扫描', signal: controller.signal,
+      onTask: task => { note.textContent = '服务器任务 ' + task.status + ' · 已完成 ' + filled + '/' + totalRuns + ' '; },
+      onPoint: point => { storePoint(jobs[point.index], point.result); filled++; },
+    });
+    if (controller.signal.aborted) throw new Error('已取消服务器任务。');
+    finish();
+    note.textContent = `扫描完成 · ${totalRuns} 点${isReplay ? ' · Replay 未使用结果缓存；失败/截断状态见点详情' : ''}`;
+  } finally { cancel.remove(); }
 }

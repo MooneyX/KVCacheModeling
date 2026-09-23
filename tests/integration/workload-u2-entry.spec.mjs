@@ -6,7 +6,43 @@ import { runSimulation, WORKLOAD_MODEL_VERSION } from '../../src/core/simulation
 const base = JSON.parse(readFileSync(new URL('../fixtures/simulation-baseline.json', import.meta.url)))[0];
 const { bundle } = JSON.parse(readFileSync(new URL('../fixtures/replay/runtime-prefix.json', import.meta.url)));
 
-test('U4: deployed task entry remains on the production engine and reports the rebuilt runner version', async ({ page }) => {
+async function completedTask(page, kind, jobs) {
+  const response = await page.request.post('/api/tasks', { data: { kind, jobs, requestId: randomUUID(), label: 'U5 entry consistency' } });
+  expect(response.status(), await response.text()).toBe(202);
+  const task = await response.json();
+  await expect.poll(async () => (await (await page.request.get(`/api/tasks/${task.id}`)).json()).status,
+    { timeout: 30_000 }).toBe('completed');
+  const stored = await (await page.request.get(`/api/tasks/${task.id}/download`)).json();
+  expect(stored.task.status).toBe('completed');
+  expect(stored.points).toHaveLength(jobs.length);
+  return stored.points.map(point => point.result);
+}
+
+for (const workloadSource of ['synthetic', 'replay']) {
+  test(`U5: identical ${workloadSource} jobs produce equal complete results singly and in independent batch slots`, async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#serverStatus')).toContainText('服务器计算');
+    const job = { params: structuredClone(base.params), strategy: structuredClone(base.strategy), mode: 'dsl',
+      overrides: workloadSource === 'replay'
+        ? { seed: 0, blockSize: 32, qps: 6, simMaxTime: 1, replay: { bundle, options: { durationSeconds: 0.2, warmupSeconds: 0 } } }
+        : { seed: 0, blockSize: 32, qps: 2, nreq: 2, inputLen: 64, outputLen: 2, lenDist: 'fixed', prefixHit: 0, prefixWarm: false } };
+    const before = structuredClone(job);
+    const [single] = await completedTask(page, 'simulation', [job]);
+    const batch = await completedTask(page, 'batch', [job, structuredClone(job)]);
+    expect(batch).toEqual([single, single]);
+    expect(job).toEqual(before);
+    expect(single.configuration.workloadModelVersion).toBe(WORKLOAD_MODEL_VERSION);
+    if (workloadSource === 'replay') {
+      expect(single.replay.configuration).toEqual(single.configuration);
+      expect(single.replay.configuration.seed).toBe(0);
+      expect(single.replay.configuration.execution.blockSize).toBe(32);
+      expect(single.hitTok).toEqual({ l1: 192, l2: 0, l3: 0, miss: 256, total: 448 });
+      expect(single.replay.counts.successful).toBe(3);
+    } else expect(single.replay).toBeUndefined();
+  });
+}
+
+test('U5: deployed task entry defaults to the unified engine and cannot inject acceptance overrides', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('#serverStatus')).toContainText('服务器计算');
   const health = await (await page.request.get('/api/health')).json();
@@ -35,9 +71,18 @@ test('U4: deployed task entry remains on the production engine and reports the r
   }
   expect(results[0]).toEqual(JSON.parse(JSON.stringify(runSimulation(base.params, base.strategy, overrides))));
   expect(results[1]).toEqual(results[0]);
-  expect(results[1].workloadModelVersion).toBeUndefined();
-  expect(results[2].replay.configuration.workloadModelVersion).not.toBe(WORKLOAD_MODEL_VERSION);
-  expect(results[2].replay.state.supportedScope).toBe('single-instance/64-token/HBM-capacity-sufficient');
+  expect(results[0].configuration.workloadModelVersion).toBe(WORKLOAD_MODEL_VERSION);
+  expect(results[1].configuration.workloadModelVersion).toBe(WORKLOAD_MODEL_VERSION);
+  for (const result of results) {
+    expect(result.configuration.execution).not.toHaveProperty('acceptance');
+    expect(result.configuration.execution).not.toHaveProperty('unified');
+    expect(result.configuration.execution).not.toHaveProperty('workloadModelVersion');
+  }
+  expect(results[1].completed).toBe(1);
+  expect(results[1].simEnd).toBeGreaterThan(0);
+  expect(results[2].replay.configuration).toEqual(results[2].configuration);
+  expect(results[2].replay.configuration.workloadModelVersion).toBe(WORKLOAD_MODEL_VERSION);
+  expect(results[2].replay.state.supportedScope).toBe('single-instance/64-token/finite-capacity-tiered-four-configurations');
   expect(results[2].completed).toBe(3);
   expect(results[2].hitTok).toEqual({ l1: 192, l2: 0, l3: 0, miss: 256, total: 448 });
   expect(results[2].replay.cache.inputPages).toBe(4);

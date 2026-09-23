@@ -17,10 +17,10 @@ export function runWorkloadAcceptance(params, strategy, overrides, acceptance = 
   return simulate(params, strategy, overrides, 'dsl', acceptance);
 }
 
-export const WORKLOAD_MODEL_VERSION = 'workload-u4-pages-topology-v1';
+export const WORKLOAD_MODEL_VERSION = 'workload-u5-metrics-v1';
 
 function simulate(params, strategy, overrides, strategyMode, acceptance) {
-  const unified = acceptance !== null;
+  const unified = true;
   overrides = overrides || {};
   let p = JSON.parse(JSON.stringify(params));
   // ---- 硬件预设覆盖(2026-08-25, 为「形状=GPU」的多硬件扫描而加) ----
@@ -48,9 +48,13 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     p.gpus = _hwOv.gpus;
     // 注意: 故意**不**写 p.ssdBW —— 见上方第 1 条
   }
-  for (let k in overrides) { if (k !== 'seed' && k !== 'nreq' && k !== 'hwPreset' && k !== 'replay') p[k] = overrides[k]; }
+  for (let k in overrides) {
+    if (!['seed', 'nreq', 'hwPreset', 'replay', 'unified', 'acceptance', 'workloadModelVersion'].includes(k)) p[k] = overrides[k];
+  }
   if (p.instances > 1 && p.pdMode === 2)
     throw new RangeError('Multiple instances cannot be combined with physical P/D separation');
+  const effectiveSeed = (overrides.seed ?? p.seed) >>> 0;
+  p.seed = effectiveSeed;
   let replayMetrics = null;
   const replayActive = overrides.replay === undefined ? null : new Map();
   const replayIncomplete = [];
@@ -61,13 +65,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       id: req.id, templateIndex: req.templateIndex, launchIndex: req.launchIndex, requestIndex: req.requestIndex,
       arrive: req.arrive, admitTime: phaseTime(req.admitTime),
       prefillStart: phaseTime(req.prefillStart), prefillEnd: phaseTime(req.prefillEnd),
+      firstTokenTime: phaseTime(req.firstTokenTime), decodeStart: req._decodeStarted ? phaseTime(req.decodeStart) : null,
       completeTime: !reason && req.state === 'done' ? req.completeTime : null,
       state: reason ? 'failed' : ({ wait: 'queued', prefill: 'prefilling', decode: 'decoding' }[req.state] || req.state),
       ...(reason ? { failedAt: req.completeTime, reason } : {}),
     };
   }
   const replay = overrides.replay === undefined ? null : createReplayRuntime(overrides.replay, {
-    qps: p.qps, seed: overrides.seed ?? p.seed,
+    qps: p.qps, seed: effectiveSeed,
     hooks: {
       launch: event => replayMetrics.launch(event),
       arrive: req => { replayMetrics.arrive(req); replayActive.set(req.id, req); },
@@ -100,8 +105,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     p.lenDist = 'fixed'; p.arrivalDist = 'poisson'; p.concurrency = 1;
   }
   if (unified) {
-    if (![0, 2].includes(p.pdMode) || (p.pdSep && p.pdMode !== 2))
-      throw new RangeError('U4.3 acceptance supports mixed execution or physical P/D separation');
+    if (![0, 1, 2].includes(p.pdMode))
+      throw new RangeError('Workload execution requires a supported P/D mode');
     if (p.pdMode === 2 && (!Number.isSafeInteger(p.pdPrefillGpus) || p.pdPrefillGpus < 1 || p.pdPrefillGpus >= p.gpus))
       throw new RangeError('U4.3 acceptance requires positive prefill and decode GPU allocations');
     if (p.pdMode === 2 && (!(p.pdLinkBW > 0) || !Number.isFinite(p.pdLinkBW)
@@ -110,7 +115,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     if (!Number.isSafeInteger(p.instances) || p.instances < 1 || p.instances > p.gpus)
       throw new RangeError('U4.2 acceptance requires a positive safe-integer instance count not exceeding GPUs');
     validatePhysicalBlockSize(p.blockSize);
-    if (strategyMode !== 'dsl') throw new RangeError('U4 acceptance requires DSL');
+    if (!['dsl', 'js'].includes(strategyMode)) throw new RangeError('Workload execution requires DSL or JavaScript strategy mode');
   }
   if (_hwOv) {
     let _e = estimatePrefillParams(p);
@@ -120,16 +125,25 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     p.prefillB = parseFloat(_e.b.toFixed(6));
     p.prefillBIdx = parseFloat(_e.bIdx.toFixed(6));
   }
+  const bypassedParameters = replay ? ['inputLen', 'outputLen', 'lenDist', 'arrivalDist', 'concurrency', 'prefixHit', 'prefixWarm', 'prefixWarmL2', 'multiTurn', 'singleBatch', 'nreq'] : [];
+  const execution = Object.fromEntries(Object.entries(p).filter(([key]) => !bypassedParameters.includes(key)));
+  const configuration = {
+    source: replay ? 'replay' : 'synthetic', seed: effectiveSeed,
+    workloadModelVersion: unified ? WORKLOAD_MODEL_VERSION : 'legacy-s09-u5-metrics-v1',
+    blockMapping: { logical: 64, physical: p.blockSize },
+    pageLayout: { inputOutput: 'separately-rounded', capacity: unified || replay ? 'physical-page' : 'legacy-merged-block', reads: 'valid-tokens',
+      sharing: p.blockSize < 64 ? 'conservative-subpages' : 'ordered-path-segments', outputIdentity: replay ? 'unmapped' : 'session-history' },
+    capabilities: { tieredCache: unified || !replay, finiteCapacity: unified, physicalPd: (unified || !replay) && p.pdMode === 2,
+      multiInstance: (unified || !replay) && p.instances > 1, superblocks: !unified && !replay },
+    execution, bypassedParameters, strategy: JSON.parse(JSON.stringify(strategy)),
+    ...(!replay && overrides.nreq != null ? { nreq: overrides.nreq } : {}),
+    ...(replay ? { bundleVersion: 1, bundleDigest: createHash('sha256').update(JSON.stringify(overrides.replay.bundle)).digest('hex'),
+      digestEncoding: 'JSON.stringify/sha256' } : {}),
+  };
   if (replay) {
-    const bypassedParameters = ['inputLen', 'outputLen', 'lenDist', 'arrivalDist', 'concurrency', 'prefixHit', 'prefixWarm', 'prefixWarmL2', 'multiTurn', 'singleBatch', 'nreq'];
-    const execution = Object.fromEntries(Object.entries(p).filter(([key]) => !bypassedParameters.includes(key)));
-    replayMetrics = createReplayMetrics({ ...replay.options, hardCutoff: replay.options.durationSeconds + p.simMaxTime,
-      stats: replay.launcher.stats, seed: overrides.seed ?? p.seed, qps: p.qps, finiteCapacity: unified,
-      lambdaSession: replay.launcher.lambdaSession, limits: replay.launcher.limits,
-      configuration: { ...(unified ? { workloadModelVersion: WORKLOAD_MODEL_VERSION } : {}),
-        bundleVersion: 1, bundleDigest: createHash('sha256').update(JSON.stringify(overrides.replay.bundle)).digest('hex'),
-        digestEncoding: 'JSON.stringify/sha256', blockMapping: { logical: 64, physical: p.blockSize }, execution, bypassedParameters,
-        strategy: JSON.parse(JSON.stringify(strategy)) } });
+    replayMetrics = createReplayMetrics({ ...replay.options, hardCutoff: acceptance?.window?.hardCutoff ?? replay.options.durationSeconds + p.simMaxTime,
+      stats: replay.launcher.stats, seed: effectiveSeed, qps: p.qps, finiteCapacity: unified,
+      lambdaSession: replay.launcher.lambdaSession, limits: replay.launcher.limits, configuration });
   }
   let r = calcAll(p);
   // ---------- PD 真分离: 双资源视图(2026-08-20) ----------
@@ -1586,8 +1600,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // _kvXferEnd 由传输完成时写入(= prefillEnd + 实际传输墙钟)。
     const firstKvReady = unified && req._firstKvXferEnd != null ? req._firstKvXferEnd : req._kvXferEnd;
     let _ttftAt = unified && req.firstTokenTime != null ? req.firstTokenTime : (firstKvReady != null ? firstKvReady : req.prefillEnd);
+    req.firstTokenTime ??= _ttftAt;
+    const completedOutputTokens = p.singleBatch ? 0 : req.outputLen;
     stats.ttfts.push((_ttftAt - req.arrive) * 1000);
-    stats.tpots.push((now - (req.decodeStart || _ttftAt)) / Math.max(1, req.outputLen) * 1000); // ms/token（剔除 decodeWait 排队）
+    if (completedOutputTokens > 0) stats.tpots.push((now - (req.decodeStart ?? _ttftAt)) / completedOutputTokens * 1000);
     stats.queueWaits.push(req.admitTime - req.arrive);
     // ===== TTFT 分解: 事件时间戳口径(2026-09-01 重构) =====
     // 加性恒等式: queue + prefillQ + fetch + computeNet + computeWait (+xfer) = TTFT
@@ -1687,10 +1703,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         stats.dcSpans.push([_ds, req.completeTime]);
         stats.dcSpanSum += (req.completeTime - _ds);
       }
-      stats.dcOutTokens += (req.outputLen || 0);
+      stats.dcOutTokens += completedOutputTokens;
     }
     stats.latDw += _dW; stats.latDt += _dT;
-    stats.completed++; stats.outTokens += req.outputLen;
+    stats.completed++; stats.outTokens += completedOutputTokens;
     // 每实例完成计数(S2): 按请求被路由到的实例归属(不用当前 inst, 更稳)
     if (instances[req.instId || 0]) instances[req.instId || 0].nCompleted++;
     if (!replay && timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
@@ -1758,7 +1774,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   }
   const earliestEnd = acceptance?.window?.earliestEnd ?? replay?.options.durationSeconds ?? 0;
   if (unified) {
-    simCap = acceptance.window?.hardCutoff ?? simCap;
+    simCap = acceptance?.window?.hardCutoff ?? simCap;
     if (!Number.isFinite(simCap) || !Number.isFinite(earliestEnd) || earliestEnd < 0 || simCap < earliestEnd)
       throw new RangeError('U2 acceptance window requires 0 <= earliestEnd <= finite hardCutoff');
   }
@@ -1940,11 +1956,33 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   let nextBoundary = 0, stepDuration = DT;
   let resourceTime = 0, hbmIntegral = 0, previousHbm = totalHbm();
   let dramIntegral = 0, ssdIntegral = 0, previousDram = totalDram(), previousSsd = totalSsd();
+  const residentWidth = Math.max(DT * 5, simCap / 19_999);
+  const residentBuckets = new Map();
+  let residentTime = 0;
+  let bandwidthSampleStart = null, bandwidthSampleEnd = null;
+  function sampleResidentUsage(time) {
+    if (!unified && !replay) return;
+    while (residentTime < time) {
+      let index = Math.floor(residentTime / residentWidth);
+      if ((index + 1) * residentWidth <= residentTime) index++;
+      index = Math.min(19_998, index);
+      const end = Math.min(time, index === 19_998 ? simCap : (index + 1) * residentWidth);
+      if (end <= residentTime) break;
+      const bucket = residentBuckets.get(index) ?? { start: index * residentWidth, duration: 0, l2: 0, l3: 0 };
+      const dt = end - residentTime;
+      bucket.duration += dt; bucket.l2 += previousDram * dt; bucket.l3 += previousSsd * dt;
+      residentBuckets.set(index, bucket);
+      residentTime = end;
+    }
+  }
   function captureResourceUsage() {
+    sampleResidentUsage(now);
     previousHbm = totalHbm(); previousDram = totalDram(); previousSsd = totalSsd();
   }
+  let pendingIdleLanding = false;
   for (let step = 0; unified || step < maxSteps; step++) {
-    let replayIdleLanding = false;
+    let replayIdleLanding = pendingIdleLanding;
+    pendingIdleLanding = false;
     now = unified ? nextBoundary : replay ? Math.min(step * DT, simCap) : step * DT;
     if (unified) {
       hbmIntegral += (now - resourceTime) * previousHbm;
@@ -2006,8 +2044,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         }
       }
       replayMetrics.observe(now, { activeSessions: replay.sessions.size,
-        activeRequests: (unified ? instances.reduce((sum, target) => sum + instLoad(target), 0)
-          : waitQueue.length + prefillQ.length + prefilling.length + decoding.length + decodeWait.length) + completionEvents.length,
+        activeRequests: instances.reduce((sum, target) => sum + instLoad(target), 0) + completionEvents.length,
         queuedRequests: unified ? instances.reduce((sum, target) => sum + target.waitQueue.length + target.prefillQ.length, 0)
           : waitQueue.length + prefillQ.length, ...cacheSnapshot() });
     }
@@ -2033,6 +2070,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         throw new Error('Workload scheduling invariant: unresolved anchors without future events');
       const target = Math.min(simCap, next, source.done ? Math.max(now, earliestEnd) : Infinity);
       if (target > now) {
+        if (replay) sampleReplayConcurrency(now);
+        pendingIdleLanding = !!replay;
         captureResourceUsage();
         nextBoundary = target;
         continue;
@@ -2676,6 +2715,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       let instL3 = (stats.transferL3Bytes - stats._prevL3) / Math.max(DT, 1e-9);
       if (!replay || stats.l2Inst.length < 20_000) {
         stats.l2Inst.push(Math.max(instL2, 0)); stats.l3Inst.push(Math.max(instL3, 0));
+        bandwidthSampleStart ??= now;
+        bandwidthSampleEnd = Math.min(simCap, now + dtEff);
       }
       // passTime 名义分量 + 瓶颈归因（时间主要花在哪一层；comm 为通信项，cmp 为算力下限）
       let tHbm = unified ? localCost.memory : (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
@@ -2765,8 +2806,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       _sDram += decodeResource.pools.dram.used; _sSsd += decodeResource.pools.ssd.used;
     }
     if (replay) replayMetrics.observe(now, { activeSessions: replay.sessions.size,
-      activeRequests: _sDec + _sPf + _sQ + completionEvents.length
-        + (unified ? instances.reduce((sum, target) => sum + target.decodeWait.length + target.kvXfer.length, 0) : 0),
+      activeRequests: instances.reduce((sum, target) => sum + instLoad(target), 0) + completionEvents.length,
       queuedRequests: _sQ, ...cacheSnapshot() });
     let u = _sHbmUsed / Math.max(_sHbmCap, 1);
     stats.memUtilSum += u; stats.memUtilSamples++;
@@ -2783,12 +2823,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         && stats.concSamples.at(-1)?.slice(1).some(count => count > 0);
       if (step % 5 === 0 || replayIdleLanding || becameIdle) sampleReplayConcurrency(now);
     }
-    if (step % 5 === 0 && (!replay || stats.l2Series.length < 20_000)) {
+    if (step % 5 === 0) {
       if (!replay) stats.concSamples.push([+now.toFixed(2), _sDec, _sPf, _sQ]);
-      // L2/L3 驻留时间序列（GB）——策略行为的瞬态画像（预取/淘汰波次可见）
-      stats.l2Series.push([+now.toFixed(2), +(_sDram / 1e9).toFixed(2)]);
-      stats.l3Series.push([+now.toFixed(2), +(_sSsd / 1e9).toFixed(2)]);
+      if (!unified && !replay) {
+        stats.l2Series.push([+now.toFixed(2), +(_sDram / 1e9).toFixed(2)]);
+        stats.l3Series.push([+now.toFixed(2), +(_sSsd / 1e9).toFixed(2)]);
+      }
     }
+    if (unified || replay) captureResourceUsage();
 
     let _allDone = source.done && (!replay || (!inFlight.length && now >= replay.options.durationSeconds));
     if (unified) _allDone = source.done && now >= earliestEnd && !cachePending()
@@ -2836,20 +2878,20 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // 'toFixed is not a function'。故老字段改名 hbmHitRate。
   let hbmHitRate = totalAcc > 0 ? stats.hbmAcc / totalAcc * 100 : 0;
   let sortedLats = stats.latencies.slice().sort((a, b) => a - b);
-  let p50 = sortedLats.length ? sortedLats[Math.floor(sortedLats.length * 0.5)] : 0;
-  let p99 = sortedLats.length ? sortedLats[Math.min(sortedLats.length - 1, Math.floor(sortedLats.length * 0.99))] : 0;
-  let mean = sortedLats.length ? sortedLats.reduce((a, b) => a + b, 0) / sortedLats.length : 0;
+  let p50 = sortedLats.length ? sortedLats[Math.floor(sortedLats.length * 0.5)] : null;
+  let p99 = sortedLats.length ? sortedLats[Math.min(sortedLats.length - 1, Math.floor(sortedLats.length * 0.99))] : null;
+  let mean = sortedLats.length ? sortedLats.reduce((a, b) => a + b, 0) / sortedLats.length : null;
   let variance = sortedLats.length ? sortedLats.reduce((a, b) => a + (b - mean) * (b - mean), 0) / sortedLats.length : 0;
-  let fairnessCV = mean > 0 ? Math.sqrt(variance) / mean * 100 : 0;
-  let avgTtft = stats.ttfts.length ? stats.ttfts.reduce((a, b) => a + b, 0) / stats.ttfts.length : 0;
+  let fairnessCV = mean > 0 ? Math.sqrt(variance) / mean * 100 : (mean === null ? null : 0);
+  let avgTtft = stats.ttfts.length ? stats.ttfts.reduce((a, b) => a + b, 0) / stats.ttfts.length : null;
   let sortedTtft = stats.ttfts.slice().sort((a, b) => a - b);
-  let p50Ttft = sortedTtft.length ? sortedTtft[Math.floor(sortedTtft.length * 0.5)] : 0;
-  let p99Ttft = sortedTtft.length ? sortedTtft[Math.min(sortedTtft.length - 1, Math.floor(sortedTtft.length * 0.99))] : 0;
-  let avgTpot = stats.tpots.length ? stats.tpots.reduce((a, b) => a + b, 0) / stats.tpots.length : 0;
+  let p50Ttft = sortedTtft.length ? sortedTtft[Math.floor(sortedTtft.length * 0.5)] : null;
+  let p99Ttft = sortedTtft.length ? sortedTtft[Math.min(sortedTtft.length - 1, Math.floor(sortedTtft.length * 0.99))] : null;
+  let avgTpot = stats.tpots.length ? stats.tpots.reduce((a, b) => a + b, 0) / stats.tpots.length : null;
   let sortedTpot = stats.tpots.slice().sort((a, b) => a - b);
-  let p50Tpot = sortedTpot.length ? sortedTpot[Math.floor(sortedTpot.length * 0.5)] : 0;
-  let p99Tpot = sortedTpot.length ? sortedTpot[Math.min(sortedTpot.length - 1, Math.floor(sortedTpot.length * 0.99))] : 0;
-  let avgQueue = stats.queueWaits.length ? stats.queueWaits.reduce((a, b) => a + b, 0) / stats.queueWaits.length : 0;
+  let p50Tpot = sortedTpot.length ? sortedTpot[Math.floor(sortedTpot.length * 0.5)] : null;
+  let p99Tpot = sortedTpot.length ? sortedTpot[Math.min(sortedTpot.length - 1, Math.floor(sortedTpot.length * 0.99))] : null;
+  let avgQueue = stats.queueWaits.length ? stats.queueWaits.reduce((a, b) => a + b, 0) / stats.queueWaits.length : null;
 
   // 未完成请求：记录截至仿真结束的部分生命周期（甘特图浅色显示）
   let incomplete = replay ? replayIncomplete : [];
@@ -3110,35 +3152,55 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     prefixGroups: Object.keys(prefixGroupMap).length,
     fragPct: r.fragPct,
     completed: stats.completed, totalReqs: source.counts().planned,
+    configuration, workloadCounts: source.counts(),
+    seriesCoverage: { resident: { start: 0, end: simEnd, sampling: unified || replay ? 'time-weighted-full-window-buckets' : 'periodic',
+      maxSamples: unified || replay ? 20_000 : null, bucketWidthSeconds: unified || replay ? residentWidth : DT * 5 } },
     ...(replay ? { replay: replayMetrics.finish(now, { ...source.counts(), truncated, terminationReason: truncated ? 'hard_cutoff' : 'drained' }) } : {}),
     truncated: truncated, simEnd: simEnd, drainEst: drainEst, // 截断标志 + 仿真结束时间 + 排水估计(截断时建议上限值)
     latencies: stats.latencies, timeline: timeline, concTimeline: stats.concSamples,
     incomplete: incomplete,   // (simEnd 已在上一行给出, 此处原有重复 key 已删 —— 2026-08-20)
     admission: strategy.admission.type, eviction: strategy.eviction.type, prefetch: strategy.prefetch.type,
   };
+  Object.assign(result.configuration, { earliestEnd, hardCutoff: simCap,
+    windows: replay ? result.replay.configuration.windows : { full: [0, now] } });
+  if (unified || replay) {
+    sampleResidentUsage(now);
+    const buckets = [...residentBuckets.values()];
+    result.l2Series = buckets.map(bucket => [bucket.start, bucket.l2 / bucket.duration / 1e9]);
+    result.l3Series = buckets.map(bucket => [bucket.start, bucket.l3 / bucket.duration / 1e9]);
+    result.l2Series.push([simEnd, totalDram() / 1e9]);
+    result.l3Series.push([simEnd, totalSsd() / 1e9]);
+  }
   if (replay) {
+    Object.assign(result.replay.configuration, result.configuration);
+    result.configuration = result.replay.configuration;
     Object.assign(result.replay.cache, cacheSnapshot());
     result.replay.samples.legacy = {
       requestCoverage: 'all-arrived-requests',
       concurrencySampling: 'periodic-with-idle-boundaries', concurrencySampleIntervalSeconds: DT * 5,
       concurrencyCoverage: [stats.concSamples[0][0], stats.concSamples.at(-1)[0]],
       completedTimelineSamples: timeline.length, incompleteTimelineSamples: incomplete.length,
-      residentMaxSeriesSamples: 20_000, residentSampling: 'first-20000-periodic-samples',
+      residentMaxSeriesSamples: 20_000, residentSampling: 'time-weighted-full-window-buckets',
+      residentCoverage: [0, now], residentBucketWidthSeconds: residentWidth,
       bandwidthSamples: stats.l2Inst.length, bandwidthSampling: 'first-20000-decode-steps',
+      bandwidthCoverage: bandwidthSampleStart === null ? null : [bandwidthSampleStart, bandwidthSampleEnd],
+      bandwidthWholeRun: false,
       requestArrayLimit: replay.launcher.limits.maxRequests,
     };
     result.memUtilAvg = (result.replay.samples.timeWeightedMean.hbmBytes || 0) / Math.max(unified ? totalHbmCapacity() : caps.hbm, 1) * 100;
     result.memUtilPeak = result.replay.samples.peak.hbmBytes / Math.max(unified ? totalHbmCapacity() : caps.hbm, 1) * 100;
     result.hitRate && (result.hitRate.input = null);
-    const bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
-    if (bytes > replay.launcher.limits.maxResultBytes) throw new ReplayValidationError('replay.result', 'result byte resource limit exceeded');
-    replay.checkWallTime();
   }
   if (unified) {
     result.memUtilAvg = hbmIntegral / simEnd / Math.max(totalHbmCapacity(), 1) * 100;
     result.memUtilPeak = stats.memUtilPeak * 100;
     result.l2AvgGB = dramIntegral / simEnd / 1e9;
     result.l3AvgGB = ssdIntegral / simEnd / 1e9;
+  }
+  if (replay) {
+    const bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+    if (bytes > replay.launcher.limits.maxResultBytes) throw new ReplayValidationError('replay.result', 'result byte resource limit exceeded');
+    replay.checkWallTime();
   }
   acceptance?.finish?.({ modelVersion: WORKLOAD_MODEL_VERSION, retractCount, recomputedTokens,
     window: { earliestEnd, hardCutoff: simCap }, counts: source.counts(), cache: cacheSnapshot(), resources: resourceSnapshots() });

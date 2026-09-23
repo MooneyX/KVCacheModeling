@@ -55,6 +55,11 @@ export const SENS_METRIC_LABEL = {
   // TTFT 六分量(2026-08-26): 既是堆叠柱的组成部分, 也可各自单独作折线纵轴
   ttft_queue:'TTFT分量-排队等待(ms)', ttft_prefillq:'TTFT分量-Prefill排队(ms)',
   ttft_fetch:'TTFT分量-L3拉取等待(ms)', ttft_xfer:'TTFT分量-PD KV传输(ms)',
+  measurement_arrival_qps:'measurement 到达QPS', measurement_completion_qps:'measurement 完成QPS',
+  measurement_ttft:'measurement 平均TTFT(ms)', measurement_ttft_p50:'measurement TTFT P50(ms)', measurement_ttft_p99:'measurement TTFT P99(ms)',
+  measurement_tpot:'measurement 平均TPOT(ms/tok)', measurement_tpot_p50:'measurement TPOT P50(ms/tok)', measurement_tpot_p99:'measurement TPOT P99(ms/tok)',
+  measurement_latency:'measurement 平均延迟(ms)', measurement_latency_p50:'measurement 延迟P50(ms)', measurement_latency_p99:'measurement 延迟P99(ms)',
+  measurement_hit_rate:'measurement 前缀命中率(%)',
   // ★ 特殊指标: 值不是单一数字而是 6 分量堆叠柱(见 TTFT_STACK_PARTS)。
   //   放在最后 —— 导出页 ←/→ 键按此顺序遍历, 结构特殊的放末尾不打断折线指标的连续浏览。
   ttft_stack:'TTFT构成(堆叠柱)'

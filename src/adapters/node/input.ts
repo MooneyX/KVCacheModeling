@@ -1,4 +1,5 @@
 import { open } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { PassThrough, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
@@ -68,6 +69,29 @@ function object(value: unknown, label: string): Record<string, unknown> {
 
 export function parseJob(input: unknown): SimulationJob {
   let data = object(input, 'Input');
+  if (data.workload !== undefined) {
+    const workload = object(data.workload, 'workload');
+    if (!['synthetic', 'replay'].includes(String(workload.source))) throw new Error('workload.source must be synthetic or replay.');
+    if (workload.source === 'replay') {
+      const supplied = data.overrides === undefined ? {} : object(data.overrides, 'overrides');
+      if (!supplied.replay) throw new Error('Replay configuration contains only a summary; reselect and verify the bundle before execution.');
+      const replay = object(supplied.replay, 'overrides.replay');
+      const summary = object(workload.bundleSummary, 'workload.bundleSummary');
+      if (typeof summary.digest !== 'string' || !/^[a-f0-9]{64}$/.test(summary.digest)) throw new Error('Invalid Replay bundle summary digest.');
+      const options = object(workload.options, 'workload.options');
+      const { qps, seed, simMaxTime, ...replayOptions } = options;
+      if (typeof qps !== 'number' || !Number.isFinite(qps) || qps <= 0
+        || typeof seed !== 'number' || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff
+        || typeof simMaxTime !== 'number' || !Number.isFinite(simMaxTime) || simMaxTime < 0) throw new Error('Invalid Replay workload QPS, seed or drain.');
+      if (replayOptions.arrivalModel !== 'closed' || replayOptions.superblocks !== false) throw new Error('Replay workload requires closed arrivals without superblocks.');
+      validateReplayOverride({ bundle: replay.bundle, options: replayOptions });
+      const digest = createHash('sha256').update(JSON.stringify(replay.bundle)).digest('hex');
+      if (digest !== summary.digest) throw new Error('Replay bundle digest does not match the imported configuration.');
+      data = { ...data, overrides: { qps, seed, simMaxTime, ...supplied,
+        replay: { ...replay, options: { ...replayOptions, ...object(replay.options ?? {}, 'replay.options') } },
+      } };
+    }
+  }
   if (!('params' in data)) {
     if (!Object.keys(data).some(key => key.startsWith('p') && key !== 'params')) {
       throw new Error('Expected a job with params/strategy or an exported control-ID parameter object.');
@@ -100,6 +124,16 @@ export function parseJob(input: unknown): SimulationJob {
   if (Number(overrides.instances ?? params.instances) > 1 && (overrides.pdMode ?? params.pdMode) === 2) {
     throw new Error('Multiple instances cannot be combined with physical P/D separation.');
   }
-  if ('replay' in overrides) overrides.replay = validateReplayOverride(overrides.replay);
+  if ('replay' in overrides) {
+    overrides.replay = validateReplayOverride(overrides.replay);
+    if (mode !== 'dsl') throw new Error('Replay execution accepts DSL only.');
+    for (const key of ['nreq', 'concurrency', 'inputLen', 'outputLen', 'lenDist', 'arrivalDist', 'multiTurn', 'prefixHit', 'prefixWarm', 'prefixWarmL2', 'singleBatch']) {
+      if (key in overrides) throw new Error(`Replay does not support synthetic generation override: ${key}.`);
+    }
+    const effective = { ...params, ...overrides };
+    if (!Number.isFinite(effective.qps) || Number(effective.qps) <= 0) throw new Error('Replay QPS must be a finite positive number.');
+    if (!Number.isInteger(effective.seed) || Number(effective.seed) < 0 || Number(effective.seed) > 0xffffffff) throw new Error('Replay seed must be a uint32 integer.');
+    if (!Number.isFinite(effective.simMaxTime) || Number(effective.simMaxTime) < 0) throw new Error('Replay simMaxTime must be finite nonnegative drain seconds.');
+  }
   return { params: params as SimulationParams, strategy: strategy as SimulationStrategy, mode: mode as StrategyMode, overrides };
 }

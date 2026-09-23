@@ -104,11 +104,14 @@ test('JS is explicitly rejected and scan cancellation reaches the server', async
   expect(await page.evaluate(() => window.__unexpectedJs)).toBeUndefined();
   await importControls(page, { ...uiValues, _strategyMode: 'dsl' });
   await page.locator('#sSweepRange').fill('1,200,1');
+  const previousChart = await page.locator('#chartSensitivity').innerHTML();
   const submission = submitted(page);
   await page.locator('#btnRunSens').click();
   const task = await (await submission).json();
   await page.locator('#sensCancelBtn').click();
-  await expect(page.locator('#chartSensitivity')).toContainText('取消');
+  await expect(page.locator('#sensitivityStatus')).toContainText('取消');
+  await expect(page.locator('#sensitivityStatus')).toContainText('保留上次结果');
+  expect(await page.locator('#chartSensitivity').innerHTML()).toBe(previousChart);
   const status = await page.evaluate(async id => (await (await fetch('/api/tasks/' + id)).json()).status, task.id);
   expect(status).toBe('cancelled');
   await expect(page.locator('#btnRunSens')).toBeEnabled();

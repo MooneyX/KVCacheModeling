@@ -84,8 +84,17 @@ function assertMeasurement(snapshot, r) {
   expect(snapshot.formulas.formulaStrategySim).toContain('measurement');
   expect(snapshot.formulas.formulaStrategyTier).toContain('全程');
   expect(Object.keys(snapshot.metrics)).not.toContain('命中率(实测/输入)');
-  expect(snapshot.charts.chartStrategyBwReq).toBeNull();
-  expect(snapshot.charts.chartStrategyResident).toBeNull();
+  const bandwidth = snapshot.charts.chartStrategyBwReq;
+  expect(bandwidth.xAxis[0].data).toEqual([r.name]);
+  for (const [name, key] of [['L2 P99', 'l2BWp99'], ['L2 峰值', 'l2BWPeak'], ['L3 P99', 'l3BWp99'], ['L3 峰值', 'l3BWPeak']]) {
+    expect(bandwidth.series.find(series => series.name === name).data).toEqual([r.ptSamples ? +(r[key] / 1e9).toFixed(2) : null]);
+  }
+  expect(bandwidth.series.find(series => series.name === 'L3 配置').data).toEqual([r.replay.configuration.execution.ssdBW]);
+  const resident = snapshot.charts.chartStrategyResident;
+  expect(resident.series.map(series => series.data)).toEqual([r.l2Series, r.l3Series]);
+  expect(resident.series.map(series => series.data.at(-1)[0])).toEqual([r.simEnd, r.simEnd]);
+  expect(r.seriesCoverage.resident).toMatchObject({ start: 0, end: r.simEnd, sampling: 'time-weighted-full-window-buckets' });
+  expect(snapshot.formulas.formulaStrategyTier).toContain('不能视为全程所需带宽');
   expect(JSON.stringify(snapshot)).not.toMatch(/NaN|Infinity|undefined/);
 }
 
@@ -125,7 +134,8 @@ test('V3: measurement values, units and counts do not come from top-level synthe
   expect(snapshot.metrics['输出吞吐(全程)']).toBe(valueText(r.throughput, 3, ' tok/s'));
   expect(snapshot.metrics['显存利用率峰值(全程)']).toBe(valueText(r.memUtilPeak, 1, '%'));
   expect(snapshot.charts.chartStrategyPt.series.find(s => s.name === 'HBM读').data).toEqual([null, +r.ptBreakdown.hbm.toFixed(1)]);
-  for (const id of ['chartStrategyBwReq', 'chartStrategyResident', 'chartBatching', 'chartPrefix', 'chartEviction']) await expect(page.locator('#' + id)).toContainText('不适用');
+  for (const id of ['chartStrategyBwReq', 'chartStrategyResident']) await expect(page.locator('#' + id)).not.toContainText('不适用');
+  for (const id of ['chartBatching', 'chartPrefix', 'chartEviction']) await expect(page.locator('#' + id)).toContainText('不适用：此理论估算依赖合成负载假设');
   expect(observed).toEqual({ errors: [], posts: [] });
 });
 
@@ -169,9 +179,10 @@ test('V3: failed and cutoff records retain sparse IDs and never invent cancelled
   expect(snapshot.charts.chartGantt.yAxis[0].data).toEqual(['Req #0 · 失败', 'Req #2 · 成功']);
   const failed = mixed.incomplete[0];
   expect(snapshot.charts.chartGantt.series.find(s => s.name === '失败').data).toEqual([[0, failed.failedAt, failed.failedAt]]);
-  expect(failed.failedAt).toBeGreaterThan(failed.arrive);
+  expect(failed.reason).toBe('infeasible');
+  expect(failed.failedAt).toBe(failed.arrive);
   expect(snapshot.charts.chartGantt.series.find(s => s.name === 'Queue(等槽位/显存)').data.filter(d => (d.value || d)[0] === 0))
-    .toEqual([{ value: [0, failed.arrive, failed.failedAt], itemStyle: { opacity: 0.35 } }]);
+    .toEqual([]);
   expect(snapshot.charts.chartGantt.series.filter(s => ['Wait(等算力)', 'Prefill', 'Decode'].includes(s.name))
     .flatMap(s => s.data).every(d => (d.value || d)[0] !== 0)).toBe(true);
   expect(snapshot.tooltips.some(text => text.includes('infeasible'))).toBe(true);

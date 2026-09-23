@@ -27,6 +27,25 @@ test('S07: hand-calculated continuous-prefix hits and resident input KV agree wi
   assert.equal(result.replay.cache.inputPages, expected.residentInputPages);
   assert.equal(result.replay.cache.outputPages, 0);
   assert.ok(result.replay.cache.hbmBytes > 0);
+  assert.equal(result.replay.cache.hbmBytes, 4 * 64 * 163840);
+});
+
+test('U5: production completion dependencies reuse published pages with independent 128/64/64ms prefill times', () => {
+  const result = run(bundle, { prefillA: 1000, prefillB: 0, prefillBIdx: 0 });
+  assert.equal(result.completed, 3);
+  assert.deepEqual(result.hitTok, { l1: 192, l2: 0, l3: 0, miss: 256, total: 448 });
+  const rows = [...result.timeline].sort((a, b) => a.requestIndex - b.requestIndex);
+  for (const [index, duration] of [0.128, 0.064, 0.064].entries()) {
+    const row = rows[index];
+    assert.equal(row.admitTime, row.arrive); assert.equal(row.prefillStart, row.arrive);
+    assert.ok(Math.abs(row.prefillEnd - row.prefillStart - duration) < 1e-10);
+    assert.equal(row.completeTime, row.prefillEnd);
+    assert.equal(row.firstTokenTime, row.prefillEnd); assert.equal(row.decodeStart, null);
+    if (index) assert.equal(row.arrive, rows[index - 1].completeTime);
+  }
+  assert.ok(Math.abs(result.avgTtft - 256 / 3) < 1e-10);
+  assert.equal(result.replay.cache.hbmBytes, 4 * 64 * 163840);
+  assert.equal(result.replay.cache.outputPages, 0);
 });
 
 test('S07: concurrent unpublished inputs miss, then publication deduplicates without losing locks', () => {

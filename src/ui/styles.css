@@ -97,7 +97,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
 #replayFileInfo,#replayStatus{font-size:.75rem;color:var(--text-dim);margin:8px 0 14px;overflow-wrap:anywhere}
 #replaySummary{font-size:.75rem;margin-bottom:16px}
 #replaySummary h3{font-size:.85rem;color:var(--accent);margin-bottom:2px}
-#replaySummary dt,#replaySummary>p,#replaySummary summary{color:var(--text-dim)}
-#replaySummary>p{margin-bottom:14px}
+#replaySummary dt,#replaySummary p,#replaySummary summary{color:var(--text-dim)}
+#replaySummary p{margin-bottom:14px}
 #replaySummary summary{cursor:pointer}
 #ganttPageStatus{font-size:.75rem;color:var(--text-dim);margin:0 8px}

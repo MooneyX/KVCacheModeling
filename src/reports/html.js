@@ -1,6 +1,58 @@
 import { SENS_METRIC_LABEL, TTFT_STACK_KEY, SENS_PARAM_LABEL, sensParamUnit } from "../application/labels.js";
 import { sensSnapTitle } from "../application/snapshots.js";
 
+export function reportSnapshotContext(snapshot = {}, point = {}) {
+  const saved = snapshot.workload || {};
+  const measured = point.workload || point.rec?.workload || snapshot.points?.[0]?.rec?.workload || snapshot.curveRecs?.[0]?.[0]?.workload || {};
+  const workload = { ...saved, ...measured };
+  const experiment = point.experiment || snapshot.experiment || {};
+  const states = point.rec || point.workload ? [] : (snapshot.points || []).map(item => item.workload?.state || item.rec?.workload?.state).filter(Boolean);
+  return {
+    source: workload.source || snapshot.workloadSource || snapshot.source || 'synthetic',
+    bundleSummary: saved.bundleSummary || workload.bundleSummary || workload.bundle || experiment.bundleSummary || null,
+    configuration: point.workload?.configuration || point.rec?.workload?.configuration || workload.configuration || experiment.params || snapshot.configuration || null,
+    baselineConfiguration: snapshot.configuration || null,
+    options: saved.options || null,
+    windows: workload.windows || snapshot.windows || null,
+    state: states.length ? { ...workload.state, truncated: states.some(item => item.truncated), terminationReason: [...new Set(states.map(item => item.terminationReason))].join(', ') } : workload.state || null,
+    counts: workload.counts || null,
+    versions: { engine: snapshot.engineVersion || null, ...workload.versions, ...experiment.versions },
+    eligibleForComparison: workload.eligibleForComparison ?? null,
+    experiment,
+  };
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+  }
+  return value;
+}
+
+export function reportPointKey(snapshot, point) {
+  let params;
+  try { params = JSON.parse(snapshot.paramsJson || '{}'); } catch { params = snapshot.paramsJson; }
+  const context = reportSnapshotContext(snapshot, point);
+  const windows = context.windows && Object.fromEntries(Object.entries(context.windows).map(([name, window]) => [name,
+    { start: window?.start, end: window?.end, durationSeconds: window?.durationSeconds }]));
+  return JSON.stringify(canonical({
+    source: context.source, bundleSummary: context.bundleSummary,
+    configuration: context.configuration, baselineConfiguration: context.baselineConfiguration, options: context.options, windows, versions: context.versions,
+    experiment: context.experiment, params, point: point.params,
+    strategy: snapshot.strategy || snapshot.strategyName, dsl: snapshot.dsl, mode: snapshot.mode, seed: snapshot.seed,
+    version: snapshot.engineVersion || snapshot.version || null,
+  }));
+}
+
+export function reportExportRestriction(snapshot) {
+  if (!snapshot) return '请先运行一次敏感性分析。';
+  const contexts = [reportSnapshotContext(snapshot), ...(snapshot.points || []).map(point => reportSnapshotContext(snapshot, point))];
+  if (contexts.some(context => context.source === 'replay' && (!context.bundleSummary || !context.configuration || !context.windows || !context.state || !Object.values(context.versions).some(Boolean)))) {
+    return '该 Replay 快照缺少来源、有效配置、窗口或版本信息，请重新运行；完整结果 JSON 下载仍可使用。';
+  }
+  return '';
+}
 
 
 // ---- 自包含可交互 HTML ----
@@ -17,6 +69,10 @@ export function renderSensHtml(st, snapList) {
 
   // 快照列表: 未传或只有 1 条时退化为原来的单快照页(行为逐位不变)
   let snaps = (snapList && snapList.length) ? snapList : [st];
+  for (const snapshot of [st, ...snaps]) {
+    const restriction = reportExportRestriction(snapshot);
+    if (restriction) throw new Error(restriction);
+  }
   let multi = snaps.length > 1;
   // 深拷贝顺带丢掉函数字段(formatter) —— 生成页里重建, 见下方 FORMATTER
   let opt = JSON.parse(JSON.stringify(st.opt));
@@ -39,8 +95,8 @@ export function renderSensHtml(st, snapList) {
       let any = false;
       let cols = recs.map(function (arr) {
         return (arr || []).map(function (rec) {
-          if (rec && rec[k] != null && isFinite(rec[k])) { any = true; return +Number(rec[k]).toFixed(1); }
-          return 0;
+          if (rec && Object.prototype.hasOwnProperty.call(rec, k)) any = true;
+          return rec && typeof rec[k] === 'number' && Number.isFinite(rec[k]) ? +rec[k].toFixed(1) : null;
         });
       });
       if (any) { metricData[k] = cols; metricKeys.push(k); }
@@ -66,11 +122,11 @@ export function renderSensHtml(st, snapList) {
     else {
       stackParts.forEach(function (p) {
         stackData[p.key] = flat.map(function (r) {
-          let v = (r && r[p.key] != null && isFinite(r[p.key])) ? +Number(r[p.key]).toFixed(1) : 0;
-          return v;
+          return r && typeof r[p.key] === 'number' && Number.isFinite(r[p.key]) ? +r[p.key].toFixed(1) : null;
         });
       });
       stackTotals = flat.map(function (r, i) {
+        if (stackParts.some(p => stackData[p.key][i] == null)) return null;
         return +stackParts.reduce(function (a, p) { return a + stackData[p.key][i]; }, 0).toFixed(1);
       });
     }
@@ -95,8 +151,8 @@ export function renderSensHtml(st, snapList) {
       + '<th>TTFT合计</th></tr>';
     rows = stackLabels.map(function (lb, i) {
       return '<tr><td class="k">' + esc(lb) + '</td>'
-        + stackParts.map(function (p) { return '<td>' + esc(stackData[p.key][i]) + '</td>'; }).join('')
-        + '<td><b>' + esc(stackTotals[i]) + '</b></td></tr>';
+        + stackParts.map(function (p) { return '<td>' + esc(stackData[p.key][i] ?? '—') + '</td>'; }).join('')
+        + '<td><b>' + esc(stackTotals[i] ?? '—') + '</b></td></tr>';
     }).join('\n');
   } else {
     head = '<tr><th>' + esc(st.paramLabel) + '</th>'
@@ -104,7 +160,7 @@ export function renderSensHtml(st, snapList) {
     rows = st.labels.map(function (lb, i) {
       return '<tr><td class="k">' + esc(lb) + '</td>'
         + sers.map(function (s) {
-          let v = (s.data && s.data[i] != null) ? s.data[i] : '';
+          let v = (s.data && s.data[i] != null) ? s.data[i] : '—';
           return '<td>' + esc(v) + '</td>';
         }).join('') + '</tr>';
     }).join('\n');
@@ -133,19 +189,17 @@ export function renderSensHtml(st, snapList) {
   // 指纹: 参数键排序后的 JSON —— 与平台侧点级缓存 key 同思路(键序无关)。
   // 重复点取**首次出现**的记录(同参数组合同种子的仿真结果本应逐位相同; 若不同则说明有
   // 未纳入 params 的隐藏差异, 此时保留先到者并计数, 由 dupCount 暴露给用户而非静默平均)。
-  let pivotPts = [], pivotSeen = {}, dupCount = 0;
-  let ptFp = function (ps) {
-    let ks = Object.keys(ps || {}).sort();
-    return ks.map(function (k) { return k + '=' + ps[k]; }).join('|');
-  };
+  let pivotPts = [], pivotSeen = new Map(), pivotGroups = new Map(), dupCount = 0;
   snaps.forEach(function (sn, si) {
+    const groupKey = reportPointKey(sn, { params: {} });
+    if (!pivotGroups.has(groupKey)) pivotGroups.set(groupKey, pivotGroups.size);
+    const group = pivotGroups.get(groupKey);
     (sn.points || []).forEach(function (p) {
       if (!p || !p.rec) return;
-      let fp = ptFp(p.params);
-      if (pivotSeen[fp] !== undefined) { dupCount++; return; }
-      pivotSeen[fp] = pivotPts.length;
-      // 只保留数值型指标(rec 里全是标量), 并记录来源批次供"批次聚焦"用
-      pivotPts.push({ p: p.params, r: p.rec, s: si });
+      let fp = reportPointKey(sn, p);
+      if (pivotSeen.has(fp)) { pivotPts[pivotSeen.get(fp)].snapshots.push(si); dupCount++; return; }
+      pivotSeen.set(fp, pivotPts.length);
+      pivotPts.push({ p: p.params, r: p.rec, s: si, snapshots: [si], g: group, workload: reportSnapshotContext(sn, p) });
     });
   });
   // 参数索引: 每个参数在点云里出现过的**全部取值**(升序)。
@@ -283,6 +337,7 @@ export function renderSensHtml(st, snapList) {
   L.push('<h1>参数<span>敏感性</span>分析</h1>');
   L.push('<p class="sub">' + dimsHtml + '<br>基准策略 <b>' + esc(st.strategyName)
     + '</b> · 随机种子 ' + esc(st.seed) + ' · 导出于 ' + esc(st.at.toLocaleString('zh-CN')) + '</p>');
+  L.push('<div class="card"><div class="box"><b>指标口径</b><br>throughput 为全程输出 token/s；TTFT 分解为全程口径。measurement_* 仅采用 measurement 窗口；Replay 延迟按到达窗口归属，完成 QPS 按完成事件归窗。无样本显示“—”，失败或截断不记为零延迟最优点。</div></div>');
   L.push('<div class="card">');
   if (hasSwitch) {
     // 只在有 ≥2 个可用指标时才出现切换条 —— 单指标时下拉是噪音
@@ -401,10 +456,17 @@ export function renderSensHtml(st, snapList) {
     let pMeta = sn.paramMeta || {};
     let pData = {};
     try { pData = JSON.parse(sn.paramsJson); } catch (e) { pData = {}; }
-    let pKeys = Object.keys(pData).filter(function (k) { return k.charAt(0) !== '_'; });
+    let pKeys = Object.keys(pData).filter(function (k) { return k.charAt(0) !== '_' && k !== 'workload'; });
     // 有元信息才分组; 老快照(无 paramMeta)安全降级为纯 JSON
     let hasMeta = pKeys.some(function (k) { return pMeta[k]; });
-    let B = [];
+    const context = reportSnapshotContext(sn);
+    let B = ['<div class="pgrp"><h3>负载来源与有效实验快照</h3>'
+      + '<p>来源：' + esc(context.source) + ' · 状态：' + esc(context.state?.truncated ? '截断' : context.state?.terminationReason || '见快照') + '</p>'
+      + '<pre>' + esc(JSON.stringify(context, null, 2)) + '</pre></div>'];
+    if ((sn.points || []).length) {
+      B.push('<details class="pgrp"><summary>逐点有效配置、窗口与状态（' + sn.points.length + ' 点）</summary><pre>'
+        + esc(JSON.stringify(sn.points.map(point => ({ params: point.params, ...reportSnapshotContext(sn, point) })), null, 2)) + '</pre></details>');
+    }
     if (hasMeta) {
       // 值渲染: select 取 option 文本(而非 "1"/"gqa"), bool 取 开/关, 数字加千分位
       let fmtVal = function (id, v) {
@@ -486,7 +548,9 @@ export function renderSensHtml(st, snapList) {
     // 原始 JSON: 默认折叠(hasMeta 时), 无元信息时直接展开 —— 保证任何情况下都能复现
     B.push('<div id="pJson"' + (hasMeta ? ' style="display:none"' : '') + '>');
     B.push('<p style="font-size:.71rem;color:var(--text-dim);margin:0 0 6px">'
-      + '可全选复制后粘回平台「导入参数」以复现本次扫描</p>');
+      + (context.source === 'replay'
+        ? '可复制回平台恢复参数；必须重新选择并核验 bundle 后再运行。此配置仅含摘要，不是独立可复现包。'
+        : '可全选复制后粘回平台「导入参数」恢复本次扫描参数。') + '</p>');
     B.push('<pre>' + esc(sn.paramsJson) + '</pre></div>');
     return {
       inner: B.join('\n'),
@@ -498,8 +562,8 @@ export function renderSensHtml(st, snapList) {
   // 每个批次各自的参数区 HTML(无 paramsJson 的老快照给占位说明)
   let snapParamsHtml = snaps.map(function (sn) {
     if (!sn.paramsJson) {
-      return { html: '<p style="font-size:.75rem;color:var(--text-dim);margin:4px 0">该批次无参数配置快照（老版本平台导出）</p>',
-        count: '该批次无参数快照' };
+      return { html: '<p style="font-size:.75rem;color:var(--text-dim);margin:4px 0">该批次无可回填参数配置；以下为保存的实验元信息。</p><pre>'
+        + esc(JSON.stringify(reportSnapshotContext(sn), null, 2)) + '</pre>', count: '该批次无参数快照' };
     }
     let r = paramsInnerOf(sn);
     return { html: r.inner, count: r.count };
@@ -577,9 +641,11 @@ export function renderSensHtml(st, snapList) {
   L.push('  var h = "<div style=\\"font-weight:600;margin-bottom:4px\\">"+(ps[0].axisValueLabel||ps[0].name)+"</div>";');
   // 堆叠柱: 显示 分量/绝对值/占比 + 合计行(与平台内 tooltip 逐字等价)
   L.push('  if(CUR_IS_STACK){');
-  L.push('    var tot = 0; ps.forEach(function(p){ tot += (+p.value||0); });');
+  L.push('    var valid = ps.every(function(p){ return typeof p.value === "number" && isFinite(p.value); });');
+  L.push('    if(!valid) return h + "无完整样本（—）";');
+  L.push('    var tot = 0; ps.forEach(function(p){ tot += p.value; });');
   L.push('    ps.forEach(function(p){');
-  L.push('      var v = +p.value||0, pct = tot>0 ? (100*v/tot) : 0;');
+  L.push('      var v = p.value, pct = tot>0 ? (100*v/tot) : 0;');
   L.push('      h += "<div style=\\"display:flex;align-items:center;line-height:18px\\">"');
   L.push('        + "<span style=\\"display:inline-block;width:9px;height:9px;border-radius:2px;background:"+p.color+";margin-right:6px;flex:none\\"></span>"');
   L.push('        + "<span style=\\"color:#9ca0b0;margin-right:10px\\">"+p.seriesName+"</span>"');
@@ -595,7 +661,7 @@ export function renderSensHtml(st, snapList) {
   L.push('    var sym = (OPT.series[p.seriesIndex]&&OPT.series[p.seriesIndex].symbol)||"circle";');
   L.push('    h += "<div style=\\"display:flex;align-items:center;line-height:18px\\">"+symbolMarker(sym,p.color)');
   L.push('      + "<span style=\\"color:#9ca0b0;margin-right:8px\\">"+p.seriesName+"</span>"');
-  L.push('      + "<span style=\\"margin-left:auto;color:#9ca0b0\\">"+p.value+"</span></div>";');
+  L.push('      + "<span style=\\"margin-left:auto;color:#9ca0b0\\">"+(p.value==null?"—":p.value)+"</span></div>";');
   L.push('  });');
   L.push('  return h;');
   L.push('};');
@@ -673,8 +739,8 @@ export function renderSensHtml(st, snapList) {
   L.push('    th.innerHTML = "<tr><th>场景</th>" + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("") + "<th>TTFT合计</th></tr>";');
   L.push('    tb.innerHTML = sIdx.map(function(i){');
   L.push('      return "<tr><td class=\\"k\\">"+esc2(sceneLabelAt(i))+"</td>"');
-  L.push('        + STACK_PARTS.map(function(p){ return "<td>"+esc2((STACK_DATA[p.key]||[])[i])+"</td>"; }).join("")');
-  L.push('        + "<td><b>"+esc2(STACK_TOTALS[i])+"</b></td></tr>";');
+  L.push('        + STACK_PARTS.map(function(p){ var v=(STACK_DATA[p.key]||[])[i]; return "<td>"+esc2(v==null?"—":v)+"</td>"; }).join("")');
+  L.push('        + "<td><b>"+esc2(STACK_TOTALS[i]==null?"—":STACK_TOTALS[i])+"</b></td></tr>";');
   L.push('    }).join("");');
   L.push('    return;');
   L.push('  }');
@@ -686,7 +752,7 @@ export function renderSensHtml(st, snapList) {
   L.push('    + keepC.map(function(ci){ return "<th>"+esc2(IS_MULTI ? LINE_TPL[ci].name : lb)+"</th>"; }).join("") + "</tr>";');
   L.push('  tb.innerHTML = keepX.map(function(xi){');
   L.push('    return "<tr><td class=\\"k\\">"+esc2(LINE_LABELS[xi])+"</td>"');
-  L.push('      + keepC.map(function(ci){ var v=(cols[ci]||[])[xi]; return "<td>"+esc2(v!=null?v:"")+"</td>"; }).join("") + "</tr>";');
+  L.push('      + keepC.map(function(ci){ var v=(cols[ci]||[])[xi]; return "<td>"+esc2(v!=null?v:"—")+"</td>"; }).join("") + "</tr>";');
   L.push('  }).join("");');
   L.push('}');
   // buildStackSeries / buildLineSeries: 两种图形的 series 构造器(与平台侧逐字对应)
@@ -703,7 +769,7 @@ export function renderSensHtml(st, snapList) {
   // ⚠️ formatter 的 dataIndex 是**筛后**下标 ⇒ 必须经 sIdx 映射回原始下标再取 TOTALS
   L.push('  if(ss.length){ ss[ss.length-1].label = {show: sIdx.length<=24, position:"top",');
   L.push('    color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){');
-  L.push('      var t = STACK_TOTALS[sIdx[p.dataIndex]]||0;');
+  L.push('      var t = STACK_TOTALS[sIdx[p.dataIndex]]; if(t==null) return "";');
   L.push('      return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }');
   L.push('  return ss;');
   L.push('}');
@@ -825,7 +891,7 @@ export function renderSensHtml(st, snapList) {
   //   PIVOT_PTS[i] = {p: {参数key: 值}, r: {全指标}, s: 来源批次}
   // 于是「颜色=命中率 形状=输入长度」与「颜色=输入长度 形状=命中率」只是同一份点云的
   // 两种投影 —— 无需重跑, 页内下拉一换即可。
-  L.push('var PIVOT_PTS = ' + safeJson(hasPivot ? pivotPts : []) + ';');
+  L.push('var PIVOT_PTS = ' + safeJson(pivotPts) + ';');
   L.push('var PIVOT_IDX = ' + safeJson(hasPivot ? pivotIndex : {}) + ';');
   L.push('var PIVOT_DIMS = ' + safeJson(hasPivot ? pivotDims : []) + ';');
   L.push('var HAS_PIVOT = ' + (hasPivot ? 'true' : 'false') + ';');
@@ -834,7 +900,7 @@ export function renderSensHtml(st, snapList) {
   L.push('var SNAP_PARAMS_HTML = ' + safeJson(snapParamsHtml) + ';');
   // 面板待机时的提示文案(含点云规模信息) —— pvToggle(false) 退回原图时也恢复成它
   L.push('var PV_HINT = ' + safeJson(pivHint + ' —— 改动任一项即按所选角色重绘') + ';');
-  L.push('var PV_ON = false;');
+  L.push('var PV_ON = false, PV_SNAPSHOT = null;');
   // PV_SEL[参数key] = 勾选的取值下标数组(初始全选)
   L.push('var PV_SEL = {};');
   L.push('var PV_ROLE = {x:null,c:null,s:null};');
@@ -856,6 +922,7 @@ export function renderSensHtml(st, snapList) {
   L.push('  var keep = [];');
   L.push('  for(var i=0;i<PIVOT_PTS.length;i++){');
   L.push('    var pt = PIVOT_PTS[i], ok = true;');
+  L.push('    if(PV_SNAPSHOT!==null && (pt.snapshots||[pt.s]).indexOf(PV_SNAPSHOT)<0) continue;');
   L.push('    for(var k in PV_SEL){');
   L.push('      var idx = PIVOT_IDX[k]; if(!idx) continue;');
   L.push('      var v = pt.p[k]; if(v===undefined) continue;');
@@ -877,8 +944,8 @@ export function renderSensHtml(st, snapList) {
   L.push('  var groups = {}, order = [];');
   L.push('  keep.forEach(function(pt){');
   L.push('    var cv = kc ? pt.p[kc] : "", sv = ks ? pt.p[ks] : "";');
-  L.push('    var gk = String(cv)+"\\u0001"+String(sv);');
-  L.push('    if(!groups[gk]){ groups[gk] = {cv:cv, sv:sv, byX:{}}; order.push(gk); }');
+  L.push('    var gk = JSON.stringify([pt.g, cv, sv]);');
+  L.push('    if(!groups[gk]){ groups[gk] = {cv:cv, sv:sv, group:pt.g, batch:pt.s, byX:{}}; order.push(gk); }');
   L.push('    var xk = String(pt.p[kx]);');
   L.push('    if(!groups[gk].byX[xk]) groups[gk].byX[xk] = [];');
   L.push('    groups[gk].byX[xk].push(pt.r);');
@@ -906,6 +973,7 @@ export function renderSensHtml(st, snapList) {
   L.push('  var curves = order.map(function(gk){');
   L.push('    var g = groups[gk];');
   L.push('    var nm = [];');
+  if (pivotGroups.size > 1) L.push('    nm.push("批次 #" + (g.batch+1));');
   L.push('    if(kc) nm.push(pvFmt(kc, g.cv));');
   L.push('    if(ks) nm.push(pvFmt(ks, g.sv));');
   L.push('    var data = xv.map(function(x){');
@@ -975,9 +1043,9 @@ export function renderSensHtml(st, snapList) {
   L.push('  });');
   L.push('  var totals = sceneRecs.map(function(recs){');
   L.push('    if(recs===null) return null;');
-  L.push('    var t = 0, any = false;');
-  L.push('    STACK_PARTS.forEach(function(p){ var v = pvMetricVal(recs, p.key); if(v!=null){ t += v; any = true; } });');
-  L.push('    return any ? +t.toFixed(1) : null;');
+  L.push('    var t = 0, complete = STACK_PARTS.length > 0;');
+  L.push('    STACK_PARTS.forEach(function(p){ var v = pvMetricVal(recs, p.key); if(v==null) complete=false; else t+=v; });');
+  L.push('    return complete ? +t.toFixed(1) : null;');
   L.push('  });');
   L.push('  var ss = STACK_PARTS.map(function(p){');
   L.push('    return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,');
@@ -1163,7 +1231,7 @@ export function renderSensHtml(st, snapList) {
   //   · on=false ⇒ 交还给原路径(rebuildAll 重画平台那张图)
   //   fbar 始终可见 —— 它就是面板本体(2026-08-27 三次改造后不再有独立 pvbar)。
   L.push('function pvToggle(on){');
-  L.push('  PV_ON = !!on;');
+  L.push('  PV_ON = !!on; if(!PV_ON) PV_SNAPSHOT = null;');
   L.push('  var bar = document.getElementById("fbar");');
   L.push('  if(bar) bar.className = "fbar" + (PV_ON ? " live" : "");');
   // 「恢复原图」只在已接管时有意义
@@ -1228,14 +1296,14 @@ export function renderSensHtml(st, snapList) {
     L.push('  for(var m=0;m<sbs.length;m++){ (function(el){');
     L.push('    el.addEventListener("click", function(){');
     L.push('      var si = parseInt(el.getAttribute("data-snap"),10);');
-    L.push('      var meta = SNAP_META[si]; if(!meta) return;');
+    L.push('      var meta = SNAP_META[si]; if(!meta) return; PV_SNAPSHOT = si;');
     L.push('      var ex = document.getElementById("pvX"), ec2 = document.getElementById("pvC"), es = document.getElementById("pvS");');
     L.push('      if(ex && PIVOT_DIMS.indexOf(meta.x)>=0) ex.value = meta.x;');
     L.push('      if(ec2) ec2.value = (meta.cmp && PIVOT_DIMS.indexOf(meta.cmp)>=0) ? meta.cmp : "";');
     L.push('      if(es) es.value = (meta.shape && PIVOT_DIMS.indexOf(meta.shape)>=0) ? meta.shape : "";');
     L.push('      Object.keys(PIVOT_IDX).forEach(function(k){');
     L.push('        var seen = {};');
-    L.push('        PIVOT_PTS.forEach(function(pt){ if(pt.s===si && pt.p[k]!==undefined) seen[String(pt.p[k])] = true; });');
+    L.push('        PIVOT_PTS.forEach(function(pt){ if((pt.snapshots||[pt.s]).indexOf(si)>=0 && pt.p[k]!==undefined) seen[String(pt.p[k])] = true; });');
     L.push('        var idx = PIVOT_IDX[k], keep = [];');
     L.push('        for(var q=0;q<idx.vals.length;q++) if(seen[String(idx.vals[q])]) keep.push(q);');
     L.push('        if(keep.length) PV_SEL[k] = keep;');

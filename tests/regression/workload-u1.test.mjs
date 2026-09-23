@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { createSyntheticRuntime, createReplayRequest, generateRequests } from '../../src/core/requests.js';
 import { createReplayRuntime, compileReplaySession, flattenReplaySession } from '../../src/core/replay.js';
 import { mulberry32 } from '../../src/core/math.js';
-import { runSimulation } from '../../src/core/simulation.js';
+import { runSimulation, runWorkloadAcceptance, WORKLOAD_MODEL_VERSION } from '../../src/core/simulation.js';
 import { loadLegacy } from '../fixtures/legacy-loader.mjs';
 import { baseControls } from '../fixtures/scenarios.mjs';
 
@@ -46,8 +46,9 @@ function assertContent(req) {
 function assertNoInternalFields(value, path = 'result') {
   if (!value || typeof value !== 'object') return;
   for (const [key, child] of Object.entries(value)) {
-    if (path === 'result.replay.configuration' && key === 'outputIdentity') assert.equal(child, 'unmapped');
-    else assert.ok(!['sessionId', 'routingKey', 'inputContent', 'outputIdentity', 'sessionInstanceKey'].includes(key), `${path}.${key}`);
+    if (/^result\.(replay\.)?configuration(\.pageLayout)?$/.test(path) && key === 'outputIdentity') {
+      assert.ok(['unmapped', 'session-history'].includes(child), `${path}.${key} must be a capability label, not request identity`);
+    } else assert.ok(!['sessionId', 'routingKey', 'inputContent', 'outputIdentity', 'sessionInstanceKey'].includes(key), `${path}.${key}`);
     assertNoInternalFields(child, `${path}.${key}`);
   }
 }
@@ -323,13 +324,19 @@ test('U1: long Replay RLE remains lazy before infeasible admission and snapshots
 });
 
 for (const routePolicy of ['round_robin', 'random', 'power_of_two', 'hash_prefix']) {
-  test(`U1: full synthetic multi-turn result preserves interleaved routing RNG (${routePolicy})`, () => {
+  test(`U5: multi-turn default matches accepted isolated routing RNG (${routePolicy})`, () => {
     const legacy = loadLegacy({ ...baseControls, pMultiTurn: '100', pInstances: '2', pRoutePolicy: routePolicy, pPrefixAffinity: true });
     try {
       const overrides = { multiTurn: 1, instances: 2, routePolicy, prefixAffinity: true };
+      const historical = legacy.runSimulation(base.strategy, overrides);
+      assert.deepEqual(legacy.runSimulation(base.strategy, overrides), historical);
+      assert.ok(historical.totalReqs > 8);
       const result = runSimulation(base.params, base.strategy, overrides);
-      assert.deepEqual(result, legacy.runSimulation(base.strategy, overrides));
+      assert.deepEqual(result, runWorkloadAcceptance(base.params, base.strategy, overrides));
       assert.ok(result.totalReqs > 8);
+      assert.equal(result.totalReqs, 16, 'eight parents always produce one follow-up, independent of retained cache handles');
+      assert.equal(result.completed, 16);
+      assert.equal(result.workloadCounts.followUps, 8);
       assertNoInternalFields(result);
     } finally { legacy.close(); }
   });
@@ -342,10 +349,26 @@ for (const [extra, hash] of [
   [{ simMaxTime: 0 }, 'a065f6963d4c17ccee272d0b4a1d2ca37d4699b68ebd43cc542d1816b7326b3f'],
   [{ qps: 1e-12 }, '878a1317e1983618a0835f1145e3a2b53c37442c419a3c656131d71f2717fc44'],
 ]) {
-  test(`U1: complete Replay result baseline ${JSON.stringify(extra)}`, () => {
+  test(`U5: complete Replay result migrates from U1 to the accepted model ${JSON.stringify(extra)}`, () => {
     const overrides = freeze({ seed: 42, qps: 6, blockSize: 64, simMaxTime: 5, ...extra, replay: { bundle, options } });
     const result = runSimulation(freeze(base.params), freeze(base.strategy), overrides);
-    assert.equal(createHash('sha256').update(JSON.stringify(result)).digest('hex'), hash);
+    const accepted = runWorkloadAcceptance(base.params, base.strategy, overrides);
+    assert.deepEqual(result, accepted);
+    const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    assert.equal(fingerprint(result), fingerprint(accepted));
+    assert.notEqual(fingerprint(result), hash, 'U1 fingerprints predate physical-page timing, finite capacity, and versioned U5 provenance');
+    assert.equal(result.configuration.workloadModelVersion, WORKLOAD_MODEL_VERSION);
+    const counts = result.replay.counts;
+    assert.equal(counts.arrived, counts.successful + counts.failed + counts.arrivedUnfinished);
+    if (overrides.simMaxTime > 0) {
+      const source = createReplayRuntime(overrides.replay, { seed: overrides.seed, qps: overrides.qps });
+      source.drainEvents(options.durationSeconds, () => {});
+      const launches = source.counts().launchedSessions;
+      assert.equal(counts.successful, launches * 3);
+      assert.deepEqual(result.hitTok, { l1: launches * 192, l2: 0, l3: 0, miss: launches * 256, total: launches * 448 });
+      assert.equal(result.replay.cache.inputPages, launches * 4);
+      assert.equal(result.replay.cache.outputPages, 0);
+    }
     assertNoInternalFields(result);
   });
 }

@@ -7,6 +7,7 @@ import { state } from "./state.js";
 import { switchMode, syncPrefetchSelect } from "./strategy.js";
 import { setFormula, initChart } from "./charts.js";
 import { refreshActiveTab } from "./init.js";
+import { getReplayWorkloadConfig as collectWorkloadConfig, applyReplayWorkloadConfig as restoreWorkloadConfig } from "./replay.js";
 
 
 
@@ -303,6 +304,7 @@ export function collectParamsJson() {
     data[el.id] = el.type === 'checkbox' ? el.checked : el.value;
   });
   data._strategyMode = (typeof state.strategyMode !== 'undefined') ? state.strategyMode : 'dsl';
+  data.workload = collectWorkloadConfig();
   return JSON.stringify(data);
 }
 
@@ -428,7 +430,9 @@ export function buildParamMeta() {
 export function exportParams() {
   let box = $('paramsIo'), note = $('paramsIoNote');
   if (!box) return;
-  let json = collectParamsJson();
+  let json;
+  try { json = collectParamsJson(); }
+  catch (error) { if (note) note.textContent = '参数导出失败: ' + error.message; return; }
   box.value = json;
   try { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(json); } catch(e) {}
   if (note) note.textContent = '✓ ' + Object.keys(JSON.parse(json)).length + ' 个参数已生成并复制';
@@ -440,8 +444,12 @@ export function importParamsFromBox() {
   let box = $('paramsIo'), note = $('paramsIoNote');
   if (!box) return;
   let data;
-  try { data = JSON.parse(box.value.trim()); }
-  catch(e) { if (note) note.textContent = '✗ JSON 解析失败: ' + e.message; return; }
+  try {
+    data = JSON.parse(box.value.trim());
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('参数配置必须为 JSON 对象。');
+    if (state.simRunning || state.sensitivityRunning || state.crossRunning) throw new Error('任务运行中不能导入参数。');
+    restoreWorkloadConfig(data.workload === undefined ? { source: 'synthetic' } : data.workload);
+  } catch(e) { if (note) note.textContent = '参数导入失败: ' + e.message; return; }
   // 先恢复策略模式(dsl/js)——switchMode 可能改写 textarea(js 空文本加载预设), 之后再写回覆盖
   if (data._strategyMode && typeof switchMode === 'function') {
     try { switchMode(data._strategyMode === 'js' ? 'js' : 'dsl'); } catch(e) {}
@@ -470,7 +478,8 @@ export function importParamsFromBox() {
   if (typeof toggleSparseFields === 'function') { try { toggleSparseFields(); } catch(e) {} }
   if (typeof toggleSingleBatchHints === 'function') { try { toggleSingleBatchHints(); } catch(e) {} }
   recalcAll();
-  if (note) note.textContent = '✓ 已应用 ' + applied + ' 个参数并重算' + (wroteDsl ? '（含调度策略 DSL）' : '');
+  if (note) note.textContent = '已应用 ' + applied + ' 个参数并重算' + (wroteDsl ? '（含调度策略 DSL）' : '')
+    + (state.workloadSource === 'replay' ? '；请重新选择并核验 Replay bundle。此配置仅含摘要，不是独立可复现包。' : '');
 }
 
 

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import builder from '../../scripts/build_replay_bundle.js';
 
@@ -60,6 +61,43 @@ test('S09: parseJob preserves replay for normalized and controls formats and rej
   assert.equal(JSON.stringify(controls), before);
   assert.throws(() => library.parseJob({ ...controls, overrides: { replay: { ...replay, options: { ...replay.options, arrivalModel: 'open' } } } }), /closed/);
   assert.throws(() => library.parseJob({ ...controls, mode: 'other' }), /mode/);
+});
+
+test('U5: exported Replay configuration requires a matching bundle and restores workload options immutably', t => {
+  const { bundle } = JSON.parse(readFileSync(join(root, 'tests/fixtures/replay/runtime-prefix.json')));
+  const workload = { source: 'replay', bundleSummary: { digest: createHash('sha256').update(JSON.stringify(bundle)).digest('hex') },
+    options: { qps: 7, seed: 9, durationSeconds: 1, warmupSeconds: 0.2, simMaxTime: 2, arrivalModel: 'closed', superblocks: false } };
+  const controls = { pBlockSize: '32', workload };
+  assert.throws(() => library.parseJob(controls), /reselect.*bundle/);
+  const input = { ...controls, overrides: { replay: { bundle } } };
+  const before = structuredClone(input);
+  const job = library.parseJob(input);
+  assert.deepEqual(input, before);
+  assert.equal(job.params.blockSize, 32);
+  assert.equal(job.overrides.qps, 7);
+  assert.equal(job.overrides.seed, 9);
+  assert.equal(job.overrides.simMaxTime, 2);
+  assert.equal(job.overrides.replay.options.durationSeconds, 1);
+  assert.equal(job.overrides.replay.options.warmupSeconds, 0.2);
+  assert.equal(library.parseJob({ ...input, overrides: { ...input.overrides, qps: 8 } }).overrides.qps, 8);
+  const changed = structuredClone(bundle); changed.sessions[0].req[0].out++;
+  assert.throws(() => library.parseJob({ ...input, overrides: { replay: { bundle: changed } } }), /digest does not match/);
+  assert.throws(() => library.parseJob({ ...input, workload: { ...workload, options: { ...workload.options, seed: -1 } } }), /workload/);
+  assert.throws(() => library.parseJob({ ...input, workload: { ...workload, bundleSummary: { digest: 'bad' } } }), /digest/);
+  assert.throws(() => library.parseJob({ ...input, workload: { source: 'unknown' } }), /workload.source/);
+  assert.equal(library.parseJob({ pBlockSize: '32' }).overrides.replay, undefined);
+  assert.equal(library.parseJob({ pBlockSize: '32', workload: { source: 'synthetic' } }).overrides.replay, undefined);
+  const dir = workspace(t), configPath = join(dir, 'config.json'), bundlePath = join(dir, 'bundle.json');
+  writeFileSync(configPath, JSON.stringify(controls)); writeFileSync(bundlePath, JSON.stringify(bundle));
+  const result = cli(['--bundle', bundlePath, '--config', configPath]);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.deepEqual(actual, JSON.parse(JSON.stringify(library.executeJob(job))));
+  assert.equal(actual.replay.configuration.durationSeconds, 1);
+  assert.equal(actual.replay.configuration.warmupSeconds, 0.2);
+  writeFileSync(bundlePath, JSON.stringify(changed));
+  const mismatch = cli(['--bundle', bundlePath, '--config', configPath]);
+  assert.notEqual(mismatch.status, 0); assert.match(mismatch.stderr, /digest does not match/);
 });
 
 test('U4.1: normalized and controls jobs validate the effective physical page mapping', () => {
@@ -122,7 +160,9 @@ test('S09: explicit CLI overrides and JS permission guard apply before execution
   assert.equal(actual.replay.configuration.durationSeconds, 0.3); assert.equal(actual.replay.configuration.hardCutoff, 1);
   writeFileSync(configPath, JSON.stringify({ ...normalized(), mode: 'js' }));
   const js = cli(['--bundle', bundlePath, '--config', configPath]);
-  assert.notEqual(js.status, 0); assert.match(js.stderr, /allow-js/);
+  assert.notEqual(js.status, 0); assert.match(js.stderr, /DSL only/);
+  const allowedJs = cli(['--bundle', bundlePath, '--config', configPath, '--allow-js']);
+  assert.notEqual(allowedJs.status, 0); assert.match(allowedJs.stderr, /DSL only/);
 });
 
 test('S09: shipped real sample executes with the documented B300/Hy4 FP8 preset', async t => {

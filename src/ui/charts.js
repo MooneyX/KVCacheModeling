@@ -22,10 +22,10 @@ const ganttPages = new WeakMap();
 const GANTT_PAGE_SIZE = 100;
 const numberText = (value, digits = 3, unit = '') => Number.isFinite(value) ? value.toFixed(digits) + unit : '无样本';
 const chartNumber = (value, digits = 1) => Number.isFinite(value) ? +value.toFixed(digits) : null;
-const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 function resultCaption(r, input) {
-  const strategy = escapeHtml(input?.strategies?.[0]?.name || r.name || '当前策略');
+  const strategy = escapeHtml(r.name || input?.strategies?.[0]?.name || '当前策略');
   const range = '全程 [0, ' + numberText(r.simEnd) + '] s · ' + (r.truncated ? '截断' : '未截断');
   if (!r.replay) return '来源：合成负载 · 策略 ' + strategy + ' · ' + range;
   const c = r.replay.configuration;
@@ -285,7 +285,7 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
   const ch = initChart('chartGantt');
   const status = t => t.state === 'done' ? '成功' : t.state === 'failed' ? '失败' : '截止未完成 (' + t.state + ')';
   const categories = timeline.map(t => 'Req #' + t.id + (replay || t.state !== 'done' ? ' · ' + status(t) : ''));
-  const queueData = [], waitComputeData = [], prefillData = [], decodeData = [], failedData = [];
+  const queueData = [], waitComputeData = [], prefillData = [], waitDecodeData = [], decodeData = [], failedData = [];
   timeline.forEach((t, row) => {
     const end = t.state === 'done' ? t.completeTime : t.state === 'failed' ? t.failedAt : simEnd;
     const segment = (data, start, stop) => {
@@ -298,7 +298,10 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
     segment(queueData, t.arrive, t.admitTime);
     segment(waitComputeData, t.admitTime, t.prefillStart);
     segment(prefillData, t.prefillStart, t.prefillEnd);
-    segment(decodeData, t.prefillEnd, t.completeTime);
+    if (Object.hasOwn(t, 'decodeStart')) {
+      segment(waitDecodeData, t.prefillEnd, t.decodeStart);
+      segment(decodeData, t.decodeStart, t.completeTime);
+    } else segment(decodeData, t.prefillEnd, t.completeTime);
     if (t.state === 'failed') failedData.push([row, end, end]);
   });
   const maxT = replay ? simEnd : Math.max(simEnd, ...timeline.map(t => t.completeTime || 0), 0.01);
@@ -320,7 +323,7 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
       return 'Req #' + escapeHtml(t.id) + ' · ' + escapeHtml(status(t)) + detail + '<br/>' + escapeHtml(p.seriesName) +
         '<br/>开始: ' + numberText(d[1], 3, 's') + '<br/>结束: ' + numberText(d[2], 3, 's') + '<br/>持续: ' + numberText(d[2] - d[1], 3, 's');
     }},
-    legend: { data: ['Queue(等槽位/显存)', 'Wait(等算力)', 'Prefill', 'Decode', ...(failedData.length ? ['失败'] : [])], top: 0, textStyle: { color: '#9ca0b0' } },
+    legend: { data: ['Queue(等槽位/显存)', 'Wait(等算力)', 'Prefill', ...(waitDecodeData.length ? ['KV传输/等Decode'] : []), 'Decode', ...(failedData.length ? ['失败'] : [])], top: 0, textStyle: { color: '#9ca0b0' } },
     grid: { left: replay ? 220 : 80, right: 46, top: 40, bottom: 20 },
     // 只用 slider 缩放：移除 inside dataZoom——它即使 zoomOnMouseWheel:'shift' 仍会拦截滚轮事件，导致页面无法滚动
     dataZoom: [
@@ -336,6 +339,7 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
       makeGanttSeries('Queue(等槽位/显存)', 'rgba(228,228,235,0.55)', queueData),
       makeGanttSeries('Wait(等算力)', '#fbbf24', waitComputeData),
       makeGanttSeries('Prefill', '#fb923c', prefillData),
+      ...(waitDecodeData.length ? [makeGanttSeries('KV传输/等Decode', '#60a5fa', waitDecodeData)] : []),
       makeGanttSeries('Decode', '#6c63ff', decodeData),
       ...(failedData.length ? [{ name: '失败', type: 'scatter', symbol: 'diamond', symbolSize: 10, encode: { x: 1, y: 0 }, data: failedData, itemStyle: { color: '#f87171' } }] : []),
     ]
@@ -601,8 +605,21 @@ function replayMetricItems(sr) {
     ['Decode 计算/pass(全程)', numberText(sr.passMs ? sr.passMs.hbm + sr.passMs.cmp + sr.passMs.comm : null, 3, ' ms/pass'), 'accent'],
     ['瓶颈归因(全程)', sr.ptSamples ? bottleneckLabel(sr) : '无样本', 'accent'],
   );
-  for (const name of ['L2读带宽', 'L3读带宽', 'L2驻留', 'L3驻留', '分层缓存能力', '物理 P/D 分离', '多实例分析']) {
-    items.push([name, '不适用', 'accent']);
+  const capabilities = sr.replay.configuration.capabilities;
+  if (capabilities?.tieredCache) {
+    items.push(
+      ['L2 平均读带宽(全程)', numberText(sr.l2ReadBW / 1e9, 3, ' GB/s'), 'accent'],
+      ['L3 平均读带宽(全程)', numberText(sr.l3ReadBW / 1e9, 3, ' GB/s'), 'accent'],
+      ['L2 峰值驻留(全程)', numberText(sr.l2PeakGB, 3, ' GB'), 'accent'],
+      ['L3 峰值驻留(全程)', numberText(sr.l3PeakGB, 3, ' GB'), 'accent'],
+      ['分层缓存能力', '实际有限容量 / 四档预取', 'accent'],
+      ['撤回次数(全程)', numberText(sr.replay.state.retractCount, 0), 'orange'],
+      ['重算 token(全程)', numberText(sr.replay.state.recomputedTokens, 0), 'orange'],
+      ['物理 P/D 分离', sr.pd ? numberText(sr.pd.xferGB, 3, ' GB P→D') : '本次未启用', 'accent'],
+      ['多实例分析', sr.multi ? numberText(sr.multi.count, 0, ' 个实例') : '本次单实例', 'accent'],
+    );
+  } else {
+    for (const name of ['L2/L3 驻留与读带宽', '分层缓存能力', '物理 P/D 分离', '多实例分析']) items.push([name, '不适用（旧引擎快照）', 'accent']);
   }
   return items;
 }
@@ -620,14 +637,14 @@ export function drawStrategyMetrics() {
     rows.push('<div style="grid-column:1/-1;font-size:.78rem;color:var(--accent);margin-bottom:2px;border-bottom:1px solid var(--border);padding-bottom:4px;margin-top:8px">'+heading+'</div>');
     let items = sr.replay ? replayMetricItems(sr) : [
       ['HBM命中率', (sr.hbmHitRate != null ? sr.hbmHitRate : 0).toFixed(1)+'%', 'green'],
-      ['TTFT(均值)', sr.avgTtft.toFixed(0)+' ms', 'accent'],
-      ['TTFT(P50)', sr.p50Ttft.toFixed(0)+' ms', 'accent'],
-      ['TTFT(P99)', sr.p99Ttft.toFixed(0)+' ms', 'orange'],
-      ['TPOT(均值)', sr.avgTpot.toFixed(1)+' ms/tok', 'accent'],
-      ['TPOT(P99)', sr.p99Tpot.toFixed(1)+' ms/tok', 'red'],
-      ['P50延迟', sr.p50.toFixed(0)+' ms', 'accent'],
-      ['P99延迟', sr.p99.toFixed(0)+' ms', 'red'],
-      ['平均排队', sr.avgQueue.toFixed(2)+' s', 'orange'],
+      ['TTFT(均值)', numberText(sr.avgTtft, 0, ' ms'), 'accent'],
+      ['TTFT(P50)', numberText(sr.p50Ttft, 0, ' ms'), 'accent'],
+      ['TTFT(P99)', numberText(sr.p99Ttft, 0, ' ms'), 'orange'],
+      ['TPOT(均值)', numberText(sr.avgTpot, 1, ' ms/tok'), 'accent'],
+      ['TPOT(P99)', numberText(sr.p99Tpot, 1, ' ms/tok'), 'red'],
+      ['P50延迟', numberText(sr.p50, 0, ' ms'), 'accent'],
+      ['P99延迟', numberText(sr.p99, 0, ' ms'), 'red'],
+      ['平均排队', numberText(sr.avgQueue, 2, ' s'), 'orange'],
       // 传输 vs 计算「重叠之前」的独立用时（2026-08-18）：看清带宽/算力各作用于哪个阶段
       // Prefill 传输(独立) = 仿真过程中的实际传输耗时(含 L3 带宽排队, 不含计算)——
       // 用真实时间戳差(_ft1-_ft0)独立测量, 不会被计算覆盖; race/be 下 fetch 计入 TTFT 为 0
@@ -733,7 +750,7 @@ export function drawStrategyMetrics() {
       ['未命中(需重算)', sr.hitRate ? sr.hitRate.miss.toFixed(1)+'%' : '—', sr.hitRate && sr.hitRate.miss > 50 ? 'orange' : 'green'],
       ['前缀节省显存', sr.prefixSavedMB.toFixed(0)+' MB', 'green'],
       ['会话复用', sr.sessionHits+' 次', 'green'],
-      ['公平性(CV)', sr.fairnessCV.toFixed(0)+'%', 'accent'],
+      ['公平性(CV)', numberText(sr.fairnessCV, 0, '%'), 'accent'],
       ['完成请求', sr.completed+'/'+sr.totalReqs+' ('+(sr.totalReqs>0?(sr.completed/sr.totalReqs*100).toFixed(0):0)+'%)', sr.truncated?'red':(sr.completed<sr.totalReqs?'orange':'green')],
       ['仿真窗口', sr.simEnd.toFixed(0)+' s'+(sr.truncated?' · ⚠截断':' · 排空'), sr.truncated?'red':'green'],
     ];
@@ -772,7 +789,8 @@ export function drawStrategyTierDemand(){
   const replay = !!state.simResults[0]?.replay;
   let colors = {hbm:'#6c63ff', l2:'#fb923c', l3:'#f87171', cmp:'#34d399', comm:'#9ca0b0'};
   let names = {hbm:'HBM读', l2:'L2读', l3:'L3读', cmp:'算力下限', comm:'TP通信'};
-  let keys = replay ? ['hbm','cmp','comm'] : ['hbm','l2','l3','cmp','comm'];
+  const legacyReplay = replay && !state.simResults[0].replay.configuration.capabilities?.tieredCache;
+  let keys = legacyReplay ? ['hbm','cmp','comm'] : ['hbm','l2','l3','cmp','comm'];
   // 图1: TTFT 分解 + passTime 分解（各 100% 堆叠，每策略两条）
   // TTFT 条 = prefill 段时间账（到达排队/准入排队/L3拉取/计算）；passTime 条 = decode 每 token 前向账
   // ——区分「TTFT 时间花在哪」vs「延迟(每前向)时间花在哪」，L3 拉取与 L3 读的落点一目了然
@@ -782,10 +800,13 @@ export function drawStrategyTierDemand(){
   let ttftNames = ['TTFT·到达排队','TTFT·prefill排队','TTFT·L3拉取','TTFT·纯计算','TTFT·算力竞争等待'];
   let ttftKeys = ['queue','prefillQ','fetch','computeNet','computeWait'];
   let ttftColors = ['#B5D4F4','#85B7EB','#FAC775','#185FA5','#C8341F'];
-  if (replay) {
+  if (legacyReplay) {
     ttftNames.splice(2, 1);
     ttftKeys.splice(2, 1);
     ttftColors.splice(2, 1);
+  }
+  if (state.simResults.some(s => s.pd)) {
+    ttftNames.push('TTFT·P→D 传输'); ttftKeys.push('xfer'); ttftColors.push('#9b7ce4');
   }
   let ycats = [];
   state.simResults.forEach(s => {
@@ -803,7 +824,7 @@ export function drawStrategyTierDemand(){
       ...ttftKeys.map((k,i)=>({
         name:ttftNames[i],type:'bar',stack:'ttft',barMaxWidth:22,
         data:state.simResults.flatMap(s=>{ let b=s.ttftBreakdown; if(!b) return [null, null];
-          let t=b.queue+b.prefillQ+b.fetch+b.compute;
+          let t=b.queue+b.prefillQ+b.fetch+b.compute+(b.xfer || 0);
           let v = (b.computeNet == null)
             ? (k==='computeNet' ? b.compute : (k==='computeWait' ? 0 : b[k]))
             : b[k];
@@ -817,8 +838,8 @@ export function drawStrategyTierDemand(){
       }))
     ]
   });
-  if (replay) {
-    const message = '不适用：当前 Replay 未仿真 L2/L3 读带宽、驻留及分层缓存能力。';
+  if (legacyReplay) {
+    const message = '不适用：旧 Replay 引擎快照未仿真 L2/L3 读带宽、驻留及分层缓存能力。';
     showChartMessage('chartStrategyBwReq', message);
     showChartMessage('chartStrategyResident', message);
     setFormula('formulaStrategyTier', resultCaption(state.simResults[0], state.simInput) +
@@ -835,12 +856,12 @@ export function drawStrategyTierDemand(){
     xAxis:{type:'category',data:state.simResults.map(s=>s.name),axisLabel:{color:'#e4e4e7',fontSize:10,rotate:15}},
     yAxis:{type:'value',name:'带宽 (GB/s)',nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
     series:[
-      {name:'L2 P99',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>+(s.l2BWp99/1e9).toFixed(2)),itemStyle:{color:'#7F77DD'}},
-      {name:'L2 峰值',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>+(s.l2BWPeak/1e9).toFixed(2)),itemStyle:{color:'#534AB7'}},
-      {name:'L3 P99',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>+(s.l3BWp99/1e9).toFixed(2)),itemStyle:{color:'#F0997B'}},
-      {name:'L3 峰值',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>+(s.l3BWPeak/1e9).toFixed(2)),itemStyle:{color:'#D85A30'}},
-      {name:'L2 配置',type:'line',data:state.simResults.map(()=>effL2LinkBW(p)),symbol:'none',lineStyle:{color:'#f87171',type:'dashed',width:1.5},itemStyle:{color:'#f87171'}},
-      {name:'L3 配置',type:'line',data:state.simResults.map(()=>p.ssdBW),symbol:'none',lineStyle:{color:'#f87171',type:'dotted',width:1.5},itemStyle:{color:'#f87171'}}
+      {name:'L2 P99',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>s.ptSamples ? chartNumber(s.l2BWp99/1e9, 2) : null),itemStyle:{color:'#7F77DD'}},
+      {name:'L2 峰值',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>s.ptSamples ? chartNumber(s.l2BWPeak/1e9, 2) : null),itemStyle:{color:'#534AB7'}},
+      {name:'L3 P99',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>s.ptSamples ? chartNumber(s.l3BWp99/1e9, 2) : null),itemStyle:{color:'#F0997B'}},
+      {name:'L3 峰值',type:'bar',barMaxWidth:16,data:state.simResults.map(s=>s.ptSamples ? chartNumber(s.l3BWPeak/1e9, 2) : null),itemStyle:{color:'#D85A30'}},
+      {name:'L2 配置',type:'line',data:state.simResults.map(s=>effL2LinkBW(s.configuration?.execution ?? s.replay?.configuration?.execution ?? p)),symbol:'none',lineStyle:{color:'#f87171',type:'dashed',width:1.5},itemStyle:{color:'#f87171'}},
+      {name:'L3 配置',type:'line',data:state.simResults.map(s=>(s.configuration?.execution ?? s.replay?.configuration?.execution ?? p).ssdBW),symbol:'none',lineStyle:{color:'#f87171',type:'dotted',width:1.5},itemStyle:{color:'#f87171'}}
     ]
   });
   // 图3: 首个策略的 L2/L3 驻留时间序列（预取/淘汰波次的瞬态画像）
@@ -857,6 +878,15 @@ export function drawStrategyTierDemand(){
       {name:'L3 (SSD) 占用',type:'line',showSymbol:false,data:sr0.l3Series,lineStyle:{color:'#6c63ff',width:1.5},areaStyle:{color:'rgba(108,99,255,.15)'}}
     ]
   });
+  if (replay || sr0.configuration?.capabilities?.finiteCapacity) {
+    const coverage = sr0.seriesCoverage?.resident;
+    setFormula('formulaStrategyTier', resultCaption(sr0, state.simInput) +
+      '<br>TTFT 分解为全程成功请求均值，不是 measurement；包含到达排队、Prefill 排队、拉取、纯计算、竞争等待及 P→D 传输。<br>' +
+      'L2/L3 驻留采用全程时间加权分桶，覆盖 [' + numberText(coverage?.start) + ', ' + numberText(coverage?.end) +
+      '] s；末点为终态。各策略配置来自其结果快照。<br>' +
+      '带宽 P99/峰值沿用 decode 阶段样本，可能仅覆盖早期，不能视为全程所需带宽；不包含所有纯 Prefill 传输区间。无样本留空。');
+    return;
+  }
   setFormula('formulaStrategyTier',
     '<b>📐 L2/L3 需求推导（实测轨迹 → 所需资源，任意代码策略适用）</b><br>'+
     '• <b>带宽需求</b>: 每步瞬时链路速率 = decode读(<code>ΣKV<sub>T</sub>/passTime</code>) + 本步换入换出字节/DT；取 <code>P99 分位 = 推荐所需带宽</code>（峰值评估最坏突发）——平均口径会低估，预取/淘汰突发才是需求决定因素<br>'+

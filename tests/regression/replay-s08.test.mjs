@@ -82,15 +82,45 @@ test('U3 metrics: tier residency and reservations are time weighted only in fini
   assert.equal(report.configuration.workloadModelVersion, version);
   assert.equal(report.state.supportedScope, 'single-instance/64-token/finite-capacity-tiered-four-configurations');
   assert.ok(report.samples.series.length <= 20000);
+  const terminal = report.samples.series.at(-1);
+  const lastInterval = report.samples.series.findLast(sample => sample.end > sample.start);
+  assert.equal(terminal.end, 4);
+  assert.ok(terminal.start >= 2 && terminal.start <= terminal.end);
+  const terminalAverage = terminal.end > terminal.start ? 0 : null;
+  assert.equal(terminal.arrivalQps, terminalAverage); assert.equal(terminal.completionQps, terminalAverage);
+  assert.equal(lastInterval.end, 4);
+  assert.ok(lastInterval.start >= 2);
   for (const [key, bytes] of Object.entries(occupied)) {
     assert.ok(Math.abs(report.samples.timeWeightedMean[key] - bytes / 2) < 1e-9);
     assert.equal(report.samples.peak[key], bytes);
     assert.equal(report.samples.series[0].mean[key], bytes);
     assert.equal(report.samples.series[0].peak[key], bytes);
     assert.equal(report.samples.series[0].last[key], bytes);
-    assert.equal(report.samples.series.at(-1).mean[key], 0);
-    assert.equal(report.samples.series.at(-1).last[key], 0);
+    assert.equal(lastInterval.mean[key], 0);
+    assert.equal(lastInterval.last[key], 0);
+    assert.equal(terminal.mean[key], terminalAverage);
+    assert.equal(terminal.last[key], 0);
   }
+});
+
+test('U5 metrics: explicit terminal observations preserve zero-duration nulls without changing integrated zero residency', () => {
+  const m = make({ finiteCapacity: true });
+  m.observe(0, { hbmBytes: 64 }); m.observe(2, { hbmBytes: 0 });
+  const before = m.finish(4, {});
+  const lastInterval = before.samples.series.at(-1);
+  assert.equal(lastInterval.end, 4); assert.ok(lastInterval.start < 4);
+  assert.equal(lastInterval.mean.hbmBytes, 0); assert.equal(lastInterval.last.hbmBytes, 0);
+  m.observe(4, { hbmBytes: 0 });
+  const after = m.finish(4, {}), terminal = after.samples.series.at(-1);
+  assert.equal(terminal.start, 4); assert.equal(terminal.end, 4);
+  assert.equal(terminal.arrivalQps, null); assert.equal(terminal.completionQps, null);
+  assert.equal(terminal.mean.hbmBytes, null); assert.equal(terminal.last.hbmBytes, 0);
+  assert.deepEqual(after.samples.series.slice(0, -1), before.samples.series);
+  assert.deepEqual(after.samples.timeWeightedMean, before.samples.timeWeightedMean);
+  assert.ok(Math.abs(after.samples.timeWeightedMean.hbmBytes - 32) < 1e-9);
+  assert.deepEqual(after.samples.peak, before.samples.peak);
+  assert.equal(after.samples.peak.hbmBytes, 64);
+  assert.deepEqual(after.samples.coverage, [0, 4]);
 });
 
 test('U3 metrics: retries count events without repeating admission denominators or successful output', () => {
@@ -255,9 +285,11 @@ test('S08: real engine reports coherent bounded windows and content-derived conf
 test('S08: hard cutoff cannot grant future decode work at the prefill completion instant', () => {
   const data = structuredClone(bundle); data.sessions[0].req = [{ ...data.sessions[0].req[0], out: 1 }];
   const run = drain => runSimulation(base.params, base.strategy, { seed: 42, qps: 2, blockSize: 64, simMaxTime: drain,
+    prefillA: 1000, prefillB: 0, prefillBIdx: 0,
     replay: { bundle: data, options: { durationSeconds: 0.13, warmupSeconds: 0 } } });
   const completed = run(5);
   const prefillEnd = completed.timeline[0].prefillEnd;
+  assert.ok(Math.abs(prefillEnd - completed.timeline[0].arrive - 0.128) < 1e-10);
   const cut = run(prefillEnd - 0.13);
   assert.equal(cut.simEnd, prefillEnd);
   assert.equal(cut.completed, 0);

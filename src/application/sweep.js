@@ -1,12 +1,32 @@
 import { hwPresets } from "../core/presets.js";
 
+export const REPLAY_SWEEP_PARAMETERS = Object.freeze(['qps', 'max_batch_size', 'gpu_preset', 'ssd_bw', 'evict_threshold', 'prefetch']);
+
+export function assertReplaySweepParameter(key) {
+  if (key && !REPLAY_SWEEP_PARAMETERS.includes(key)) throw new Error(`Replay 不支持合成生成维度：${key}。`);
+}
+
+export function buildSweepJob(baseJob, dimensions = []) {
+  const job = structuredClone(baseJob);
+  job.overrides ||= {};
+  for (const [key, value] of dimensions) applyParamVal(job.strategy, job.overrides, key, value);
+  return job;
+}
+
 export function applyParamVal(s, ov, key, val) {
+  if (ov.replay) assertReplaySweepParameter(key);
   if (val == null) return;
   switch (key) {
     // ---- 策略对象: 阈值类均为百分比输入, 引擎内是 0~1 小数 ----
     // (hbm_threshold 已删 2026-09-03: 准入收敛为 always, "HBM 水位决定新 KV 落层"无 sglang 对应)
     case 'evict_threshold':    s.eviction.hbm_evict_threshold = val / 100; break;
     case 'max_batch_size':     s.batching.max_batch_size = val; break;
+    case 'prefetch': {
+      const type = val === 'wait_complete' ? 'none' : val;
+      if (!['none', 'best_effort', 'timeout', 'race'].includes(type)) throw new Error(`未知预取策略：${val}。`);
+      s.prefetch.type = type;
+      break;
+    }
     // ---- overrides: 负载与硬件 ----
     case 'prefix_hit':  ov.prefixHit = val / 100; break;
     case 'prefix_warm_l2': ov.prefixWarmL2 = val / 100; break;

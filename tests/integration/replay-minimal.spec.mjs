@@ -23,6 +23,23 @@ const submitted = page => page.waitForResponse(response => response.url().endsWi
 const summaryValue = (page, label) => page.locator('#replaySummary dt').filter({ hasText: new RegExp(`^${label}$`) }).locator('xpath=following-sibling::dd[1]');
 
 async function importControls(page, values) {
+  if (await page.locator('#workloadSource').inputValue() === 'replay' && !('workload' in values)) {
+    await page.evaluate(values => {
+      if (values._strategyMode) window.switchMode(values._strategyMode);
+      for (const [id, value] of Object.entries(values)) {
+        const control = document.getElementById(id);
+        if (!control || id === 'workloadSource' || control.closest('#replayPanel')) continue;
+        if (control.type === 'checkbox') control.checked = !!value;
+        else control.value = String(value);
+        control.dispatchEvent(new Event('input', { bubbles: true }));
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (values.sDsl) window.syncPrefetchSelect();
+      window.toggleSingleBatchHints();
+      window.recalcAll();
+    }, values);
+    return;
+  }
   await page.locator('#paramsIo').fill(JSON.stringify(values));
   await page.locator('button[onclick="importParamsFromBox()"]').click();
 }
@@ -93,7 +110,7 @@ async function recovered(page, previous = null) {
   await expect(page.locator(runButton)).toBeEnabled();
   await expect(page.locator('#workloadSource')).toBeEnabled();
   await expect(page.locator('#replayFile')).toBeEnabled();
-  await expect(page.locator(allButton)).toBeDisabled();
+  await expect(page.locator(allButton)).toBeEnabled();
   for (const id of ids) await expect(page.locator('#' + id)).toBeEnabled();
   if (previous) {
     await expect(page.locator('#replaySummary')).toBeVisible();
@@ -141,6 +158,349 @@ async function runSynthetic(page) {
   return stored.points[0].result;
 }
 
+async function u5Scan(page) {
+  const pending = submitted(page);
+  await page.locator('#btnRunSens').click();
+  const response = await pending;
+  expect(response.status(), await response.text()).toBe(202);
+  const task = await response.json();
+  await expect(page.locator('#sensitivityStatus')).toContainText('扫描完成', { timeout: 30_000 });
+  await expect(page.locator('#btnRunSens')).toBeEnabled();
+  const stored = await (await page.request.get(`/api/tasks/${task.id}/download`)).json();
+  expect(stored.task.status).toBe('completed');
+  return stored.points.map(point => point.result);
+}
+
+async function u5SavePair(page) {
+  await page.locator('#sName').fill('U5-none');
+  await page.locator('button[onclick="saveStrategy()"]').click();
+  await page.locator('#sName').fill('U5-best-effort');
+  await page.locator('#sDsl').fill(baseline.strategy.dsl.replace(/PREFETCH:[^\n]*/, 'PREFETCH: best_effort'));
+  await page.locator('button[onclick="saveStrategy()"]').click();
+}
+
+test('U5: Replay multi-strategy freezes one workload and commits only complete snapshots', async ({ page }, info) => {
+  const { errors, posts } = await start(page);
+  await upload(page, oneRequest(2), 'frozen.json');
+  await settings(page, { replaySeed: '0', replayQps: '2' });
+  await u5SavePair(page);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  await page.route('**/api/tasks', async route => {
+    if (route.request().method() === 'POST') await gate;
+    await route.continue();
+  });
+  const pending = submitted(page);
+  await page.locator(allButton).click();
+  await expect(page.locator('#simulationStatus')).toContainText('正在运行');
+  for (const id of ['workloadSource', 'replayFile', ...ids]) await expect(page.locator('#' + id)).toBeDisabled();
+  await page.evaluate(() => {
+    document.getElementById('replayQps').value = '99';
+    document.getElementById('replaySeed').value = '99';
+    document.getElementById('sName').value = 'must-not-relabel';
+    window.runAllStrategies();
+  });
+  release();
+  const response = await pending;
+  expect(response.status()).toBe(202);
+  const task = await response.json();
+  await expect(page.locator('#simulationStatus')).toHaveText('运行完成');
+  const stored = await (await page.request.get(`/api/tasks/${task.id}/download`)).json();
+  const results = stored.points.map(point => point.result);
+  expect(posts).toHaveLength(1);
+  expect(posts[0].kind).toBe('batch');
+  expect(posts[0].jobs).toHaveLength(2);
+  expect(results.map(result => result.name)).toEqual(['U5-none', 'U5-best-effort']);
+  for (const job of posts[0].jobs) expect(job.overrides).toMatchObject({ qps: 2, seed: 0, replay: { bundle: oneRequest(2) } });
+  for (const result of results) {
+    expect(result.replay.configuration).toMatchObject({ targetQps: 2, seed: 0, durationSeconds: 0.2, warmupSeconds: 0 });
+    expect(result.completed).toBe(1);
+  }
+  expect(await downloadResult(page)).toEqual(results);
+  await expect(page.locator('#simulationSnapshot')).toContainText('QPS=2');
+  await expect(page.locator('#simulationSnapshot')).not.toContainText('QPS=99');
+  if (info.project.name === 'development') {
+    const snapshot = await page.evaluate(async () => {
+      const { state } = await import('/src/ui/state.js');
+      return { input: state.simInput, results: state.simResults, cache: state.simCache };
+    });
+    expect(snapshot.input.replayConfigurations).toEqual(results.map(result => result.replay.configuration));
+    expect(snapshot.results).toEqual(results);
+    expect(snapshot.cache).toEqual({});
+    expect(JSON.stringify(snapshot.input)).not.toContain('blockRuns');
+  }
+  expect(errors).toEqual([]);
+});
+
+for (const status of ['failed', 'cancelled']) {
+  test(`U5: a ${status} Replay strategy batch preserves prior results and input despite a delivered partial point`, async ({ page }, info) => {
+    const { errors, posts } = await start(page);
+    await upload(page, oneRequest(2));
+    const { result: previous } = await run(page);
+    await refreshTabs(page);
+    const visible = await capture(page);
+    if (info.project.name === 'development') await page.evaluate(async () => {
+      const { state } = await import('/src/ui/state.js');
+      window.u5OldInput = state.simInput;
+      window.u5OldResults = state.simResults;
+    });
+    await u5SavePair(page);
+    const task = { id: `u5-batch-${status}`, status, total: 2, completed: 1, error: `U5 batch ${status}` };
+    await page.route(`**/api/tasks/${task.id}/points?*`, route => route.fulfill({ json: {
+      task, next: 1, points: [{ index: 0, result: { ...previous, name: 'partial-must-not-publish' } }],
+    } }));
+    await page.route('**/api/tasks', route => route.request().method() === 'POST'
+      ? route.fulfill({ status: 202, json: { ...task, status: 'running', completed: 0 } }) : route.continue());
+    await page.locator(allButton).click();
+    await expect(page.locator('#simulationStatus')).toContainText(task.error);
+    await expect(page.locator(allButton)).toBeEnabled();
+    await refreshTabs(page);
+    expect(await capture(page)).toEqual(visible);
+    expect(await downloadResult(page)).toEqual(previous);
+    expect(posts).toHaveLength(2);
+    expect(posts[1].kind).toBe('batch');
+    expect(posts[1].jobs).toHaveLength(2);
+    if (info.project.name === 'development') expect(await page.evaluate(async () => {
+      const { state } = await import('/src/ui/state.js');
+      return state.simInput === window.u5OldInput && state.simResults === window.u5OldResults;
+    })).toBe(true);
+    expect(errors).toEqual([]);
+  });
+}
+
+test('U5: Replay scan overrides QPS and batch size across all four prefetch policies without reusing results', async ({ page }) => {
+  const { errors, posts } = await start(page);
+  await upload(page, oneRequest(2));
+  await settings(page, { replayDuration: '0.6', replaySeed: '0' });
+  await page.locator('#sSweepParam').selectOption('qps');
+  await page.locator('#sSweepRange').fill('2,8');
+  await page.locator('#sSweepCompareParam').selectOption('max_batch_size');
+  await page.locator('#sSweepCompare').fill('1,4');
+  await page.locator('#sShapeDim').selectOption('prefetch');
+  await page.locator('#sSweepMetric').selectOption('measurement_latency_p99');
+  for (const id of ['sPfWait', 'sPfBest', 'sPfTimeout', 'sPfRace']) await page.locator('#' + id).check();
+  const records = await u5Scan(page);
+  expect(posts).toHaveLength(1);
+  expect(posts[0].kind).toBe('scan');
+  expect(posts[0].jobs).toHaveLength(16);
+  const combinations = [];
+  posts[0].jobs.forEach((job, index) => {
+    const rec = records[index];
+    combinations.push([job.overrides.qps, job.strategy.batching.max_batch_size, job.strategy.prefetch.type]);
+    expect(job.overrides.replay.bundle).toEqual(oneRequest(2));
+    expect(job.overrides.seed).toBe(0);
+    expect(job.overrides.replay.options).toMatchObject({ durationSeconds: 0.6, warmupSeconds: 0 });
+    for (const key of ['nreq', 'inputLen', 'prefixHit', 'singleBatch']) expect(job.overrides).not.toHaveProperty(key);
+    expect(rec.workload.configuration).toMatchObject({ targetQps: job.overrides.qps, seed: 0,
+      execution: { qps: job.overrides.qps, seed: 0 },
+      strategy: { batching: { max_batch_size: job.strategy.batching.max_batch_size }, prefetch: { type: job.strategy.prefetch.type } },
+    });
+    expect(rec.measurement_latency_p99).toBe(rec.workload.windows.measurement.latency.endToEnd.p99);
+    expect(rec.measurement_arrival_qps).toBe(rec.workload.windows.measurement.arrivalQps);
+    expect(rec.measurement_completion_qps).toBe(rec.workload.windows.measurement.completionQps);
+    expect(rec.workload.counts.failed).toBe(0);
+  });
+  expect(new Set(combinations.map(JSON.stringify)).size).toBe(16);
+  expect(new Set(combinations.map(item => item[2]))).toEqual(new Set(['none', 'best_effort', 'timeout', 'race']));
+  const low = records.filter((_record, index) => posts[0].jobs[index].overrides.qps === 2);
+  const high = records.filter((_record, index) => posts[0].jobs[index].overrides.qps === 8);
+  expect(Math.min(...high.map(rec => rec.workload.counts.arrived))).toBeGreaterThan(Math.max(...low.map(rec => rec.workload.counts.arrived)));
+  const chart = await page.evaluate(() => window.echarts.getInstanceByDom(document.getElementById('chartSensitivity')).getOption());
+  expect(chart.xAxis[0].name).toBe('目标 QPS');
+  expect(chart.series.flatMap(series => series.data)).toEqual(records.map(rec => rec.measurement_latency_p99 == null ? null : +rec.measurement_latency_p99.toFixed(3)));
+  expect(await u5Scan(page)).toEqual(records);
+  expect(posts).toHaveLength(2);
+  expect(posts[0].requestId).not.toBe(posts[1].requestId);
+  expect(errors).toEqual([]);
+});
+
+test('U5: Replay hardware, SSD bandwidth and eviction scans survive base overrides in execution snapshots', async ({ page }) => {
+  const { errors, posts } = await start(page);
+  await upload(page, oneRequest(2));
+  await page.locator('#sSweepParam').selectOption('ssd_bw');
+  await page.locator('#sSweepRange').fill('10,30');
+  await page.locator('#sSweepCompareParam').selectOption('evict_threshold');
+  await page.locator('#sSweepCompare').fill('60,90');
+  await page.locator('#sShapeDim').selectOption('gpu_preset');
+  await page.locator('#sShapeVals').fill('h20x8,b300x8');
+  const records = await u5Scan(page);
+  expect(posts).toHaveLength(1);
+  expect(posts[0].jobs).toHaveLength(8);
+  const combinations = new Set();
+  posts[0].jobs.forEach((job, index) => {
+    const configuration = records[index].workload.configuration;
+    combinations.add(JSON.stringify([job.overrides.ssdBW, job.overrides.hwPreset, job.strategy.eviction.hbm_evict_threshold]));
+    expect(configuration.execution.ssdBW).toBe(job.overrides.ssdBW);
+    expect(configuration.execution.hbmPerGpu).toBe(job.overrides.hwPreset === 'h20x8' ? 96 : 288);
+    expect(configuration.strategy.eviction.hbm_evict_threshold).toBe(job.strategy.eviction.hbm_evict_threshold);
+    expect(configuration.targetQps).toBe(2);
+    expect(configuration.seed).toBe(42);
+    expect(configuration.execution.blockSize).toBe(64);
+  });
+  expect(combinations.size).toBe(8);
+  expect(errors).toEqual([]);
+});
+
+test('U5: Replay synthetic dimensions are disabled and direct handlers cannot inject them', async ({ page }) => {
+  const { errors, posts } = await start(page);
+  await upload(page);
+  await smallScanSettings(page);
+  for (const id of ['sSweepParam', 'sSweepCompareParam', 'sShapeDim']) {
+    for (const dimension of ['input_len', 'prefix_hit', 'prefix_warm_l2', 'concurrency']) {
+      const option = page.locator(`#${id} option[value="${dimension}"]`);
+      if (await option.count()) await expect(option).toBeDisabled();
+    }
+    for (const dimension of ['input_len', 'prefix_hit', 'prefix_warm_l2', 'concurrency']) {
+      await page.evaluate(({ id, dimension }) => {
+        document.getElementById('sSweepParam').value = 'ssd_bw';
+        document.getElementById('sSweepCompareParam').value = '';
+        document.getElementById('sShapeDim').value = 'prefetch';
+        const select = document.getElementById(id);
+        if (![...select.options].some(option => option.value === dimension)) select.add(new Option(dimension, dimension));
+        select.value = dimension;
+        return window.runSensitivity();
+      }, { id, dimension });
+      await expect(page.locator('#sensitivityStatus')).toContainText(dimension);
+      await expect(page.locator('#sensitivityStatus')).toContainText('不支持合成生成维度');
+      expect(posts).toHaveLength(0);
+    }
+  }
+  expect(errors).toEqual([]);
+});
+
+test('U5: Replay cross uses target QPS axes and actual measurement QPS tooltips', async ({ page }) => {
+  const { errors, posts } = await start(page);
+  await upload(page, oneRequest(2));
+  await settings(page, { replaySeed: '0' });
+  await page.locator('.nav-item[data-tab="tab-cross"]').click();
+  const pending = submitted(page);
+  await page.locator('#btnRunCross').click();
+  const response = await pending;
+  expect(response.status()).toBe(202);
+  const task = await response.json();
+  await expect(page.locator('#crossStatus')).toContainText('交叉分析完成', { timeout: 30_000 });
+  const stored = await (await page.request.get(`/api/tasks/${task.id}/download`)).json();
+  expect(stored.task.status).toBe('completed');
+  expect(posts).toHaveLength(1);
+  expect(posts[0].kind).toBe('batch');
+  expect(posts[0].jobs).toHaveLength(28);
+  const levels = [0.1, 0.3, 1, 3, 8, 16];
+  posts[0].jobs.forEach((job, index) => {
+    expect(job.overrides.qps).toBe(index < 24 ? levels[Math.floor(index / 4)] : 2);
+    expect(job.overrides.seed).toBe(0);
+    expect(job.overrides.replay.bundle).toEqual(oneRequest(2));
+    expect(job.overrides).not.toHaveProperty('nreq');
+    expect(job.overrides).not.toHaveProperty('concurrency');
+  });
+  const chart = await page.evaluate(() => {
+    const option = window.echarts.getInstanceByDom(document.getElementById('chartHeatmap')).getOption();
+    return { axis: option.xAxis[0], data: option.series[0].data,
+      tooltips: option.series[0].data.map(value => option.tooltip[0].formatter({ value })) };
+  });
+  expect(chart.axis.name).toBe('目标 QPS');
+  expect(chart.axis.data).toEqual(levels);
+  expect(chart.data).toHaveLength(24);
+  for (let index = 0; index < 24; index++) {
+    const r = stored.points[index].result, measurement = r.replay.windows.measurement;
+    const latency = measurement.latency.endToEnd.p99;
+    const valid = !r.replay.state.truncated && !r.replay.counts.failed && !r.replay.counts.cancelled
+      && !r.replay.counts.arrivedUnfinished && r.completed > 0 && Number.isFinite(latency);
+    expect(chart.data[index]).toEqual([Math.floor(index / 4), index % 4, valid ? +latency.toFixed(3) : null]);
+    expect(chart.tooltips[index]).toContain(`目标 QPS: ${levels[Math.floor(index / 4)]}`);
+    expect(chart.tooltips[index]).toContain(`实际到达 QPS: ${measurement.arrivalQps.toFixed(3)}`);
+    expect(chart.tooltips[index]).toContain(`实际完成 QPS: ${measurement.completionQps.toFixed(3)}`);
+  }
+  expect(errors).toEqual([]);
+});
+
+test('U5: empty measurement samples remain null in Replay scan charts and offline report records', async ({ page }) => {
+  const { errors, posts } = await start(page);
+  await upload(page, oneRequest(2, 1000));
+  await settings(page, { replayDrain: '0', replayQps: '2' });
+  await smallScanSettings(page);
+  await page.locator('#sPfTimeout').uncheck();
+  await page.locator('#sSweepMetric').selectOption('measurement_latency_p99');
+  const records = await u5Scan(page);
+  expect(records).toHaveLength(1);
+  expect(records[0].measurement_latency_p99).toBeNull();
+  expect(records[0].measurement_latency_samples).toBe(0);
+  expect(records[0].workload.eligibleForComparison).toBe(false);
+  const data = await page.evaluate(() => window.echarts.getInstanceByDom(document.getElementById('chartSensitivity')).getOption().series.map(series => series.data));
+  expect(data).toEqual([[null]]);
+  const html = await downloadHtml(page);
+  const points = JSON.parse(html.match(/var PIVOT_PTS = ([^\n]+);/)[1]);
+  expect(points).toHaveLength(1);
+  expect(points[0].r.measurement_latency_p99).toBeNull();
+  expect(points[0].r.measurement_latency_samples).toBe(0);
+  expect(html).toContain('无样本');
+  expect(posts).toHaveLength(1);
+  expect(errors).toEqual([]);
+});
+
+test('U5: Replay config requires bundle reselection and report points never merge across same-name bundles', async ({ page }) => {
+  const { errors, posts } = await start(page);
+  await upload(page, oneRequest(2), 'same-name.json');
+  await settings(page, { replaySeed: '0' });
+  await smallScanSettings(page);
+  await page.locator('#sPfTimeout').uncheck();
+  await page.locator('#sSweepMetric').selectOption('measurement_latency_p99');
+  const first = await u5Scan(page);
+  const firstHtml = await downloadHtml(page);
+  await page.locator('button[onclick="exportParams()"]').click();
+  const exported = JSON.parse(await page.locator('#paramsIo').inputValue());
+  expect(exported.workload).toMatchObject({ source: 'replay', options: { qps: 2, seed: 0, durationSeconds: 0.2, warmupSeconds: 0, simMaxTime: 5 } });
+  expect(exported.workload.bundleSummary.digest).toMatch(/^[a-f0-9]{64}$/);
+  expect(JSON.stringify(exported.workload)).not.toContain('blockRuns');
+  await page.locator('#replayQps').fill('19');
+  expect(await downloadHtml(page)).toBe(firstHtml);
+  await page.locator('#paramsIo').fill(JSON.stringify(exported));
+  await page.locator('button[onclick="importParamsFromBox()"]').click();
+  await expect(page.locator('#workloadSource')).toHaveValue('replay');
+  await expect(page.locator('#paramsIoNote')).toContainText('不是独立可复现包');
+  await expect(page.locator('#replayQps')).toHaveValue('2');
+  await expect(page.locator('#replaySeed')).toHaveValue('0');
+  await expect(page.locator(runButton)).toBeDisabled();
+  expect(await page.locator('#replayFile').evaluate(el => el.files.length)).toBe(0);
+  expect(await downloadHtml(page)).toBe(firstHtml);
+  await upload(page, oneRequest(8), 'same-name.json');
+  await expect(page.locator('#replayStatus')).toContainText('摘要');
+  await expect(page.locator(runButton)).toBeDisabled();
+  await upload(page, oneRequest(2), 'renamed.json');
+  await expect(page.locator(runButton)).toBeEnabled();
+  const invalid = structuredClone(exported);
+  invalid.workload.options.warmupSeconds = invalid.workload.options.durationSeconds;
+  await page.locator('#paramsIo').fill(JSON.stringify(invalid));
+  await page.locator('button[onclick="importParamsFromBox()"]').click();
+  await expect(page.locator('#paramsIoNote')).toContainText('导入失败');
+  await expect(page.locator('#replayWarmup')).toHaveValue('0');
+  await expect(page.locator(runButton)).toBeEnabled();
+  const { workload: _workload, ...legacy } = exported;
+  await page.locator('#paramsIo').fill(JSON.stringify(legacy));
+  await page.locator('button[onclick="importParamsFromBox()"]').click();
+  await expect(page.locator('#workloadSource')).toHaveValue('synthetic');
+  await source(page, 'replay');
+  await expect(page.locator(runButton)).toBeDisabled();
+  await upload(page, oneRequest(8), 'same-name.json');
+  await settings(page, { replaySeed: '0' });
+  await page.locator('#sSweepMetric').selectOption('measurement_latency_p99');
+  const second = await u5Scan(page);
+  expect(posts).toHaveLength(2);
+  expect(first[0].workload.configuration.bundleDigest).not.toBe(second[0].workload.configuration.bundleDigest);
+  const html = await downloadHtml(page);
+  const points = JSON.parse(html.match(/var PIVOT_PTS = ([^\n]+);/)[1]);
+  expect(points).toHaveLength(2);
+  expect(new Set(points.map(point => point.r.workload.configuration.bundleDigest))).toEqual(new Set([
+    first[0].workload.configuration.bundleDigest, second[0].workload.configuration.bundleDigest,
+  ]));
+  expect(points.map(point => point.r.measurement_latency_p99).sort()).toEqual([first[0].measurement_latency_p99, second[0].measurement_latency_p99].sort());
+  expect(html).toContain('measurement');
+  expect(html).toContain('workloadModel');
+  expect(html).not.toBe(firstHtml);
+  await source(page, 'synthetic');
+  expect(await downloadHtml(page)).toBe(html);
+  expect(errors).toEqual([]);
+});
+
 test('U1: shared entry preserves synthetic follow-ups, Replay zero-offset dependencies and result isolation', async ({ page }) => {
   const { errors, posts } = await start(page, 'synthetic');
   await importControls(page, { ...baseControls, pMultiTurn: '100', pInstances: '2', pRoutePolicy: 'random',
@@ -165,8 +525,24 @@ test('U1: shared entry preserves synthetic follow-ups, Replay zero-offset depend
     for (const key of ['sessionId', 'routingKey', 'inputContent', 'sessionInstanceKey']) {
       expect(json).not.toContain(`"${key}":`);
     }
-    expect(json.match(/"outputIdentity":/g)?.length || 0).toBe(snapshot.replay ? 1 : 0);
-    if (snapshot.replay) expect(snapshot.replay.configuration.outputIdentity).toBe('unmapped');
+    const identityPaths = [];
+    const collectIdentityPaths = (value, path = '') => {
+      if (!value || typeof value !== 'object') return;
+      for (const [key, item] of Object.entries(value)) {
+        const next = path ? `${path}.${key}` : key;
+        if (key === 'outputIdentity') identityPaths.push(next);
+        collectIdentityPaths(item, next);
+      }
+    };
+    collectIdentityPaths(snapshot);
+    expect(identityPaths.sort()).toEqual((snapshot.replay
+      ? ['configuration.pageLayout.outputIdentity', 'configuration.outputIdentity', 'replay.configuration.pageLayout.outputIdentity', 'replay.configuration.outputIdentity']
+      : ['configuration.pageLayout.outputIdentity']).sort());
+    expect(snapshot.configuration.pageLayout.outputIdentity).toBe(snapshot.replay ? 'unmapped' : 'session-history');
+    if (snapshot.replay) {
+      expect(snapshot.replay.configuration.outputIdentity).toBe('unmapped');
+      expect(snapshot.replay.configuration).toEqual(snapshot.configuration);
+    }
   }
   expect(posts[0].jobs[0].overrides?.replay).toBeUndefined();
   expect(posts[1].jobs[0].overrides.replay.bundle).toEqual(prefix);
@@ -206,12 +582,12 @@ test('Replay typography matches the legacy interface without changing existing f
     for (const heading of await page.locator('#replaySummary h3').all()) {
       expect(await typography(heading)).toEqual(resultHeading);
     }
-    for (const selector of ['#replayFileInfo', '#replayStatus', '#replaySummary dt', '#replaySummary > p', '#replaySummary summary']) {
+    for (const selector of ['#replayFileInfo', '#replayStatus', '#replaySummary dt', '#replaySummary > details > p', '#replaySummary summary']) {
       expect(await typography(page.locator(selector).first()), selector).toEqual(note);
     }
     const value = await typography(page.locator('#replaySummary dd').first());
     expect(value).toEqual({ ...note, color: (await typography(page.locator('body'))).color });
-    await page.locator('#replaySummary summary').first().click();
+    await page.locator('#replaySummary > details > details > summary').first().click();
     await expect(page.locator('#replaySummary pre').first()).toBeVisible();
     expect(await typography(page.locator('#replaySummary pre').first())).toEqual(formula);
     await page.locator('.nav-item[data-tab="tab-schedule"]').click();
@@ -223,7 +599,7 @@ test('Replay typography matches the legacy interface without changing existing f
     await page.locator('.nav-item[data-tab="tab-params"]').click();
     await source(page, 'synthetic');
     expect(await typography(page.locator('#pQps'))).toEqual(await typography(legacy.locator('#pQps')));
-    expect(await typography(page.locator('#replaySummary h3').first())).toEqual(resultHeading);
+    await expect.poll(() => typography(page.locator('#replaySummary h3').first())).toEqual(resultHeading);
     expect(errors).toEqual([]);
   } finally {
     await legacy.close();
@@ -409,32 +785,52 @@ test('numeric and unsupported configuration errors stay local and unlock the pan
     await recovered(page);
   }
   await settings(page);
-  await page.locator('#pBlockSize').fill('256');
-  await page.locator(runButton).click();
-  await expect(page.locator('#simulationStatus')).toContainText('64');
-  await expect(page.locator('#pBlockSize')).toHaveValue('256');
-  await recovered(page);
+  for (const size of ['48', '96']) {
+    await page.locator('#pBlockSize').fill(size);
+    await page.locator(runButton).click();
+    await expect(page.locator('#simulationStatus')).toContainText('64');
+    await expect(page.locator('#pBlockSize')).toHaveValue(size);
+    await recovered(page);
+  }
   await page.locator('#pBlockSize').fill('64');
   await page.locator('#pInstances').fill('2');
-  await page.locator(runButton).click();
-  await expect(page.locator('#simulationStatus')).toContainText('单计算实例');
-  await expect(page.locator('#pInstances')).toHaveValue('2');
-  await recovered(page);
-  await page.locator('#pInstances').fill('1');
   await page.locator('#pPdSep').selectOption('2');
   await page.locator(runButton).click();
-  await expect(page.locator('#simulationStatus')).toContainText('物理 P/D');
+  await expect(page.locator('#simulationStatus')).toContainText('P/D');
+  await expect(page.locator('#pInstances')).toHaveValue('2');
+  await expect(page.locator('#pPdSep')).toHaveValue('2');
   await recovered(page);
+  await page.locator('#pInstances').fill('1');
   await page.locator('#pPdSep').selectOption('0');
-  await importControls(page, { _strategyMode: 'js', sDsl: 'window.__replayJs = true;' });
-  await page.locator(runButton).click();
+  await page.locator('#modeJs').click();
+  await page.locator('#sDsl').fill('window.__replayJs = true;');
+  await expect(page.locator('#workloadSource')).toHaveValue('replay');
+  expect(await page.locator('#replayFile').evaluate(el => el.files.length)).toBe(1);
+  await expect(page.locator(runButton)).toBeDisabled();
+  await page.evaluate(() => window.applyStrategies());
   await expect(page.locator('#simulationStatus')).toContainText('仅支持 DSL');
-  await recovered(page);
   expect(await page.evaluate(() => window.__replayJs)).toBeUndefined();
   expect(posts).toHaveLength(0);
-  await importControls(page, { _strategyMode: 'dsl', sDsl: baseline.strategy.dsl });
-  expect((await run(page)).result.completed).toBe(1);
-  expect(posts).toHaveLength(1);
+  await page.locator('#modeDsl').click();
+  await page.locator('#sDsl').fill(baseline.strategy.dsl);
+  await expect(page.locator('#workloadSource')).toHaveValue('replay');
+  for (const size of ['16', '32', '64', '128', '256']) {
+    await page.locator('#pBlockSize').fill(size);
+    const { result } = await run(page);
+    expect(result.completed).toBe(1);
+    expect(result.replay.configuration.execution.blockSize).toBe(Number(size));
+    expect(result.replay.windows.full.cache.inputTokens).toBe(64);
+  }
+  await page.locator('#pInstances').fill('2');
+  const multi = (await run(page)).result;
+  expect(multi.replay.configuration.execution.instances).toBe(2);
+  expect(multi.replay.state.supportedScope).toContain('instance-private');
+  await page.locator('#pInstances').fill('1');
+  await page.locator('#pPdSep').selectOption('2');
+  const pd = (await run(page)).result;
+  expect(pd.replay.configuration.execution.pdMode).toBe(2);
+  expect(pd.replay.state.supportedScope).toContain('physical-pd');
+  expect(posts).toHaveLength(7);
   expect(errors).toEqual([]);
 });
 
@@ -610,14 +1006,24 @@ test('V4: synthetic to Replay to synthetic replaces every result view without mi
   await expect(page.locator('#simulationDirty')).toBeHidden();
   await page.locator('button[onclick="exportParams()"]').click();
   const exported = JSON.parse(await page.locator('#paramsIo').inputValue());
-  expect(exported).toEqual(original);
-  expect(Object.keys(exported).some(key => /replay|bundle|workloadSource/i.test(key))).toBe(false);
-  await importControls(page, { ...original, workloadSource: 'synthetic', replaySeed: '999', replayDuration: '123', replayFile: 'not-a-bundle', bundle: oneRequest() });
-  await expect(page.locator('#workloadSource')).toHaveValue('replay');
+  const { workload: originalWorkload, ...originalControls } = original;
+  const { workload: exportedWorkload, ...exportedControls } = exported;
+  expect(originalWorkload).toEqual({ source: 'synthetic' });
+  expect(exportedControls).toEqual(originalControls);
+  expect(exportedWorkload).toMatchObject({ source: 'replay', options: { qps: 6, seed: 42, durationSeconds: 0.2, warmupSeconds: 0, simMaxTime: 5 } });
+  expect(exportedWorkload.bundleSummary.digest).toMatch(/^[a-f0-9]{64}$/);
+  expect(JSON.stringify(exportedWorkload)).not.toContain('blockRuns');
+  await page.locator('#paramsIo').fill(JSON.stringify({ ...originalControls, workloadSource: 'replay', replaySeed: '999', replayDuration: '123', replayFile: 'not-a-bundle', bundle: oneRequest() }));
+  await page.locator('button[onclick="importParamsFromBox()"]').click();
+  await expect(page.locator('#workloadSource')).toHaveValue('synthetic');
   await expect(page.locator('#replaySeed')).toHaveValue('42');
   await expect(page.locator('#replayDuration')).toHaveValue('0.2');
-  expect(await page.locator('#replayFileInfo').textContent()).toBe(fileInfo);
+  expect(await page.locator('#replayFile').evaluate(el => el.files.length)).toBe(0);
   expect(await downloadResult(page)).toEqual(result);
+  await source(page, 'replay');
+  await expect(page.locator(runButton)).toBeDisabled();
+  await upload(page, prefix, 'preserved.json');
+  expect(await page.locator('#replayFileInfo').textContent()).toBe(fileInfo);
   await source(page, 'synthetic');
   await expect(page.locator(allButton)).toBeEnabled();
   await expect(page.locator('#replaySummary')).toBeVisible();
@@ -707,18 +1113,30 @@ for (const workloadSource of ['synthetic', 'replay']) {
   }
 }
 
-test('V4: Replay rejects the run-all handler while synthetic retains its existing batch entry', async ({ page }) => {
+test('U5: Replay and synthetic share the run-all entry without sharing result caches or workload inputs', async ({ page }) => {
   const { errors, posts } = await start(page);
   await upload(page);
-  await expect(page.locator(allButton)).toBeDisabled();
-  await page.evaluate(() => window.runAllStrategies());
-  await expect(page.locator('#simulationStatus')).toContainText('Replay');
-  expect(posts).toHaveLength(0);
-  await expect(page.locator(runButton)).toBeEnabled();
-  await run(page);
-  await expect(page.locator(allButton)).toBeDisabled();
-  await page.evaluate(() => window.runAllStrategies());
-  expect(posts).toHaveLength(1);
+  await page.locator('button[onclick="saveStrategy()"]').click();
+  await page.locator('#sName').fill('replay-second');
+  await page.locator('#sDsl').fill(baseline.strategy.dsl.replace(/PREFETCH:[^\n]*/, 'PREFETCH: best_effort'));
+  await page.locator('button[onclick="saveStrategy()"]').click();
+  for (let iteration = 0; iteration < 2; iteration++) {
+    await expect(page.locator(allButton)).toBeEnabled();
+    const responseEvent = submitted(page);
+    await page.locator(allButton).click();
+    const response = await responseEvent;
+    expect(response.status()).toBe(202);
+    const task = await response.json();
+    await expect(page.locator(runButton)).toBeEnabled();
+    await expect(page.locator('#simulationStatus')).toContainText('运行完成');
+    const stored = await (await page.request.get(`/api/tasks/${task.id}/download`)).json();
+    expect(stored.task.status).toBe('completed');
+    expect(stored.points).toHaveLength(2);
+    expect(posts[iteration].jobs).toHaveLength(2);
+    for (const job of posts[iteration].jobs) expect(job.overrides.replay.bundle).toEqual(oneRequest());
+    expect(stored.points.map(point => point.result.completed)).toEqual([1, 1]);
+  }
+  expect(posts[0].requestId).not.toBe(posts[1].requestId);
   await source(page, 'synthetic');
   await expect(page.locator(allButton)).toBeEnabled();
   const responseEvent = submitted(page);
@@ -726,8 +1144,9 @@ test('V4: Replay rejects the run-all handler while synthetic retains its existin
   expect((await responseEvent).status()).toBe(202);
   await expect(page.locator(runButton)).toBeEnabled();
   await expect(page.locator('#simulationStatus')).toHaveText('运行完成');
-  expect(posts).toHaveLength(2);
-  expect(posts[1].jobs.every(job => !job.overrides?.replay)).toBe(true);
+  expect(posts).toHaveLength(3);
+  expect(posts[2].jobs).toHaveLength(2);
+  expect(posts[2].jobs.every(job => !job.overrides?.replay)).toBe(true);
   await expect(page.locator('#replayDownload')).toBeDisabled();
   expect(errors).toEqual([]);
 });
@@ -860,7 +1279,7 @@ const consoleErrors = page => {
   return errors;
 };
 
-test('V5: analysis handlers cannot bypass Replay restrictions and legacy exports follow saved results across the round trip', async ({ page }) => {
+test('U5: missing bundles block analysis while report permissions follow saved scan snapshots across source changes', async ({ page }) => {
   const { errors, posts } = await start(page, 'synthetic');
   const console = consoleErrors(page);
   await runSynthetic(page);
@@ -884,7 +1303,7 @@ test('V5: analysis handlers cannot bypass Replay restrictions and legacy exports
   expect(await downloadHtml(page)).toBe(originalHtml);
   await page.locator('.nav-item[data-tab="tab-cross"]').click();
   await expect(page.locator('button[onclick="runCrossAnalysis()"]')).toBeDisabled();
-  await expect(page.locator('#crossStatus')).toContainText('不支持');
+  await expect(page.locator('#crossStatus')).toContainText('bundle');
   for (let i = 0; i < 2; i++) {
     await page.evaluate(async () => {
       window.runAllStrategies();
@@ -899,25 +1318,24 @@ test('V5: analysis handlers cannot bypass Replay restrictions and legacy exports
   expect(await page.locator('#formulaSensitivity').innerHTML()).toBe(originalScan);
   await upload(page);
   const { result } = await run(page);
-  for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeDisabled();
-  await expect(page.locator('#sensExportRestriction')).toContainText('下载完整结果 JSON');
-  const unexpectedDownloads = [];
-  const onDownload = download => unexpectedDownloads.push(download.suggestedFilename());
-  page.on('download', onDownload);
-  for (const editedSource of ['replay', 'synthetic']) {
-    if (editedSource === 'synthetic') await source(page, 'synthetic');
-    await page.evaluate(() => {
-      window.exportSensHtml();
-      window.exportSensImage('png');
-      window.exportSensImage('jpeg');
-    });
-    await expect(page.locator('#sensExportNote')).toContainText('Replay');
-    for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeDisabled();
-  }
-  page.off('download', onDownload);
-  expect(unexpectedDownloads).toEqual([]);
+  for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeEnabled();
+  await expect(page.locator('#sensExportRestriction')).toBeHidden();
+  expect(await downloadHtml(page)).toBe(originalHtml);
+  await expect(page.locator('#btnRunSens')).toBeEnabled();
+  const replayScan = submitted(page);
+  await page.locator('#btnRunSens').click();
+  expect((await replayScan).status()).toBe(202);
+  await expect(page.locator('#btnRunSens')).toBeEnabled();
+  for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeEnabled();
+  const replayHtml = await downloadHtml(page);
+  expect(replayHtml).toContain('Replay');
+  expect(replayHtml).toContain('measurement');
+  expect(replayHtml).not.toEqual(originalHtml);
+  await page.locator('#replayQps').fill('19');
+  await source(page, 'synthetic');
+  expect(await downloadHtml(page)).toEqual(replayHtml);
   expect(await downloadResult(page)).toEqual(result);
-  expect(posts).toHaveLength(3);
+  expect(posts).toHaveLength(4);
   await expect(page.locator('#btnRunSens')).toBeEnabled();
   await expect(page.locator(allButton)).toBeEnabled();
   await page.locator('.nav-item[data-tab="tab-cross"]').click();
@@ -928,23 +1346,24 @@ test('V5: analysis handlers cannot bypass Replay restrictions and legacy exports
   await expect(page.locator(runButton)).toBeEnabled();
   for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeEnabled();
   await expect(page.locator('#sensExportRestriction')).toBeHidden();
-  expect(await downloadHtml(page)).toBe(originalHtml);
+  expect(await downloadHtml(page)).toBe(replayHtml);
   await page.locator('#btnRunSens').click();
   await expect(page.locator('#btnRunSens')).toBeEnabled();
   expect(await page.locator('#formulaSensitivity').innerHTML()).toContain(originalScan);
   await expect(page.locator('#formulaSensitivity')).toContainText('缓存命中，未重跑仿真');
   expect(await scanData()).toEqual(originalScanData);
-  expect(posts).toHaveLength(3);
-  expect(posts.map(post => post.kind)).toEqual(['simulation', 'scan', 'simulation']);
+  expect(posts).toHaveLength(4);
+  expect(posts.map(post => post.kind)).toEqual(['simulation', 'scan', 'simulation', 'scan']);
   expect(errors).toEqual([]);
   expect(console).toEqual([]);
 });
 
 for (const status of ['completed', 'failed', 'cancelled']) {
-  test(`V5: a ${status} synthetic scan cannot unlock Replay entries after an in-flight mode switch`, async ({ page }) => {
+  test(`U5: a ${status} synthetic scan locks source changes and never enables Replay without a bundle`, async ({ page }) => {
     const { errors, posts } = await start(page, 'synthetic');
     const result = await runSynthetic(page);
     await smallScanSettings(page);
+    const chartBefore = await page.locator('#chartSensitivity').innerHTML();
     const task = { id: `v5-scan-${status}`, status, total: 1, completed: status === 'completed' ? 1 : 0, error: status === 'completed' ? undefined : `scan ${status}` };
     let release;
     const gate = new Promise(resolve => { release = resolve; });
@@ -957,19 +1376,32 @@ for (const status of ['completed', 'failed', 'cancelled']) {
     const response = submitted(page);
     await page.locator('#btnRunSens').click();
     expect((await response).status()).toBe(202);
-    for (const editedSource of ['replay', 'synthetic', 'replay']) {
-      await source(page, editedSource);
-      await expect(page.locator('#btnRunSens')).toBeDisabled();
-    }
-    await page.evaluate(() => window.runSensitivity());
+    await expect(page.locator('#workloadSource')).toBeDisabled();
+    await expect(page.locator('#replayFile')).toBeDisabled();
+    await expect(page.locator('#btnRunSens')).toBeDisabled();
+    await page.evaluate(() => {
+      const source = document.getElementById('workloadSource');
+      source.value = 'replay';
+      source.dispatchEvent(new Event('change', { bubbles: true }));
+      window.runSensitivity();
+    });
+    await expect(page.locator('#workloadSource')).toHaveValue('synthetic');
+    expect(posts).toHaveLength(2);
     release();
     await expect(page.locator('#btnRunSens')).toHaveText('运行敏感性分析');
+    await expect(page.locator('#workloadSource')).toBeEnabled();
+    if (status !== 'completed') {
+      await expect(page.locator('#sensitivityStatus')).toContainText(`scan ${status}`);
+      expect(await page.locator('#chartSensitivity').innerHTML()).toBe(chartBefore);
+    }
+    await source(page, 'replay');
     await expect(page.locator('#btnRunSens')).toBeDisabled();
     await expect(page.locator(allButton)).toBeDisabled();
-    await expect(page.locator('#sensitivityStatus')).toContainText('Replay');
+    await page.evaluate(() => window.runSensitivity());
+    await expect(page.locator('#sensitivityStatus')).toContainText('bundle');
     if (status === 'completed') await expect(page.locator('#btnSensExportHtml')).toBeEnabled();
     else {
-      await expect(page.locator('#chartSensitivity')).toContainText(`scan ${status}`);
+      expect(await page.locator('#chartSensitivity').innerHTML()).toBe(chartBefore);
       await expect(page.locator('#btnSensExportHtml')).toBeDisabled();
     }
     await source(page, 'synthetic');
@@ -1081,19 +1513,36 @@ for (const status of ['completed', 'failed', 'cancelled']) {
     await page.route('**/api/tasks', route => route.request().method() === 'POST'
       ? route.fulfill({ status: 202, json: { ...task, status: 'running', completed: 0 } }) : route.continue());
     await page.locator('.nav-item[data-tab="tab-cross"]').click();
+    await expect(page.locator('#chartHeatmap .progress-note')).toBeVisible();
+    await expect(page.locator('#chartHeatmap')).toContainText('交叉分析需运行');
+    const chartBefore = await page.locator('#chartHeatmap').innerHTML();
     const response = submitted(page);
     await page.locator('#btnRunCross').click();
     expect((await response).status()).toBe(202);
     await expect(page.locator('#btnRunCross')).toBeDisabled();
     await page.locator('.nav-item[data-tab="tab-params"]').click();
-    await source(page, 'replay');
-    await page.evaluate(() => window.runCrossAnalysis());
+    await expect(page.locator('#workloadSource')).toBeDisabled();
+    await page.evaluate(() => {
+      const source = document.getElementById('workloadSource');
+      source.value = 'replay';
+      source.dispatchEvent(new Event('change', { bubbles: true }));
+      window.runCrossAnalysis();
+    });
+    await expect(page.locator('#workloadSource')).toHaveValue('synthetic');
     release();
     await page.locator('.nav-item[data-tab="tab-cross"]').click();
     if (status === 'completed') await expect(page.locator('#formulaRadar')).toContainText('计算方式');
-    else await expect(page.locator('#chartHeatmap')).toContainText(`cross ${status}`);
+    else {
+      await expect(page.locator('#crossStatus')).toContainText(`cross ${status}`);
+      expect(await page.locator('#chartHeatmap').innerHTML()).toBe(chartBefore);
+    }
+    await expect(page.locator('#btnRunCross')).toBeEnabled();
+    await page.locator('.nav-item[data-tab="tab-params"]').click();
+    await source(page, 'replay');
+    await page.locator('.nav-item[data-tab="tab-cross"]').click();
     await expect(page.locator('#btnRunCross')).toBeDisabled();
-    await expect(page.locator('#crossStatus')).toContainText('Replay');
+    await page.evaluate(() => window.runCrossAnalysis());
+    await expect(page.locator('#crossStatus')).toContainText('bundle');
     expect(posts).toHaveLength(2);
     expect(posts[1].kind).toBe('batch');
     expect(posts[1].jobs).toHaveLength(28);
@@ -1111,7 +1560,7 @@ for (const status of ['completed', 'failed', 'cancelled']) {
   });
 }
 
-test('V5: a pre-submission scan rejection disables stale exports and a supported cached scan restores them', async ({ page }) => {
+test('U5: a pre-submission scan rejection retains the previous valid export and a cached scan restores its chart', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-09-23T00:00:00Z'));
   const { errors, posts } = await start(page, 'synthetic');
   await smallScanSettings(page);
@@ -1120,9 +1569,11 @@ test('V5: a pre-submission scan rejection disables stale exports and a supported
   const original = await downloadHtml(page);
   await importControls(page, { _strategyMode: 'js', sDsl: 'window.__unexpectedScan = true;' });
   await page.locator('#btnRunSens').click();
-  await expect(page.locator('#chartSensitivity')).toContainText('不支持 JavaScript');
+  await expect(page.locator('#sensitivityStatus')).toContainText('不支持 JavaScript');
+  await expect(page.locator('#sensitivityStatus')).toContainText('保留上次结果');
   await expect(page.locator('#btnRunSens')).toBeEnabled();
-  for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeDisabled();
+  for (const id of legacyExportIds) await expect(page.locator('#' + id)).toBeEnabled();
+  expect(await downloadHtml(page)).toBe(original);
   expect(await page.evaluate(() => window.__unexpectedScan)).toBeUndefined();
   expect(posts).toHaveLength(1);
   await importControls(page, { _strategyMode: 'dsl', sDsl: baseline.strategy.dsl });

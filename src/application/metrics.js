@@ -1,6 +1,24 @@
 export function extractSensMetrics(r) {
   let b = r.ttftBreakdown || null;
   let tt = b ? (b.queue + b.prefillQ + b.fetch + b.compute) : 0;
+  const replay = r.replay;
+  const measurement = replay?.windows?.measurement;
+  const value = n => Number.isFinite(n) ? n : null;
+  const latency = (key, field) => value(measurement?.latency?.[key]?.[field]);
+  const configuration = r.configuration ?? replay?.configuration ?? null;
+  const counts = replay?.counts ?? r.workloadCounts ?? { planned: r.totalReqs, successful: r.completed };
+  const state = { terminationReason: r.truncated ? 'hard_cutoff' : 'drained',
+    ...(replay?.state ?? {}), truncated: !!r.truncated };
+  const eligibleForComparison = !state.truncated && !(counts.failed > 0) && !(counts.cancelled > 0)
+    && !(counts.arrivedUnfinished > 0) && r.completed > 0;
+  const workload = JSON.parse(JSON.stringify({
+    source: replay ? 'replay' : 'synthetic',
+    bundle: replay ? { version: configuration?.bundleVersion, digest: configuration?.bundleDigest,
+      digestEncoding: configuration?.digestEncoding, templates: replay.source?.sessions,
+      requests: replay.source?.requests, inputTokens: replay.source?.inputTokens, outputTokens: replay.source?.outputTokens } : null,
+    configuration, windows: replay?.windows ?? { full: { start: 0, end: r.simEnd, durationSeconds: r.simEnd } },
+    counts, state, versions: { workloadModel: configuration?.workloadModelVersion ?? null }, eligibleForComparison,
+  }));
   return { ttft: r.avgTtft, ttft_p50: r.p50Ttft, ttft_p99: r.p99Ttft, tpot: r.avgTpot,
     tpot_p50: r.p50Tpot, tpot_p99: r.p99Tpot, latency: r.avgLatency, latency_p50: r.p50,
     // hit_rate 保持"HBM 访问命中率"语义(历史敏感性/导出口径); 前缀分层命中率见 prefix_hit_rate
@@ -24,14 +42,14 @@ export function extractSensMetrics(r) {
     prefill_thr_per_req: r.prefillThroughputPerReq || 0,
     decode_thr_per_req: r.decodeThroughputPerReq || 0,
     prefix_hit_rate: r.hitRate ? r.hitRate.total : 0,
-    fetch_ratio: tt > 0 ? 100 * b.fetch / tt : 0,   // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
+    fetch_ratio: tt > 0 ? 100 * b.fetch / tt : null,   // L3拉取时间占比(%) = fetch/(queue+pfQ+fetch+compute)
     // compute 二级拆分的扫描指标(2026-08-24): 用于扫出"带宽/并发提升把等待从存储搬到算力"的曲线。
     // compute_net  : 纯计算(ms) —— 与并发/带宽都无关的基线, 扫描曲线应近似水平(可作正确性哨兵)
     // compute_wait : 算力竞争等待(ms) —— 随并发单调上升
     // compute_wait_ratio: 竞争等待占 compute 的比例(%) —— >50% ⇒ 该做并发准入控制而非加算力
-    compute_net: b ? (b.computeNet || 0) : 0,
-    compute_wait: b ? (b.computeWait || 0) : 0,
-    compute_wait_ratio: (b && b.compute > 0) ? 100 * (b.computeWait || 0) / b.compute : 0,
+    compute_net: b ? (b.computeNet || 0) : null,
+    compute_wait: b ? (b.computeWait || 0) : null,
+    compute_wait_ratio: (b && b.compute > 0) ? 100 * (b.computeWait || 0) / b.compute : null,
     // ---- TTFT 六分量(2026-08-26): 供「TTFT 构成」堆叠柱使用, 同时各自可作独立折线指标 ----
     // ★ 已用 _dbg_ttft_identity.js 在 12 个场景(wc/be/race × 命中0/60/90/100% × PD分离/
     //   多实例/长输入/低slots)逐一验证: 六项之和 == r.avgTtft, 最大相对残差 7.28e-12(浮点噪声)。
@@ -41,8 +59,17 @@ export function extractSensMetrics(r) {
     //   混在一起。拆开后堆叠柱能直接回答"该加卡还是该收紧准入"(见 NOTES_engine.md)。
     // 为什么不用 fetchReal: fetchReal 是"拉取过程真实时长", race/best_effort 下与计算重叠,
     //   计入堆叠会导致 Σ > TTFT(重复计时)。堆叠柱必须用**互不重叠**的墙钟分段 ⇒ 用 fetch。
-    ttft_queue: b ? (b.queue || 0) : 0,
-    ttft_prefillq: b ? (b.prefillQ || 0) : 0,
-    ttft_fetch: b ? (b.fetch || 0) : 0,
-    ttft_xfer: b ? (b.xfer || 0) : 0 };
+    ttft_queue: b ? (b.queue || 0) : null,
+    ttft_prefillq: b ? (b.prefillQ || 0) : null,
+    ttft_fetch: b ? (b.fetch || 0) : null,
+    ttft_xfer: b ? (b.xfer || 0) : null,
+    measurement_ttft: latency('ttft', 'mean'), measurement_ttft_p50: latency('ttft', 'p50'), measurement_ttft_p99: latency('ttft', 'p99'),
+    measurement_tpot: latency('tpot', 'mean'), measurement_tpot_p50: latency('tpot', 'p50'), measurement_tpot_p99: latency('tpot', 'p99'),
+    measurement_latency: latency('endToEnd', 'mean'), measurement_latency_p50: latency('endToEnd', 'p50'), measurement_latency_p99: latency('endToEnd', 'p99'),
+    measurement_arrival_qps: value(measurement?.arrivalQps), measurement_completion_qps: value(measurement?.completionQps),
+    measurement_hit_rate: measurement?.cache?.hitRate == null ? null : value(measurement.cache.hitRate * 100),
+    measurement_ttft_samples: measurement?.latency?.ttft?.count ?? 0,
+    measurement_tpot_samples: measurement?.latency?.tpot?.count ?? 0,
+    measurement_latency_samples: measurement?.latency?.endToEnd?.count ?? 0,
+    workload };
 }

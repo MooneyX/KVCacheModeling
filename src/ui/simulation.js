@@ -5,7 +5,7 @@ import { getCurrentStrategy } from "./strategy.js";
 import { $ } from "../adapters/browser/dom.js";
 import { drawGantt, refreshScheduleTab, drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
 import { executeSimulation, executeBatch, serverVersion } from '../execution/browser/client.ts';
-import { createReplayJob, replaySelection, updateRunControls } from './replay.js';
+import { createReplayJob, replaySelection, updateRunControls, allowSyntheticAnalysis } from './replay.js';
 import { refreshSensExportControls } from './export.js';
 
 const pending = new Map();
@@ -37,11 +37,11 @@ export function updateSimulationSnapshot() {
   if (!input || !result) { label.textContent = '请先运行'; dirty.hidden = true; return; }
   const config = input.replayConfiguration || result.replay?.configuration;
   const source = result.replay ? '数据集 Replay' : '合成负载';
-  const names = config ? config.strategy.name : input.strategies.map(strategy => strategy.name).join(' / ');
+  const names = config ? state.simResults.map(item => item.replay.configuration.strategy.name).join(' / ') : input.strategies.map(strategy => strategy.name).join(' / ');
   label.textContent = `最近一次运行 · ${source} · 策略：${names} · ` + (config
     ? `QPS=${config.targetQps} · seed=${config.seed} · T/W/D=${config.durationSeconds}/${config.warmupSeconds}/${config.execution.simMaxTime}s · bundle=${config.bundleDigest}`
     : `请求数=${input.params.concurrency} · QPS=${input.params.qps} · seed=${input.params.seed}`)
-    + (result.truncated ? ' · 已截断' : '');
+    + (state.simResults.some(item => item.truncated || item.replay?.state?.truncated) ? ' · 含截断结果' : '');
   dirty.hidden = !input.inputKey || input.inputKey === inputKey();
 }
 
@@ -56,7 +56,7 @@ export function initSimulationInputs() {
 }
 
 async function runSelectedStrategies(list) {
-  if (state.simRunning) return;
+  if (state.simRunning || !allowSyntheticAnalysis('simulationStatus')) return;
   state.simRunning = true;
   updateRunControls();
   setSimulationStatus('正在运行，保留最近一次成功结果…');
@@ -72,11 +72,14 @@ async function runSelectedStrategies(list) {
       const job = createReplayJob(input);
       input.params = job.params;
       const { generation: _generation, ...fileSummary } = replaySelection();
-      const result = await executeSimulation(job);
-      if (!result.replay?.configuration || !result.replay?.windows?.measurement) throw new Error('服务器结果缺少 Replay 执行配置或测量窗口。');
-      results = [result];
-      input.replayConfiguration = structuredClone(result.replay.configuration);
-      input.bundleSummary = { ...fileSummary, digest: result.replay.configuration.bundleDigest, ...result.replay.source };
+      const jobs = strategies.map(strategy => structuredClone({ ...job, strategy }));
+      results = await executeBatch(jobs, jobs.length === 1 ? 'simulation' : 'batch', {
+        label: jobs.length === 1 ? strategies[0].name : 'Replay 全部已保存策略',
+      });
+      if (results.length !== jobs.length || jobs.some((_job, index) => !results[index]?.replay?.configuration || !results[index]?.replay?.windows?.measurement)) throw new Error('服务器结果缺少 Replay 执行配置、测量窗口或策略结果。');
+      input.replayConfigurations = results.map(result => structuredClone(result.replay.configuration));
+      input.replayConfiguration = input.replayConfigurations[0];
+      input.bundleSummary = { ...fileSummary, digest: results[0].replay.configuration.bundleDigest, ...results[0].replay.source };
     } else {
       if (mode === 'js') throw new Error('服务器暂不支持 JavaScript 策略，请选择 DSL。');
       if (strategies.some(strategy => !strategy)) throw new Error('当前 DSL 策略解析失败，请检查策略编辑器。');
@@ -97,7 +100,7 @@ async function runSelectedStrategies(list) {
       results = results.map((result, index) => ({ ...result, name: strategies[index].name || result.name }));
     }
     Object.assign(state, { simResults: results, simInput: input });
-    setSimulationStatus(results[0]?.truncated ? '运行完成：已截断，请查看终止原因和未完成计数。' : '运行完成');
+    setSimulationStatus(results.some(result => result.truncated || result.replay?.state?.truncated) ? '运行完成：部分策略已截断，请查看各自终止原因和未完成计数。' : '运行完成');
     showStrategyResults();
   } catch (error) {
     simError(error);
@@ -133,10 +136,6 @@ export function applyStrategies() {
 // 运行全部已保存策略（无保存则回退当前策略）；结果走缓存
 export function runAllStrategies() {
   if (state.simRunning) return;
-  if (state.workloadSource === 'replay') {
-    setSimulationStatus('Replay 仅支持单策略 simulation 任务，请使用运行当前策略。', true);
-    return;
-  }
   return runSelectedStrategies(state.savedStrategies.length > 0 ? state.savedStrategies : [getCurrentStrategy()]);
 }
 
@@ -202,6 +201,18 @@ function renderReplayResult() {
   parent.replaceChildren();
   parent.hidden = !report;
   if (!report) return;
+  for (const result of state.simResults) {
+    const container = document.createElement('details');
+    container.open = state.simResults.length === 1;
+    const heading = document.createElement('summary');
+    heading.textContent = result.replay.configuration.strategy.name + (result.truncated || result.replay.state.truncated ? ' · 已截断' : '');
+    container.append(heading);
+    parent.append(container);
+    renderReplayReport(container, result.replay);
+  }
+}
+
+function renderReplayReport(parent, report) {
   const { configuration: config, source, counts, state: status, samples } = report;
   const measurement = report.windows.measurement;
   section(parent, '本次实际执行配置', [
@@ -247,7 +258,8 @@ function renderReplayResult() {
 function downloadReplayResult() {
   const result = state.simResults[0];
   if (!state.simInput || !result?.replay) return;
-  const url = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: 'application/json;charset=utf-8' }));
+  const payload = state.simResults.length === 1 ? result : state.simResults;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
   const link = document.createElement('a');
   link.href = url;
   link.download = `replay-result-seed-${result.replay.configuration.seed}.json`;

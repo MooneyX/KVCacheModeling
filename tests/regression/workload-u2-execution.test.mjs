@@ -342,11 +342,15 @@ test('U2: zero-output prefill uses the independent 64 * 1000us oracle and remove
   assert.equal(req.completeTime, req.prefillEnd); assert.equal(run.summary.cache.outputPages, 0);
   assert.ok(!run.events.some(event => event.type === 'decodeStart' || event.type === 'output'));
   const bundle = bundleOf([origin(64)]);
-  const legacy = runSimulation(common, base.strategy, { seed: 42, qps: 2, simMaxTime: 7.8, replay: { bundle, options } });
-  const admission = Math.ceil(run.first / 0.002) * 0.002;
-  close(legacy.timeline[0].prefillStart, admission + 0.002);
-  close(legacy.timeline[0].completeTime, Math.ceil((admission + 0.002 + 0.064) / 0.002) * 0.002);
-  assert.ok(legacy.timeline[0].completeTime > req.completeTime);
+  const production = runSimulation(common, base.strategy, { seed: 42, qps: 2, simMaxTime: 7.8, replay: { bundle, options } });
+  assert.deepEqual(production, run.result);
+  close(production.timeline[0].prefillStart, run.first);
+  close(production.timeline[0].completeTime, run.first + 0.064);
+  const legacyAdmission = Math.ceil(run.first / 0.002) * 0.002;
+  const legacyPrefillStart = legacyAdmission + 0.002;
+  const legacyCompleteTime = Math.ceil((legacyPrefillStart + 0.064) / 0.002) * 0.002;
+  assert.ok(legacyPrefillStart > production.timeline[0].prefillStart);
+  assert.ok(legacyCompleteTime > req.completeTime, 'U5 removes the independently calculated legacy admission/settlement ticks');
 });
 
 test('U2: same-time completion successors see published pages before admission', () => {
@@ -402,19 +406,27 @@ test('U2: unresolved dependencies without executable work or future events fail 
   }), /unresolved anchors/);
 });
 
-test('U2: restricted development scope rejects unsupported topology and does not change the production entry', () => {
-  assert.throws(() => runWorkloadAcceptance(common, base.strategy, { blockSize: 48 }), /blockSize|physical|64/);
-  for (const overrides of [{ instances: 0 }, { instances: 1.5 }, { instances: common.gpus + 1 }]) {
-    assert.throws(() => runWorkloadAcceptance(common, base.strategy, overrides), /U4\.2 acceptance requires/);
-  }
-  for (const overrides of [{ pdSep: true }, { pdMode: 1 }, { ...pdParams, pdPrefillGpus: 0 },
-    { ...pdParams, pdPrefillGpus: common.gpus }, { ...pdParams, pdLinkBW: 0 }, { ...pdParams, pdLinkUtil: 2 }]) {
-    assert.throws(() => runWorkloadAcceptance(common, base.strategy, overrides), /U4\.3 acceptance/);
-  }
+test('U5: production accepts validated topology and shares unsupported-configuration guards with acceptance', () => {
   for (const execute of [runSimulation, runWorkloadAcceptance]) {
+    assert.throws(() => execute(common, base.strategy, { blockSize: 48 }), /blockSize|physical|64/);
+    for (const overrides of [{ instances: 0 }, { instances: 1.5 }, { instances: common.gpus + 1 }]) {
+      assert.throws(() => execute(common, base.strategy, overrides), /U4\.2 acceptance requires/);
+    }
+    for (const overrides of [{ ...pdParams, pdPrefillGpus: 0 }, { ...pdParams, pdPrefillGpus: common.gpus },
+      { ...pdParams, pdLinkBW: 0 }, { ...pdParams, pdLinkUtil: 2 }]) {
+      assert.throws(() => execute(common, base.strategy, overrides), /U4\.3 acceptance/);
+    }
+    for (const pdMode of [-1, 3]) assert.throws(() => execute(common, base.strategy, { pdMode }), /supported P\/D mode/);
     assert.throws(() => execute(common, base.strategy, { instances: 2, ...pdParams }), /Multiple instances.*P\/D/);
   }
   const overrides = { nreq: 1, inputLen: 64, outputLen: 64, prefixHit: 0, prefixWarm: false };
+  for (const topology of [{ pdSep: true }, { pdMode: 1 }, { blockSize: 16 }, { blockSize: 32 }, { blockSize: 128 }, { instances: 2 }, pdParams]) {
+    const applied = { ...overrides, ...topology };
+    const production = runSimulation(common, base.strategy, applied);
+    assert.deepEqual(production, runWorkloadAcceptance(common, base.strategy, applied));
+    assert.equal(production.completed, 1); assert.equal(production.decodeTokensTotal, 64);
+    assert.deepEqual(production.hitTok, { l1: 0, l2: 0, l3: 0, miss: 64, total: 64 });
+  }
   const ordinary = runSimulation(common, base.strategy, overrides);
   const attempted = runSimulation(common, base.strategy, { ...overrides,
     unified: true, acceptance: { window: { hardCutoff: 0 } }, workloadModelVersion: WORKLOAD_MODEL_VERSION });

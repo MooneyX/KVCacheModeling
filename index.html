@@ -214,9 +214,9 @@
         <div><label for="replayWarmup">暖机时长 W（秒）</label><input id="replayWarmup" type="number" min="0" step="any" value="0"></div>
         <div><label for="replayDrain">排空上限 D（秒）</label><input id="replayDrain" type="number" min="0" step="any" value="600"></div>
       </div>
-      <p class="subtitle">仅支持单计算实例（8 张 GPU 不等于 8 个实例）、DSL、非物理 P/D 分离。必须手动将共享 Block Size 设置为 64-token 页，不会自动覆盖共享配置；到达模型固定 closed，超级块关闭。</p>
-      <p class="subtitle">[0,T) 按泊松过程投放 session，T 后继续已投放 session，最迟 T+D 停止；并非把模板池完整回放一遍。仅支持 HBM 连续前缀缓存且容量充足的运行；低 QPS 不保证容量安全，不支持 L2/L3 回读及容量恢复。输出身份 unmapped，完成依赖为推断所得；稳定性和理想缓存未评估。</p>
-      <p class="subtitle">仅接受已构建 bundle，不接受原始 trace、构建报告或配置文件。旧参数导入导出不包含 Replay 数据；上传内容不持久化，刷新后需重新选择。整任务体及实际运行仍受服务端限额约束。</p>
+      <p class="subtitle">仅支持 DSL；物理页为 64 的正整数因子或倍数，支持多实例或单实例物理 P/D 分离（二者不可叠加）。支持分层缓存、容量恢复和 none / best_effort / timeout / race 预取；到达模型固定 closed，超级块关闭。</p>
+      <p class="subtitle">[0,T) 按泊松过程投放 session，T 后继续已投放 session，最迟 T+D 停止；并非把模板池完整回放一遍。同 bundle、seed 和投放参数固定 session 计划，completion 后继的实际到达仍受策略执行影响。输出身份 unmapped，完成依赖为推断所得；小页共享保守，输入/输出尾页分别取整，稳定性和理想缓存未评估。</p>
+      <p class="subtitle">支持当前/全部策略、目标 QPS 与硬件/策略扫描和交叉分析；不支持输入长度、前缀命中、预热、请求数等合成生成维度。配置导出仅含实验设置和 bundle 摘要，导入后需重选核验数据，不是独立可复现包。上传内容不持久化；文件、任务体、请求数、墙钟、页数及结果预算保持服务端限制，超限明确失败。</p>
       <p id="replayStatus" role="status" aria-live="polite">请选择 Replay bundle。</p>
     </section>
     <h3 style="font-size:.82rem;color:var(--accent);margin:14px 0 8px">共享推理与系统设置</h3>
@@ -432,7 +432,7 @@
       </select></div>
       <div><label>对比档位(起,止,步长)</label><input id="sSweepCompare" value="" placeholder="如 0,100,20" style="width:110px"></div>
       <div style="flex:2"><label style="text-transform:none;letter-spacing:0">③ 形状维度</label>
-        <div style="display:flex;align-items:center;gap:10px;height:29px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:10px;min-height:29px;flex-wrap:wrap">
           <select id="sShapeDim" style="width:104px" title="形状维度绑定对象(2026-08-27 开放为任意参数)。&#10;预取策略: 勾选下方 3 个策略(默认, 与历史行为一致)&#10;其他任意参数: 形状=该参数的不同档位, 档位在右侧填写&#10;⚠️ 横轴/颜色/形状必须绑不同参数, 冲突时形状自动降级为预取策略">
             <option value="prefetch">预取策略</option>
             <option value="gpu_preset">GPU硬件</option>
@@ -445,13 +445,20 @@
           <span id="sShapePfBox" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
             <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfWait" checked style="margin-right:4px">wait_complete</label>
             <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfBest" checked style="margin-right:4px">best_effort</label>
+            <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfTimeout" style="margin-right:4px">timeout</label>
             <label style="margin:0;font-size:.72rem;color:var(--text-dim);white-space:nowrap;text-transform:none;letter-spacing:0"><input type="checkbox" id="sPfRace" checked style="margin-right:4px">race</label>
           </span>
           <input id="sShapeVals" value="h20x8,b300x8" style="width:150px;display:none" placeholder="如 h20x8,b300x8" title="形状维度的档位列表。&#10;GPU硬件: 预设 key 逗号分隔(h20x8 h100x8 a100x8 b200x8 b300x8 a950pr8 a950dt8 klxp800x8 klxp900x32)&#10;数值参数: 逗号列表(如 2048,8192,32768)或「起,止,步长」&#10;留空则用该参数的默认档位">
         </div>
       </div>
       <div><label>④ 观察指标(纵轴)</label><select id="sSweepMetric">
-        <option value="hit_rate">HBM命中率(%)</option><option value="prefix_hit_rate">前缀命中率实测(%)</option><option value="latency">平均延迟(ms)</option><option value="latency_p50">延迟P50(ms)</option><option value="p99_latency">延迟P99(ms)</option>
+        <optgroup label="Replay measurement 测量窗口">
+          <option value="measurement_arrival_qps">measurement 到达QPS</option><option value="measurement_completion_qps">measurement 完成QPS</option>
+          <option value="measurement_ttft">measurement 平均TTFT(ms)</option><option value="measurement_ttft_p50">measurement TTFT P50(ms)</option><option value="measurement_ttft_p99">measurement TTFT P99(ms)</option>
+          <option value="measurement_tpot">measurement 平均TPOT(ms/tok)</option><option value="measurement_tpot_p50">measurement TPOT P50(ms/tok)</option><option value="measurement_tpot_p99">measurement TPOT P99(ms/tok)</option>
+          <option value="measurement_latency">measurement 平均延迟(ms)</option><option value="measurement_latency_p50">measurement 延迟P50(ms)</option><option value="measurement_latency_p99">measurement 延迟P99(ms)</option><option value="measurement_hit_rate">measurement 前缀命中率(%)</option>
+        </optgroup>
+        <option value="hit_rate" selected>HBM命中率(%)</option><option value="prefix_hit_rate">前缀命中率实测(%)</option><option value="latency">平均延迟(ms)</option><option value="latency_p50">延迟P50(ms)</option><option value="p99_latency">延迟P99(ms)</option>
         <option value="ttft">平均TTFT(ms)</option><option value="ttft_p50">TTFT P50(ms)</option><option value="ttft_p99">TTFT P99(ms)</option>
         <option value="tpot">平均TPOT(ms/tok)</option><option value="tpot_p50">TPOT P50(ms/tok)</option><option value="tpot_p99">TPOT P99(ms/tok)</option>
         <option value="throughput">吞吐(tok/s)</option><option value="mem_util">显存利用率峰值(%)</option>
@@ -468,7 +475,7 @@
       <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn" id="btnRunSens" onclick="runSensitivity()">📈 运行敏感性分析</button></div>
     </div>
     <div id="sensitivityStatus" role="status" class="progress-note" hidden></div>
-    <p class="subtitle">下方保留最近一次合成负载扫描结果，与上方单次运行结果独立；切换输入不重新计算。</p>
+    <p class="subtitle">下方保留最近一次成功扫描结果，与上方单次运行结果独立；切换输入不重新计算，失败/取消保留旧结果。Replay measurement 指标有明确前缀，吞吐和 TTFT 分解仍为全程口径。</p>
     <div id="chartSensitivity" class="chart-container"></div>
     <!-- 图表导出(2026-08-25): 出图后才可用, 故初始 disabled, 由 setSensExportEnabled 解锁 -->
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px">
@@ -548,8 +555,8 @@
 <!-- ====== TAB 4: 交叉分析 ====== -->
 <div class="tab-panel" id="tab-cross">
   <div class="card">
-    <h2><span>策略×并发</span> 延迟热力图</h2>
-    <p class="subtitle">最近一次合成负载交叉分析：每个格子是不同Eviction策略在不同并发水平下的P99延迟(ms)，与单次运行结果独立</p>
+    <h2><span>策略×负载</span> 延迟热力图</h2>
+    <p class="subtitle">保留最近一次成功交叉分析：合成负载横轴为并发，Replay 横轴为目标 QPS、延迟为 measurement P99；实际到达/完成 QPS 和失败/截断状态见 tooltip。与单次运行独立，失败/取消保留旧结果。</p>
     <button class="btn" id="btnRunCross" onclick="runCrossAnalysis()" style="font-size:.85rem;margin-bottom:8px">按需运行交叉分析</button>
     <div id="crossStatus" role="status" class="progress-note" hidden></div>
     <div id="chartHeatmap" class="chart-tall"></div>
@@ -557,7 +564,7 @@
   </div>
   <div class="card">
     <h2><span>策略综合对比</span> 雷达图</h2>
-    <p class="subtitle">六维评分全部来自仿真结果归一化：吞吐、延迟、利用率、碎片、公平性</p>
+    <p class="subtitle">合成负载沿用六维归一化；Replay 仅比较全程输出吞吐、measurement 完成QPS及P50/P99延迟。碎片、公平性和理想缓存不作 Replay 评分，HBM占用不等同效率。</p>
     <div id="chartRadar" class="chart-container"></div>
     <div class="formula-box" id="formulaRadar"></div>
   </div>

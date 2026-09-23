@@ -2,6 +2,7 @@ import { state } from "./state.js";
 import { $ } from "../adapters/browser/dom.js";
 import { strategyPresetsJS, strategyPresets } from "../core/presets.js";
 import { parseDSL, autoNameStrategy, dslToText } from "../core/strategy.js";
+import { updateRunControls } from './replay.js';
 
 
 
@@ -42,6 +43,7 @@ export function switchMode(mode) {
       '<code>BATCH: continuous max(8)</code><br>'+
       '<code>PLACE: hbm_first</code>';
   }
+  if ($('replayPanel')) updateRunControls();
 }
 
 

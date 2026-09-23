@@ -7,6 +7,9 @@ export type SimulationParams = ReturnType<typeof readParams>;
 export type SimulationStrategy = ReturnType<typeof parseDSL>;
 export type SimulationResult = ReturnType<typeof runSimulation>;
 export type SensitivityMetrics = ReturnType<typeof extractSensMetrics>;
+export type MeasurementMetricKey = Extract<keyof SensitivityMetrics, `measurement_${string}`>;
+export type SimulationConfiguration = SimulationResult['configuration'];
+export type WorkloadSource = 'synthetic' | 'replay';
 export type StrategyMode = 'dsl' | 'js';
 export type SimulationOverrides = Partial<SimulationParams> & {
   seed?: number;

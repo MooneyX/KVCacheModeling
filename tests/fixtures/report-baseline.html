@@ -58,6 +58,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
 </style></head><body><div class="wrap">
 <h1>参数<span>敏感性</span>分析</h1>
 <p class="sub">横轴：L3聚合带宽 ｜ 纵轴：<span id="dimY">平均TTFT(ms)</span><br>基准策略 <b>WC</b> · 随机种子  · 导出于 2026/9/17 08:00:00</p>
+<div class="card"><div class="box"><b>指标口径</b><br>throughput 为全程输出 token/s；TTFT 分解为全程口径。measurement_* 仅采用 measurement 窗口；Replay 延迟按到达窗口归属，完成 QPS 按完成事件归窗。无样本显示“—”，失败或截断不记为零延迟最优点。</div></div>
 <div class="card">
 <div class="mbar"><label>纵轴指标</label><select id="mSel"><option value="ttft" selected>平均TTFT(ms)</option><option value="throughput">吞吐(tok/s)</option></select>
 <span style="color:var(--border)">|</span>
@@ -70,8 +71,23 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
 <table id="tbl"><thead><tr><th>L3聚合带宽</th><th>WC</th></tr></thead><tbody><tr><td class="k">10GB/s</td><td>12</td></tr>
 <tr><td class="k">50GB/s</td><td>8</td></tr></tbody></table></div>
 <div class="card"><h2>🔧 参数配置<span id="pCount" style="font-size:.7rem;color:var(--text-dim);font-weight:400">共 0 项</span><button class="ptog" id="pJsonTog" style="margin-left:auto">{ } 原始 JSON</button></h2>
-<div id="pWrap"><div id="pJson">
-<p style="font-size:.71rem;color:var(--text-dim);margin:0 0 6px">可全选复制后粘回平台「导入参数」以复现本次扫描</p>
+<div id="pWrap"><div class="pgrp"><h3>负载来源与有效实验快照</h3><p>来源：synthetic · 状态：见快照</p><pre>{
+  &quot;source&quot;: &quot;synthetic&quot;,
+  &quot;bundleSummary&quot;: null,
+  &quot;configuration&quot;: null,
+  &quot;baselineConfiguration&quot;: null,
+  &quot;options&quot;: null,
+  &quot;windows&quot;: null,
+  &quot;state&quot;: null,
+  &quot;counts&quot;: null,
+  &quot;versions&quot;: {
+    &quot;engine&quot;: null
+  },
+  &quot;eligibleForComparison&quot;: null,
+  &quot;experiment&quot;: {}
+}</pre></div>
+<div id="pJson">
+<p style="font-size:.71rem;color:var(--text-dim);margin:0 0 6px">可全选复制后粘回平台「导入参数」恢复本次扫描参数。</p>
 <pre>{}</pre></div></div>
 </div>
 <p class="foot">由 KV Cache 建模分析平台导出 · 图表交互（tooltip / 图例开关 / 缩放 / 指标切换）需联网加载 echarts；离线时数据表仍完整可用</p>
@@ -109,9 +125,11 @@ OPT.tooltip.formatter = function(ps){
   if(!ps||!ps.length) return "";
   var h = "<div style=\"font-weight:600;margin-bottom:4px\">"+(ps[0].axisValueLabel||ps[0].name)+"</div>";
   if(CUR_IS_STACK){
-    var tot = 0; ps.forEach(function(p){ tot += (+p.value||0); });
+    var valid = ps.every(function(p){ return typeof p.value === "number" && isFinite(p.value); });
+    if(!valid) return h + "无完整样本（—）";
+    var tot = 0; ps.forEach(function(p){ tot += p.value; });
     ps.forEach(function(p){
-      var v = +p.value||0, pct = tot>0 ? (100*v/tot) : 0;
+      var v = p.value, pct = tot>0 ? (100*v/tot) : 0;
       h += "<div style=\"display:flex;align-items:center;line-height:18px\">"
         + "<span style=\"display:inline-block;width:9px;height:9px;border-radius:2px;background:"+p.color+";margin-right:6px;flex:none\"></span>"
         + "<span style=\"color:#9ca0b0;margin-right:10px\">"+p.seriesName+"</span>"
@@ -127,7 +145,7 @@ OPT.tooltip.formatter = function(ps){
     var sym = (OPT.series[p.seriesIndex]&&OPT.series[p.seriesIndex].symbol)||"circle";
     h += "<div style=\"display:flex;align-items:center;line-height:18px\">"+symbolMarker(sym,p.color)
       + "<span style=\"color:#9ca0b0;margin-right:8px\">"+p.seriesName+"</span>"
-      + "<span style=\"margin-left:auto;color:#9ca0b0\">"+p.value+"</span></div>";
+      + "<span style=\"margin-left:auto;color:#9ca0b0\">"+(p.value==null?"—":p.value)+"</span></div>";
   });
   return h;
 };
@@ -178,8 +196,8 @@ function renderTable(){
     th.innerHTML = "<tr><th>场景</th>" + STACK_PARTS.map(function(p){ return "<th>"+esc2(p.label)+"</th>"; }).join("") + "<th>TTFT合计</th></tr>";
     tb.innerHTML = sIdx.map(function(i){
       return "<tr><td class=\"k\">"+esc2(sceneLabelAt(i))+"</td>"
-        + STACK_PARTS.map(function(p){ return "<td>"+esc2((STACK_DATA[p.key]||[])[i])+"</td>"; }).join("")
-        + "<td><b>"+esc2(STACK_TOTALS[i])+"</b></td></tr>";
+        + STACK_PARTS.map(function(p){ var v=(STACK_DATA[p.key]||[])[i]; return "<td>"+esc2(v==null?"—":v)+"</td>"; }).join("")
+        + "<td><b>"+esc2(STACK_TOTALS[i]==null?"—":STACK_TOTALS[i])+"</b></td></tr>";
     }).join("");
     return;
   }
@@ -190,7 +208,7 @@ function renderTable(){
     + keepC.map(function(ci){ return "<th>"+esc2(IS_MULTI ? LINE_TPL[ci].name : lb)+"</th>"; }).join("") + "</tr>";
   tb.innerHTML = keepX.map(function(xi){
     return "<tr><td class=\"k\">"+esc2(LINE_LABELS[xi])+"</td>"
-      + keepC.map(function(ci){ var v=(cols[ci]||[])[xi]; return "<td>"+esc2(v!=null?v:"")+"</td>"; }).join("") + "</tr>";
+      + keepC.map(function(ci){ var v=(cols[ci]||[])[xi]; return "<td>"+esc2(v!=null?v:"—")+"</td>"; }).join("") + "</tr>";
   }).join("");
 }
 function buildStackSeries(){
@@ -203,7 +221,7 @@ function buildStackSeries(){
   });
   if(ss.length){ ss[ss.length-1].label = {show: sIdx.length<=24, position:"top",
     color:"#e4e4e7", fontSize:9, fontWeight:600, formatter:function(p){
-      var t = STACK_TOTALS[sIdx[p.dataIndex]]||0;
+      var t = STACK_TOTALS[sIdx[p.dataIndex]]; if(t==null) return "";
       return t>=10000 ? (t/1000).toFixed(1)+"s" : t.toFixed(0); }}; }
   return ss;
 }
@@ -306,9 +324,9 @@ var PIVOT_IDX = {};
 var PIVOT_DIMS = [];
 var HAS_PIVOT = false;
 var SNAP_META = [{"title":"L3聚合带宽 → 平均TTFT(ms)","x":"ssd_bw","cmp":null,"shape":null,"metric":"ttft","at":"2026/9/17 08:00:00","n":0,"sig":[]}];
-var SNAP_PARAMS_HTML = [{"html":"<div id=\"pJson\">\n<p style=\"font-size:.71rem;color:var(--text-dim);margin:0 0 6px\">可全选复制后粘回平台「导入参数」以复现本次扫描<\/p>\n<pre>{}<\/pre><\/div>","count":"共 0 项"}];
+var SNAP_PARAMS_HTML = [{"html":"<div class=\"pgrp\"><h3>负载来源与有效实验快照<\/h3><p>来源：synthetic · 状态：见快照<\/p><pre>{\n  &quot;source&quot;: &quot;synthetic&quot;,\n  &quot;bundleSummary&quot;: null,\n  &quot;configuration&quot;: null,\n  &quot;baselineConfiguration&quot;: null,\n  &quot;options&quot;: null,\n  &quot;windows&quot;: null,\n  &quot;state&quot;: null,\n  &quot;counts&quot;: null,\n  &quot;versions&quot;: {\n    &quot;engine&quot;: null\n  },\n  &quot;eligibleForComparison&quot;: null,\n  &quot;experiment&quot;: {}\n}<\/pre><\/div>\n<div id=\"pJson\">\n<p style=\"font-size:.71rem;color:var(--text-dim);margin:0 0 6px\">可全选复制后粘回平台「导入参数」恢复本次扫描参数。<\/p>\n<pre>{}<\/pre><\/div>","count":"共 0 项"}];
 var PV_HINT = "0 个参数组合 —— 改动任一项即按所选角色重绘";
-var PV_ON = false;
+var PV_ON = false, PV_SNAPSHOT = null;
 var PV_SEL = {};
 var PV_ROLE = {x:null,c:null,s:null};
 var PV_PALETTE = ["#6c63ff","#f59e0b","#10b981","#ef4444","#06b6d4","#8b5cf6","#84cc16"];
@@ -319,6 +337,7 @@ function pvProject(){
   var keep = [];
   for(var i=0;i<PIVOT_PTS.length;i++){
     var pt = PIVOT_PTS[i], ok = true;
+    if(PV_SNAPSHOT!==null && (pt.snapshots||[pt.s]).indexOf(PV_SNAPSHOT)<0) continue;
     for(var k in PV_SEL){
       var idx = PIVOT_IDX[k]; if(!idx) continue;
       var v = pt.p[k]; if(v===undefined) continue;
@@ -335,8 +354,8 @@ function pvProject(){
   var groups = {}, order = [];
   keep.forEach(function(pt){
     var cv = kc ? pt.p[kc] : "", sv = ks ? pt.p[ks] : "";
-    var gk = String(cv)+"\u0001"+String(sv);
-    if(!groups[gk]){ groups[gk] = {cv:cv, sv:sv, byX:{}}; order.push(gk); }
+    var gk = JSON.stringify([pt.g, cv, sv]);
+    if(!groups[gk]){ groups[gk] = {cv:cv, sv:sv, group:pt.g, batch:pt.s, byX:{}}; order.push(gk); }
     var xk = String(pt.p[kx]);
     if(!groups[gk].byX[xk]) groups[gk].byX[xk] = [];
     groups[gk].byX[xk].push(pt.r);
@@ -415,9 +434,9 @@ function pvBuildStack(proj){
   });
   var totals = sceneRecs.map(function(recs){
     if(recs===null) return null;
-    var t = 0, any = false;
-    STACK_PARTS.forEach(function(p){ var v = pvMetricVal(recs, p.key); if(v!=null){ t += v; any = true; } });
-    return any ? +t.toFixed(1) : null;
+    var t = 0, complete = STACK_PARTS.length > 0;
+    STACK_PARTS.forEach(function(p){ var v = pvMetricVal(recs, p.key); if(v==null) complete=false; else t+=v; });
+    return complete ? +t.toFixed(1) : null;
   });
   var ss = STACK_PARTS.map(function(p){
     return {name:p.label, type:"bar", stack:"ttft", barMaxWidth:48,
@@ -565,7 +584,7 @@ function pvAutoAssign(){
   }
 }
 function pvToggle(on){
-  PV_ON = !!on;
+  PV_ON = !!on; if(!PV_ON) PV_SNAPSHOT = null;
   var bar = document.getElementById("fbar");
   if(bar) bar.className = "fbar" + (PV_ON ? " live" : "");
   var rb = document.getElementById("pvReset"); if(rb) rb.style.display = PV_ON ? "" : "none";

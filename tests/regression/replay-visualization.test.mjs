@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { runSimulation } from '../../src/core/simulation.js';
+import { runSimulation, runWorkloadAcceptance, WORKLOAD_MODEL_VERSION } from '../../src/core/simulation.js';
 import { DEFAULT_REPLAY_RUN_LIMITS } from '../../src/core/replay.js';
 import { visualizationCases, numericalResult } from '../fixtures/replay-visualization.mjs';
 
@@ -23,7 +23,7 @@ const result = name => {
   if (!results.has(name)) results.set(name, execute(visualizationCases[name]));
   return results.get(name);
 };
-const rowKeys = ['id', 'templateIndex', 'launchIndex', 'requestIndex', 'arrive', 'admitTime', 'prefillStart', 'prefillEnd', 'completeTime', 'state'];
+const rowKeys = ['id', 'templateIndex', 'launchIndex', 'requestIndex', 'arrive', 'admitTime', 'prefillStart', 'prefillEnd', 'firstTokenTime', 'decodeStart', 'completeTime', 'state'];
 
 function assertCoverage(r) {
   const counts = r.replay.counts;
@@ -36,7 +36,7 @@ function assertCoverage(r) {
   assert.equal(new Set(rows.map(row => `${row.launchIndex}:${row.requestIndex}`)).size, rows.length);
   for (const row of rows) {
     assert.deepEqual(Object.keys(row).sort(), [...rowKeys, ...(row.state === 'failed' ? ['failedAt', 'reason'] : [])].sort());
-    const times = ['arrive', 'admitTime', 'prefillStart', 'prefillEnd', 'completeTime'].map(key => row[key]);
+    const times = ['arrive', 'admitTime', 'prefillStart', 'prefillEnd', 'firstTokenTime', 'decodeStart', 'completeTime'].map(key => row[key]);
     let previous = 0;
     for (const time of times) {
       if (time === null) continue;
@@ -60,10 +60,18 @@ function assertCoverage(r) {
 }
 
 for (const name of Object.keys(visualizationCases)) {
-  test(`V2: ${name} preserves pre-V2 numerical results and covers every arrived request`, () => {
+  test(`U5: ${name} matches the accepted numerical model and covers every arrived request`, () => {
     const job = visualizationCases[name], before = JSON.stringify(job);
     const r = result(name);
-    assert.equal(createHash('sha256').update(JSON.stringify(numericalResult(r))).digest('hex'), baselines[name]);
+    const accepted = runWorkloadAcceptance(job.params, job.strategy, job.overrides);
+    assert.deepEqual(r, accepted);
+    const fingerprint = value => createHash('sha256').update(JSON.stringify(numericalResult(value))).digest('hex');
+    assert.equal(fingerprint(r), fingerprint(accepted));
+    assert.notEqual(fingerprint(r), baselines[name], 'V1 predates continuous event settlement, finite pages, and full-window residency');
+    assert.equal(r.configuration.workloadModelVersion, WORKLOAD_MODEL_VERSION);
+    assert.equal(r.configuration.capabilities.finiteCapacity, true);
+    assert.equal(r.replay.counts.arrived, r.replay.counts.successful + r.replay.counts.failed + r.replay.counts.arrivedUnfinished);
+    assert.equal(r.hitTok.total, r.hitTok.l1 + r.hitTok.l2 + r.hitTok.l3 + r.hitTok.miss);
     assert.equal(JSON.stringify(job), before);
     assertCoverage(r);
   });
@@ -121,6 +129,18 @@ test('V2: active sampling continues past 20000 points at 10ms and ends at the ex
   assert.equal(legacy.concurrencySampleIntervalSeconds, 0.01);
   assert.deepEqual(legacy.concurrencyCoverage, [0, r.simEnd]);
   assert.equal(legacy.residentMaxSeriesSamples, 20_000);
+  assert.equal(legacy.residentSampling, 'time-weighted-full-window-buckets');
+  assert.deepEqual(legacy.residentCoverage, [0, r.simEnd]);
+  assert.equal(r.seriesCoverage.resident.maxSamples, 20_000);
+  assert.equal(r.seriesCoverage.resident.start, 0); assert.equal(r.seriesCoverage.resident.end, r.simEnd);
+  for (const samples of [r.l2Series, r.l3Series]) {
+    assert.equal(samples[0][0], 0); assert.equal(samples.at(-1)[0], r.simEnd);
+    assert.ok(samples.some(([time]) => time > 201 && time < r.simEnd));
+    for (let i = 1; i < samples.length; i++) {
+      assert.ok(samples[i][0] > samples[i - 1][0]);
+      assert.ok(Number.isFinite(samples[i][1]) && samples[i][1] >= 0);
+    }
+  }
   assert.equal(legacy.bandwidthSampling, 'first-20000-decode-steps');
 });
 

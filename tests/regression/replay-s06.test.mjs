@@ -111,8 +111,13 @@ test('S06: synthetic-only knobs are bypassed, inputs immutable and successive ru
   assert.equal(JSON.stringify({ bundle, base }), before);
 });
 
-test('S06: unsupported configurations and malformed runtime options fail explicitly', () => {
-  for (const overrides of [{ instances: 2 }, { blockSize: 32 }, { qps: 0 }, { simMaxTime: -1 }, { pdMode: 2 }]) assert.throws(() => run(bundle, overrides));
+test('U5: accepted topologies run and unsupported configurations or runtime options fail explicitly', () => {
+  for (const overrides of [{ instances: 2 }, { blockSize: 32 }, { pdMode: 2 }]) {
+    const result = run(bundle, overrides);
+    assert.equal(result.replay.counts.successful, bundle.sessions[0].req.length);
+    assert.equal(result.replay.counts.failed, 0);
+  }
+  for (const overrides of [{ instances: 2, pdMode: 2 }, { blockSize: 48 }, { qps: 0 }, { simMaxTime: -1 }, { blockSize: 1.5 }]) assert.throws(() => run(bundle, overrides));
   for (const opts of [{ ...options, superblocks: true }, { ...options, arrivalModel: 'open' }, { durationSeconds: 1 }, { durationSeconds: 1, warmupSeconds: 1 }, { ...options, extra: 1 }]) {
     assert.throws(() => validateReplayOverride({ bundle, options: opts }));
   }

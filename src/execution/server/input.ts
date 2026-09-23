@@ -37,10 +37,6 @@ export function validateSubmission(value: unknown, config: ServerConfig): TaskSu
       if (!Number.isSafeInteger(batch) || batch < 1) throw new Error('Invalid batch size.');
       const replay = job.overrides?.replay;
       if (replay) {
-        if (data.kind !== 'simulation' || data.jobs.length !== 1) throw new Error('Replay requires a single simulation job; scan and batch are not supported.');
-        if (p.instances !== 1) throw new Error('Replay requires a single instance.');
-        if (p.blockSize !== 64) throw new Error('Replay requires 64-token pages.');
-        if (p.pdMode === 2) throw new Error('Replay does not support separate physical P/D pools (pdMode=2).');
         if (!Number.isFinite(p.qps) || p.qps <= 0) throw new Error('Replay QPS must be a finite positive number.');
         if (!Number.isInteger(p.seed) || p.seed < 0 || p.seed > 0xffffffff) throw new Error('Replay seed must be a uint32 integer.');
         if (!Number.isFinite(p.simMaxTime) || p.simMaxTime < 0) throw new Error('Replay simMaxTime must be finite nonnegative drain seconds.');

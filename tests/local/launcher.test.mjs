@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { readFileSync, rmSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseOptions, startLocal } from '../../scripts/local.mjs';
+import { runSimulation, WORKLOAD_MODEL_VERSION } from '../../src/core/simulation.js';
 
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/simulation-baseline.json', import.meta.url), 'utf8'))[0];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -45,7 +46,8 @@ test('local deployment and Vite development both run server tasks and release po
       }
       assert.equal(task.status, 'completed', task.error);
       const download = await (await fetch(app.url + '/api/tasks/' + taskId + '/download', { headers: { Cookie: cookie } })).json();
-      assert.equal(download.points[0].result.avgTtft, fixture.summary.avgTtft);
+      assert.equal(download.points[0].result.configuration.workloadModelVersion, WORKLOAD_MODEL_VERSION);
+      assert.deepEqual(download.points[0].result, JSON.parse(JSON.stringify(runSimulation(fixture.params, fixture.strategy, fixture.overrides, fixture.mode))));
       assert.ok(existsSync(resolve('.runtime/local/tasks', taskId, 'meta.json')));
     } finally {
       if (app) { await app.stop(); rmSync(app.logfile, { force: true }); }
