@@ -199,7 +199,7 @@ export function createSyntheticRuntime(p, overrides, rng, prefixGroupMap = {}, a
       counters.successful++;
       if (!req.followUp && !p.singleBatch && p.multiTurn > 0 && rng() < p.multiTurn) {
         const retainIds = adapters.retainedBlocks?.(req) || [];
-        if (retainIds.length > 0) {
+        if (!adapters.retainedBlocks || retainIds.length > 0) {
           const id = N + counters.followUps++;
           const arrive = time + 1 + rng() * 4;
           const inputLen = Math.round(req.inputLen * (1.1 + 0.3 * rng()));
@@ -209,7 +209,7 @@ export function createSyntheticRuntime(p, overrides, rng, prefixGroupMap = {}, a
             sessionId: req.sessionId, routingKey: req.routingKey,
           });
           const outputTokens = Math.min(req.outputLen, Math.max(0, Math.floor(req.tokensGen)));
-          const history = req.inputContent.concat(outputTokens > 0 ? [{ ...req.outputIdentity, tokens: outputTokens }] : []);
+          const history = [...req.inputContent, ...(outputTokens > 0 ? [{ ...req.outputIdentity, tokens: outputTokens }] : [])];
           setSyntheticContent(followUp, history);
           pending.push(followUp);
           pending.sort((a, b) => a.arrive - b.arrive);

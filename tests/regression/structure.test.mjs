@@ -30,7 +30,9 @@ test('synthetic sampling and grouping remain token-identical behind the shared s
   const source = read('../../src/core/simulation.js');
   const engine = parse(source, { ecmaVersion: 'latest', sourceType: 'module' }).body.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.id?.name === 'runSimulation');
   assert.equal(engine.declaration.params.length, 4);
-  assert.match(source, /const source = replay \|\| createSyntheticRuntime\(p, overrides, rng, prefixGroupMap,/);
+  assert.match(source, /let source = replay \|\| createSyntheticRuntime\(p, overrides, rng, prefixGroupMap, unified \? \{\} :/);
+  assert.match(source, /return simulate\(params, strategy, overrides, strategyMode, null\)/);
+  assert.match(source, /if \(acceptance\?\.source\) source = acceptance\.source\(source\)/);
   assert.match(source, /createReplayRuntime\(overrides\.replay/);
   for (const call of ['drainEvents', 'complete', 'fail', 'counts']) assert.ok(source.includes(`source.${call}(`));
   assert.match(source, /let _allDone = source\.done/);
