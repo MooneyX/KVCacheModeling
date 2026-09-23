@@ -1,7 +1,7 @@
 const TOKEN_KEYS = ['inputTokens', 'hitL1Tokens', 'hitL2Tokens', 'hitL3Tokens', 'missTokens'];
-const GAUGES = ['activeSessions', 'activeRequests', 'queuedRequests', 'hbmBytes', 'inputPages', 'outputPages'];
+const BASE_GAUGES = ['activeSessions', 'activeRequests', 'queuedRequests', 'hbmBytes', 'inputPages', 'outputPages'];
+const TIER_GAUGES = ['hbmResidentBytes', 'hbmReservedBytes', 'dramBytes', 'dramReservedBytes', 'ssdBytes', 'ssdReservedBytes'];
 const emptyTokens = () => Object.fromEntries(TOKEN_KEYS.map(key => [key, 0]));
-const emptyGauges = () => Object.fromEntries(GAUGES.map(key => [key, 0]));
 const ratio = (n, d) => d > 0 ? n / d : null;
 function distribution(values) {
   if (!values.length) return { count: 0, mean: null, p50: null, p99: null };
@@ -10,11 +10,14 @@ function distribution(values) {
     p50: sorted[Math.floor(sorted.length * 0.5)], p99: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.99))] };
 }
 
-export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup, hardCutoff, stats, seed, qps, lambdaSession, limits, configuration = {} }) {
+export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup, hardCutoff, stats, seed, qps, lambdaSession, limits, configuration = {}, finiteCapacity = false }) {
+  const GAUGES = finiteCapacity ? [...BASE_GAUGES, ...TIER_GAUGES] : BASE_GAUGES;
+  const emptyGauges = () => Object.fromEntries(GAUGES.map(key => [key, 0]));
   const width = Math.max(0.002, hardCutoff / 20_000);
   const windows = Object.fromEntries(['full', 'warmup', 'measurement', 'drain'].map(name => [name, {
     arrivals: 0, completions: 0, failed: 0, cancelled: 0, admitted: 0, successfulArrivals: 0, launches: 0,
     tokens: emptyTokens(), ttft: [], tpot: [], latency: [],
+    ...(finiteCapacity ? { retractCount: 0, recomputedTokens: 0 } : {}),
   }]));
   const buckets = new Map();
   const requests = [], launches = [];
@@ -99,7 +102,7 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
       bucket(req.completeTime).completions++;
       eachWindow(req.arrive, w => {
         w.successfulArrivals++;
-        w.ttft.push((req.prefillEnd - req.arrive) * 1000);
+        w.ttft.push(((req.firstTokenTime ?? req.prefillEnd) - req.arrive) * 1000);
         if (req.outputLen > 0) w.tpot.push((req.completeTime - req.decodeStart) / req.outputLen * 1000);
         w.latency.push((req.completeTime - req.arrive) * 1000);
       });
@@ -119,6 +122,19 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
       eachWindow(time, w => w.cancelled++);
       summary({ ...req, completeTime: time }, 'cancelled', 'anchor_unavailable');
     },
+    retract(req, time) {
+      if (!finiteCapacity || terminal.has(identity(req))) return;
+      if (!admitted.has(identity(req))) throw new Error('Replay metrics retraction before admission');
+      if (!Number.isFinite(time) || time < 0 || time > hardCutoff + 1e-9) throw new Error('Replay metrics retraction time invariant violated');
+      eachWindow(time, w => w.retractCount++);
+    },
+    recompute(req, tokens, time) {
+      if (!finiteCapacity || terminal.has(identity(req))) return;
+      if (!admitted.has(identity(req))) throw new Error('Replay metrics recomputation before admission');
+      if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error('Replay metrics recomputed token invariant violated');
+      if (!Number.isFinite(time) || time < 0 || time > hardCutoff + 1e-9) throw new Error('Replay metrics recomputation time invariant violated');
+      eachWindow(time, w => w.recomputedTokens += tokens);
+    },
     observe,
     finish(end, runtime) {
       observe(end, gauges);
@@ -132,7 +148,8 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
           unfinishedArrivals: w.arrivals - w.successfulArrivals - w.failed,
           failureFraction: ratio(w.failed, w.arrivals), unfinishedFraction: ratio(w.arrivals - w.successfulArrivals - w.failed, w.arrivals),
           unadmitted: w.arrivals - w.admitted,
-          cache: { ...tokens, hitRate: ratio(tokens.hitL1Tokens + tokens.hitL2Tokens + tokens.hitL3Tokens, tokens.inputTokens) },
+          cache: { ...tokens, hitRate: ratio(tokens.hitL1Tokens + tokens.hitL2Tokens + tokens.hitL3Tokens, tokens.inputTokens),
+            ...(finiteCapacity ? { recomputedTokens: w.recomputedTokens } : {}) },
           latency: { unit: 'ms', ttft: distribution(ttft), tpot: distribution(tpot), endToEnd: distribution(latency) } };
       }
       const series = [...buckets.values()].sort((a, b) => a.index - b.index).map(b => {
@@ -149,10 +166,12 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
           requestCoverage: { total: counts.successful + counts.failed + counts.cancelled, sampled: requests.length, complete: counts.successful + counts.failed + counts.cancelled <= 320 },
           launchCoverage: { total: counts.launchedSessions, sampled: launches.length, complete: counts.launchedSessions <= 320 },
           timeWeightedMean: Object.fromEntries(GAUGES.map(key => [key, ratio(integral[key], end)])), peak },
-        state: { truncated: runtime.truncated, terminationReason: runtime.terminationReason, retractCount: 0,
+        state: { truncated: runtime.truncated, terminationReason: runtime.terminationReason, retractCount: finiteCapacity ? windows.full.retractCount : 0,
+          ...(finiteCapacity ? { recomputedTokens: windows.full.recomputedTokens } : {}),
           infeasible: runtime.infeasible, aborted: runtime.aborted, anchor_unavailable: runtime.anchor_unavailable,
           limits: { ...limits }, stability: 'not_evaluated', idealCache: 'not_evaluated', mainWindow: 'measurement',
-          latencyInterpretation: 'observed_window', completionDependencies: 'inferred', supportedScope: 'single-instance/64-token/HBM-capacity-sufficient' } };
+          latencyInterpretation: 'observed_window', completionDependencies: 'inferred',
+          supportedScope: finiteCapacity ? 'single-instance/64-token/finite-capacity-tiered-four-configurations' : 'single-instance/64-token/HBM-capacity-sufficient' } };
     },
   };
 }

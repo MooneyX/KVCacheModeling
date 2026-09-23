@@ -17,7 +17,7 @@ export function runWorkloadAcceptance(params, strategy, overrides, acceptance = 
   return simulate(params, strategy, overrides, 'dsl', acceptance);
 }
 
-export const WORKLOAD_MODEL_VERSION = 'workload-u2-64-hbm-v1';
+export const WORKLOAD_MODEL_VERSION = 'workload-u3-64-tiered-v1';
 
 function simulate(params, strategy, overrides, strategyMode, acceptance) {
   const unified = acceptance !== null;
@@ -112,9 +112,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     const bypassedParameters = ['inputLen', 'outputLen', 'lenDist', 'arrivalDist', 'concurrency', 'prefixHit', 'prefixWarm', 'prefixWarmL2', 'multiTurn', 'singleBatch', 'nreq'];
     const execution = Object.fromEntries(Object.entries(p).filter(([key]) => !bypassedParameters.includes(key)));
     replayMetrics = createReplayMetrics({ ...replay.options, hardCutoff: replay.options.durationSeconds + p.simMaxTime,
-      stats: replay.launcher.stats, seed: overrides.seed ?? p.seed, qps: p.qps,
+      stats: replay.launcher.stats, seed: overrides.seed ?? p.seed, qps: p.qps, finiteCapacity: unified,
       lambdaSession: replay.launcher.lambdaSession, limits: replay.launcher.limits,
-      configuration: { bundleVersion: 1, bundleDigest: createHash('sha256').update(JSON.stringify(overrides.replay.bundle)).digest('hex'),
+      configuration: { ...(unified ? { workloadModelVersion: WORKLOAD_MODEL_VERSION } : {}),
+        bundleVersion: 1, bundleDigest: createHash('sha256').update(JSON.stringify(overrides.replay.bundle)).digest('hex'),
         digestEncoding: 'JSON.stringify/sha256', blockMapping: { logical: 64, physical: p.blockSize }, execution, bypassedParameters,
         strategy: JSON.parse(JSON.stringify(strategy)) } });
   }
@@ -402,6 +403,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // 一条独立总线/一份单飞表。主循环通过 links / groupPull 视图变量访问当前实例的那份。
   let coalesce = !!p.fetchCoalesce;
   function scheduleTransfer(blk, from, to) {
+    if (unified) return pageCache.scheduleTransfer(blk, from, to, now, { move: true });
     let link = links[from + '>' + to];
     if (!link) return 0;
     let bytes = blk.size * tierRatio[from]; // 读出一侧体积
@@ -692,7 +694,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   function pickVictim(tier) {
     let pool = pools[tier];
     // C1 修复(2026-08-12): prewarmed 块为 L3 常驻(pinned)前缀, 永不被淘汰——HiCache 常驻语义
-    let avail = pool.blocks.filter(b => b.available && !b.prewarmed && (!replay || (b.refcount === 0 && !b.pinned && !b.transferLocked)));
+    let avail = pool.blocks.filter(b => b.available && !b.prewarmed && ((!replay && !unified) || (b.refcount === 0 && !b.pinned && !b.transferLocked)));
     if (avail.length === 0) return null;
     if (jsEvict) {
       try { let v = jsEvict(pool, tier); if (v && pool.blockIndex[v.id] && v.available && !v.prewarmed && (!replay || avail.includes(v))) return v; } catch(e) {}
@@ -919,7 +921,20 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // 输出块优先放 HBM（decode 生成的 KV 本就在 GPU 上），容量不足按策略淘汰/下沉。
   const cacheResource = inst;
   const pageCache = replay || unified ? createReplayCache({ pool: cacheResource.pools.hbm, pools: cacheResource.pools, tierRatio,
-    resourceId: `instance:${cacheResource.id}`, blockBytes,
+    resourceId: `instance:${cacheResource.id}`, blockBytes, finiteCapacity: unified,
+    links: cacheResource.links, l3Bandwidth: cacheResource.effL3BW, canSchedule: time => !unified || time < simCap,
+    onEvent: event => {
+      if (event.type === 'transfer-progress') {
+        stats.transferBytes += event.bytes;
+        if (event.layer === 'l2') stats.transferL2Bytes += event.bytes;
+        else stats.transferL3Bytes += event.bytes;
+        if (event.prefetch) stats.fetchBytesPulled += event.bytes;
+      }
+      if (event.type === 'evict') stats.evictions++;
+      if (event.type === 'drop') stats.drops++;
+      if (event.type === 'transfer-start' && event.prefetch) stats.prefetches++;
+      if (event.type !== 'transfer-progress') observe(event.type, null, event);
+    },
     add: (tier, block) => {
       const pool = cacheResource.pools[tier];
       pool.blocks.push(block); pool.blockIndex[block.id] = block;
@@ -958,9 +973,109 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     });
   }
 
+  let recoveringCapacity = false, retractCount = 0, recomputedTokens = 0;
+  const runningRequests = () => [...prefillQ, ...prefilling, ...decodeWait, ...decoding, ...kvXfer];
+
+  function prefetchPolicy(req) {
+    if (!req._prefetchPolicy) {
+      const plan = pageCache.lookup(req, now);
+      const hitPages = (plan.slots || []).filter(slot => slot.hit).length;
+      req._prefetchPolicy = { type: s.prefetch?.type || 'none', coalesce,
+        fixedSeconds: (Number.isFinite(p.fetchFixedUs) ? p.fetchFixedUs : 209) * 1e-6,
+        timeoutSeconds: (Number.isFinite(p.pfTimeoutBase) ? p.pfTimeoutBase : 1)
+          + hitPages * (Number.isFinite(p.pfTimeoutPerPage) ? p.pfTimeoutPerPage : 0.25) };
+      req._fetchDeadline = now + req._prefetchPolicy.timeoutSeconds;
+    }
+    return req._prefetchPolicy;
+  }
+
+  function removeAttempt(req) {
+    for (const queue of [waitQueue, prefillQ, prefilling, decodeWait, decoding, kvXfer]) {
+      const index = queue.indexOf(req);
+      if (index >= 0) queue.splice(index, 1);
+    }
+    for (const wave of [curWave, prepWave]) {
+      if (wave) wave.members = wave.members.filter(member => member.q !== req);
+    }
+    if (prepWave && !prepWave.members.length) inst.prepWave = prepWave = null;
+    for (const events of [outputEvents, completionEvents]) {
+      for (let i = events.length - 1; i >= 0; i--) if (events[i].req === req) events.splice(i, 1);
+    }
+    req._attempt = (req._attempt || 0) + 1;
+    req._wvInFlight = 0;
+    req._outputBlocked = false;
+    dirty = true;
+  }
+
+  function failRequest(req, reason) {
+    removeAttempt(req);
+    pageCache.cancel(req, now);
+    pageCache.release(req, now, reason);
+    req.state = reason; req.completeTime = now;
+    source.fail(req, reason, now);
+    observe('fail', req, { reason });
+  }
+
+  function retractRequest(req) {
+    removeAttempt(req);
+    pageCache.release(req, now, 'retract');
+    req.state = 'wait';
+    req._pfDone = 0; req._pfTotal = 0;
+    req._prefetchPolicy = null;
+    req._outAllocTok = 0;
+    req._retractCount = (req._retractCount || 0) + 1;
+    retractCount++;
+    replayMetrics?.retract(req, now);
+    waitQueue.push(req);
+    recoveringCapacity = true;
+    observe('retract', req, { generatedTokens: req.tokensGen, attempt: req._attempt });
+  }
+
+  function reserveOutput(req, tokens) {
+    let status = pageCache.output(req, tokens, now).status;
+    while (status !== 'admitted') {
+      if (status === 'infeasible') { failRequest(req, 'abort'); return false; }
+      if (pageCache.pending) return false;
+      const active = runningRequests().sort((a, b) => a.tokensGen - b.tokensGen || b.inputLen - a.inputLen
+        || String(a.id).localeCompare(String(b.id), 'en', { numeric: true }));
+      if (active.length < 2) { failRequest(req, 'abort'); return false; }
+      const victim = active[0];
+      retractRequest(victim);
+      if (victim === req) return false;
+      status = pageCache.output(req, tokens, now).status;
+    }
+    dirty = true;
+    return true;
+  }
+
+  function computeChunk(req, budget) {
+    const ranges = [];
+    let chunk = 0;
+    for (const range of pageCache.computeRanges(req, now)) {
+      const tokens = Math.min(range.tokens, budget - chunk);
+      if (tokens <= 0) break;
+      ranges.push({ position: range.position, tokens });
+      chunk += tokens;
+    }
+    return { q: req, chunk, ranges, attempt: req._attempt || 0 };
+  }
+
+  function startPrefill(req) {
+    req.state = 'prefill';
+    req._attemptPrefillStart = now;
+    if (!unified || !req._prefillStarted) req.prefillStart = now;
+    req._prefillStarted = true;
+    observe('prefillStart', req);
+  }
+
   function admitRequests() {
+    if (unified && recoveringCapacity) {
+      if (runningRequests().length) return;
+      recoveringCapacity = false;
+    }
     for (let i = 0; i < waitQueue.length; i++) {
       const req = waitQueue[i];
+      if (unified) pageCache.prefetch(req, now, prefetchPolicy(req));
       if (!pageCache) {
         const fastCap = (caps.hbm + caps.dram) * 0.98;
         const kvInFlight = (decoding.length + decodeWait.length + prefillQ.length + prefilling.length) * r.avgLifetimeKv;
@@ -981,16 +1096,21 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
           observe('fail', req, { reason: 'infeasible' });
           continue;
         }
-        req.state = 'prefillQ'; req.admitTime = now;
-        stats.reqTokTotal += hit.inputTokens;
-        stats.hitTokL1 += hit.hitL1Tokens; stats.missTok += hit.missTokens;
-        inst.hitTok += hit.hitL1Tokens; inst.reqTok += hit.inputTokens;
-        if (hit.hitL1Tokens) { stats.prefixHits++; stats.prefixSavedBytes += hit.hitL1Tokens * kvPerTok; }
-        replayMetrics?.admit(req, hit);
-        observe('admit', req, { hit });
+        if (!req._admittedOnce) {
+          req.admitTime = now;
+          stats.reqTokTotal += hit.inputTokens;
+          stats.hitTokL1 += hit.hitL1Tokens; stats.hitTokL2 += hit.hitL2Tokens;
+          stats.hitTokL3 += hit.hitL3Tokens; stats.missTok += hit.missTokens;
+          inst.hitTok += hit.hitL1Tokens; inst.reqTok += hit.inputTokens;
+          if (hit.hitL1Tokens) { stats.prefixHits++; stats.prefixSavedBytes += hit.hitL1Tokens * kvPerTok; }
+          replayMetrics?.admit(req, hit);
+        }
+        observe(req._admittedOnce ? 'readmit' : 'admit', req, { hit });
+        req._admittedOnce = true;
       }
       waitQueue.splice(i--, 1);
-      req.state = 'prefillQ'; req.admitTime = now;
+      req.state = 'prefillQ';
+      if (!unified) req.admitTime = now;
       prefillQ.push(req);
       dirty = true;
     }
@@ -1064,7 +1184,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
 
   // prefill 完成统一出口（2026-08-18, 波次模式提取共用）：单飞组状态 + 前缀激活 + 转 decode/decodeWait
   function finishPrefill(q) {
-    q.prefillEnd = now;
+    if (!unified || !q._prefillFinished) q.prefillEnd = now;
+    if (unified && q.firstTokenTime === undefined) q.firstTokenTime = now;
     // ---- prefill 吞吐统计(2026-08-25) ----
     // 埋在此处而非 completeRequest: prefill 吞吐的完成事件是"prefill 算完", 与 decode 无关。
     // 长输入场景(1M tok)下大量请求 prefill 已完成但 decode 远未结束, 用 stats.completed
@@ -1073,15 +1194,20 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     //   pfReqTokens  = 名义输入 token —— 系统对外交付的 prompt 处理速率(用户可感知的"喂进去多少")
     //   pfCompTokens = GPU 实算 token(_pfTotal, 已扣除前缀命中/L3 拉取部分) —— 硬件真实算力产出
     // 前缀命中率 h 越高两者差越大(比值≈1/(1-h)); 只看名义会把"缓存命中"误记为"算力变强"。
-    stats.pfReqDone++;
-    stats.pfReqTokens += (q.inputLen || 0);
-    stats.pfCompTokens += Math.max(0, q._pfTotal || 0);
+    if (!unified || !q._prefillFinished) {
+      stats.pfReqDone++;
+      stats.pfReqTokens += (q.inputLen || 0);
+    }
+    q._prefillFinished = true;
+    if (!unified) stats.pfCompTokens += Math.max(0, q._pfTotal || 0);
     // 该请求的 prefill 服务区间 [prefillStart, prefillEnd] —— 结算时合并成并集作分母。
     // 用 prefillStart(真正开始算)而非 arrive: 排队等待不属于"prefill 在干活"的时间,
     // 把排队计入分母会让吞吐随 qps 虚降(排队越长分母越大, 而工作量没变)。
-    if (q.prefillStart != null && q.prefillEnd != null && q.prefillEnd > q.prefillStart) {
-      stats.pfSpans.push([q.prefillStart, q.prefillEnd]);
-      stats.pfSpanSum += (q.prefillEnd - q.prefillStart);
+    const attemptStart = unified ? q._attemptPrefillStart : q.prefillStart;
+    const attemptEnd = unified ? now : q.prefillEnd;
+    if (attemptStart != null && attemptEnd != null && attemptEnd > attemptStart) {
+      stats.pfSpans.push([attemptStart, attemptEnd]);
+      stats.pfSpanSum += attemptEnd - attemptStart;
     }
     if (q._coGpPuller && q._coGpPuller.doneAt === null) q._coGpPuller.doneAt = now; // 单飞: be/race 拉取者 prefill 完成 ⇒ 组前缀完整(拉取+重算合并)
     // 前缀缓存时间窗：founder 的 prefill 完成 → 组前缀 KV 才真正可用，激活供组内后续请求命中
@@ -1127,7 +1253,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     let decodeOk = decoding.length < decodeSlots;   // 2026-09-02: 原 static 旁路已删
     if (decodeOk) {
       q.state = 'decode';
-      q.decodeStart = now;
+      if (!unified || !q._decodeStarted) q.decodeStart = now;
+      q._decodeStarted = true;
       observe('decodeStart', q);
       if (jsPrefetch) { try { jsPrefetch(); } catch(e) {} }
       decoding.push(q);
@@ -1144,7 +1271,20 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // (h95/in8k 下 TTFT ≈ 13.6s, 60× 劣于 wait_complete 的 0.22s, 语义完全失效)。
   // 修复: 对未准入的 best_effort 候选按 groupId + 已激活组前缀实时估计 fetchTime(与
   // placeRequest 同口径: 块数×τ_fp + 字节/有效带宽), 排队期即开始拉取, 准入时定格。
+  function actualFetchEstimate(req) {
+    const slots = pageCache.lookup(req, now).slots || [];
+    let seconds = 0;
+    for (const slot of slots) {
+      if (!slot.hit || slot.tier === 'hbm') continue;
+      const bytes = slot.tokens * kvPerTok * tierRatio[slot.tier];
+      seconds += bytes / Math.max(cacheResource.links['dram>hbm'].bw, 1);
+      if (slot.tier === 'ssd') seconds += prefetchPolicy(req).fixedSeconds + bytes / Math.max(cacheResource.effL3BW, 1);
+    }
+    return seconds;
+  }
+
   function beFetchTimeEst(r0) {
+    if (unified) return actualFetchEstimate(r0);
     if (r0._beFetchEst !== undefined) return r0._beFetchEst;
     r0._beFetchEst = 0;
     if (s.prefetch && s.prefetch.type === 'best_effort' && r0.groupId && prefixGroupMap[r0.groupId] && prefixGroupMap[r0.groupId].activated) {
@@ -1162,6 +1302,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // ⚠️ waitQueue 的请求还没过 placeRequest(fetchTime 未算) —— wc 到达即拉必须
   //    在准入前拿到目标量, 只能靠这个估算(见 queueFetchTarget)。
   function l3FetchEst(r0) {
+    if (unified) return actualFetchEstimate(r0);
     if (r0._l3FetchEst !== undefined) return r0._l3FetchEst;
     r0._l3FetchEst = 0;
     if (r0.groupId && prefixGroupMap[r0.groupId] && prefixGroupMap[r0.groupId].activated) {
@@ -1354,7 +1495,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     //   computeWait ≥ 0 ⇒ 堆叠柱不溢出 100%; 万一 _ft1 被某边界路径置晚, 退化为"整个窗口
     //   算成 fetch"而非加性破裂。
     let _waveEmpty = (req._waveEmpty !== undefined) ? req._waveEmpty : (req.prefillStart || 0);
-    let _fWin = (!_hasFetch || req._race || req._be || _ft1v === null)
+    let _fWin = (!_hasFetch || req._race || req._be || _ft1v === null
+      || (unified && ['race', 'best_effort'].includes(req._prefetchPolicy?.type)))
       ? 0 : Math.max(0, Math.min(_ft1v - _waveEmpty, _T));
     let _fW = _fqW + _fWin;            // 对外的 fetch 分量 = prefillQ 期划转 + 窗口内暴露
     // ⚠️ _cW 只减 _fWin, **绝不能**减 _fqW: 后者落在 [admitTime, prefillStart] 窗口内,
@@ -1410,9 +1552,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     if (!replay && timeline.length < 320) timeline.push({ id: req.id, arrive: req.arrive, admitTime: req.admitTime,
       prefillStart: req.prefillStart, prefillEnd: req.prefillEnd, completeTime: now });
 
+    if (unified) pageCache.release(req, now);
     source.complete(req, now);
     if (pageCache) {
-      pageCache.release(req, now);
+      if (!unified) pageCache.release(req, now);
       observe('complete', req);
       return;
     }
@@ -1519,6 +1662,18 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
 
   function refreshLocations() {
     decoding.forEach(q => {
+      if (unified) {
+        q.kvHbm = 0; q.kvDram = 0; q.kvSsd = 0;
+        for (const id of q.prefixBlkIds.concat(q.ownBlkIds)) {
+          const page = cacheResource.pools.hbm.blockIndex[id];
+          if (!page?.available || !page.ready || page.refcount < 1)
+            throw new Error('Workload cache invariant: decode requires ready, referenced HBM pages');
+          q.kvHbm += page.tokens * kvPerTok;
+          page.lastTouch = now;
+          stats.hbmAcc++;
+        }
+        return;
+      }
       let h = 0, d = 0, sd = 0;
       // P0-1: 平均块大小按实际 token 数（输入+已生成输出）计算，修复前只用 inputLen
       let nIds = Math.max(1, q.prefixBlkIds.length + q.ownBlkIds.length);
@@ -1570,8 +1725,21 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     inst.lastWaveEndAt = now;
     for (const m of finished) {
       const q = m.q;
+      if (unified && ((q._attempt || 0) !== m.attempt || q.state !== 'prefill')) continue;
       q._wvInFlight = 0;
       q._pfDone += m.chunk;
+      if (unified) {
+        pageCache.completeCompute(q, m.ranges, now);
+        stats.pfCompTokens += m.chunk;
+        if (q._retractCount) { recomputedTokens += m.chunk; replayMetrics?.recompute(q, m.chunk, now); }
+        observe('prefillChunk', q, { tokens: m.chunk, ranges: m.ranges });
+        if (pageCache.prefillReady(q, now)) {
+          const index = prefilling.indexOf(q);
+          if (index >= 0) prefilling.splice(index, 1);
+          finishPrefill(q);
+        }
+        continue;
+      }
       if (q._race && q._raceMeetTok < 0) {
         if (q._pfDone + (q._raceTok || 0) >= (q._pfStartPos || 0) - (q._l2HitTok || 0)) {
           q._raceMeetTok = q._pfDone;
@@ -1600,11 +1768,34 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       hbmIntegral += (now - resourceTime) * previousHbm;
       resourceTime = now;
       if (step >= 2_000_000) throw new RangeError('U2 acceptance step resource limit exceeded');
-      for (const target of instances) { useInstance(target); settlePrefillWave(); }
+      pageCache.advance(now);
+      for (const target of instances) {
+        useInstance(target);
+        settlePrefillWave();
+        for (const queue of [prefillQ, prefilling]) {
+          for (let i = 0; i < queue.length; i++) {
+            const req = queue[i];
+            if (req._wvInFlight || !pageCache.prefillReady(req, now)) continue;
+            queue.splice(i--, 1);
+            if (req.state === 'prefillQ') startPrefill(req);
+            if (prepWave) prepWave.members = prepWave.members.filter(member => member.q !== req);
+            if (prepWave && !prepWave.members.length) inst.prepWave = prepWave = null;
+            finishPrefill(req);
+          }
+        }
+      }
       for (const event of outputEvents.splice(0)) {
         const q = event.req;
+        if (q.state !== 'decode' || (q._attempt || 0) !== event.attempt) continue;
         useInstance(instances[q.instId]);
-        allocOutBlock(q, Math.floor(event.tokens));
+        if (!reserveOutput(q, Math.floor(event.tokens))) {
+          if (q.state === 'decode' && (q._attempt || 0) === event.attempt) {
+            q._outputBlocked = true;
+            outputEvents.push(event);
+          }
+          continue;
+        }
+        q._outputBlocked = false;
         q.tokensGen = event.tokens;
         observe('output', q, { tokens: q.tokensGen });
         if (q.tokensGen >= q.outputLen) {
@@ -1647,7 +1838,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         || (unified && (xi.curWave || xi.prepWave))) { allIdle = false; break; }
     }
     if (unified && allIdle && !outputEvents.length && !completionEvents.length) {
-      let next = source.nextTime;
+      let next = Math.min(source.nextTime, pageCache.nextTime);
       for (const transfer of inFlight) next = Math.min(next, transfer.arriveAt);
       if (!Number.isFinite(next) && !source.done)
         throw new Error('Workload scheduling invariant: unresolved anchors without future events');
@@ -1765,8 +1956,11 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // frac, 等待者共享进度/完成时刻, 前缀完整点: wc=拉完 / race=相遇 / be=prefill完成);
     // 关 = 每请求独立重拉(模拟并发同前缀请求各自发起预取: sglang 的 prefetch_from_storage
     //      按 rid 独立入队, 无跨请求单飞去重)。
+    if (unified) {
+      for (const req of [...prefillQ, ...prefilling]) pageCache.prefetch(req, now, prefetchPolicy(req));
+    }
     let fetchJobs = [];
-    for (let fi = 0; fi < prefilling.length; fi++) {
+    for (let fi = 0; !unified && fi < prefilling.length; fi++) {
       let fq = prefilling[fi];
       if (fq._race) {
         if (fq._raceMeetTok >= 0) continue;
@@ -1803,7 +1997,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // 从 _fetchDone 续拉(该分支已存在且进位兼容, 无需改动)。
     // ★ 排队期拉取**不产生 fetch 分量**: 这段时间已计入 queue/prefillQ, 再记一次会重复计时。
     //   (2026-09-01 时间戳口径: fetchExposure 从 waveEmpty ≥ prefillStart 起算, 天然满足)
-    for (let qi2 = 0; qi2 < waitQueue.length + prefillQ.length; qi2++) {
+    for (let qi2 = 0; !unified && qi2 < waitQueue.length + prefillQ.length; qi2++) {
       let bq = qi2 < waitQueue.length ? waitQueue[qi2] : prefillQ[qi2 - waitQueue.length];
       let bfte = queueFetchTarget(bq);
       if (bfte <= 0) continue;
@@ -1858,10 +2052,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       // 1) fetch-only 请求(命中100%/无剩余计算): 直接进 prefilling 等拉取, 不占波次 token 预算
       for (let i = 0; i < prefillQ.length; i++) {
         let rq = prefillQ[i];
-        if ((rq.prefillTokens ?? rq.inputLen) > 0) continue;
+        if (unified ? !pageCache.prefillReady(rq, now) : (rq.prefillTokens ?? rq.inputLen) > 0) continue;
         prefillQ.splice(i, 1); i--;
-        rq.state = 'prefill'; rq.prefillStart = now;
-        observe('prefillStart', rq);
+        startPrefill(rq);
         rq._pfTotal = 0; rq._pfDone = 0;
         if ((rq.fetchTime || 0) > 0 && rq._ft0 === undefined) rq._ft0 = now;
         prefilling.push(rq); dirty = true;
@@ -1881,6 +2074,12 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         // 继续中的成员(含执行波成员的下一段 chunk, 须扣除在飞 chunk 防重复计算——
         // 否则连续波会在单请求间交替, 波永远装不满, 效率塌回 boost=1)
         for (let q of prefilling) {
+          if (unified) {
+            const member = computeChunk(q, Math.min(sbChunk, W - waveTok));
+            if (member.chunk > 0) { wv.members.push(member); waveTok += member.chunk; }
+            if (waveTok >= W) break;
+            continue;
+          }
           // race 阶段0: _pfTotal 尚未确定(=0), 但它**确实要算前缀** —— 不能按 fetch-only 跳过。
           // 剩余量用"前缀未算完的部分"估: H_eff = _pfStartPos − l2HitTok(L2 段免费不用算),
           // 再扣掉已由 L3 反向拉来的 _raceTok(那部分不用重算) —— 与相遇判据同口径。
@@ -1907,6 +2106,18 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         // 反复取队首, 取用顺序 / waveTok 累加 / wv.members 顺序全部一致。
         for (let qi = 0; qi < prefillQ.length && waveTok < W; qi++) {
           let rq = prefillQ[qi];
+          if (unified) {
+            if (!pageCache.startPrefill(rq, now)) { rq._pqSkipped = true; continue; }
+            prefillQ.splice(qi--, 1);
+            startPrefill(rq);
+            rq._pfDone = 0;
+            const member = computeChunk(rq, Math.min(sbChunk, W - waveTok));
+            rq._pfTotal = member.chunk;
+            prefilling.push(rq);
+            if (member.chunk > 0) { wv.members.push(member); waveTok += member.chunk; }
+            dirty = true;
+            continue;
+          }
           let tot = rq.prefillTokens ?? rq.inputLen;
           if (tot <= 0) break; // fetch-only 已在上面处理(顺序保持)
           // ★ 入波就绪判据(2026-09-02 第2批, 四档策略统一):
@@ -1973,6 +2184,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         // fetch-only 成员: 拉取完成即完成 prefill(不占算力不占波次预算)
         for (let i = prefilling.length - 1; i >= 0; i--) {
           let q = prefilling[i];
+          if (unified) {
+            if (q._wvInFlight || !pageCache.prefillReady(q, now)) continue;
+            prefilling.splice(i, 1);
+            if (prepWave) prepWave.members = prepWave.members.filter(member => member.q !== q);
+            if (prepWave && !prepWave.members.length) inst.prepWave = prepWave = null;
+            finishPrefill(q);
+            continue;
+          }
           if (q._pfTotal > 0) continue;
           // 单飞等待者: 共享组拉取完成 ⇒ 命中完成(与流体循环 3163 同语义; 否则 _fetchDone
           // 永不更新 → 波次模式死锁, 2026-08-19 单批基准发现)
@@ -1993,7 +2212,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
             // be/race 不等拉齐(2026-09-02 第2批):
             //   be   —— can_terminate_prefetch 恒 True, 入波时已 settleFetchStop 定格;
             //   race —— 预取与计算**并行**, 等拉齐就失去了 race 的全部意义。
-            if (m.q._be || m.q._race) continue;
+            if (unified || m.q._be || m.q._race) continue;
             // 单飞等待者: 共享组拉取完成 ⇒ 就绪(同上, 流体语义在波次判定的对齐)
             let wgp = m.q._coGp;
             if (wgp && wgp.doneAt !== null && now >= wgp.doneAt) {
@@ -2009,6 +2228,11 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
             // ⚠️ 定格会缩小/放大 _pfTotal, 成员的 chunk 是组波时按旧值切的 ⇒ 需夹紧, 否则
             //   结算时 _pfDone 会超过 _pfTotal(表现为请求"算完了还留在 prefilling")。
             for (let m of prepWave.members) {
+              if (unified) {
+                Object.assign(m, computeChunk(m.q, m.chunk));
+                pageCache.claimCompute(m.q, m.ranges, now);
+                continue;
+              }
               if (m.q._race) continue;   // race: _pfTotal=0 是"待定", 不适用夹紧
               if (m.q._to && !m.q._toFired && !((m.q.fetchTime || 0) <= (m.q._fetchDone || 0))) {
                 m.q._toFired = true;
@@ -2058,7 +2282,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
               // 2026-09-02 修正: 原式写死 `_pfStartPos + _pfDone`, 对 be/timeout(定格后
               // 从 _beHeadTok 起算) 与 race(阶段0 从 l2h 起算) 都偏大 ⇒ 高估 τ 成本。
               let posMid = prefillPos(m.q, m.q._pfDone + m.chunk / 2);
-              m._cost = m.chunk * prefillTau(pP, posMid);   // PD 真分离: 波次同样走 P 节点 a/b
+              m._cost = unified
+                ? m.ranges.reduce((sum, range) => sum + range.tokens * prefillTau(pP, range.position + range.tokens / 2), 0)
+                : m.chunk * prefillTau(pP, posMid);
               cost += m._cost;
             }
             curWave.endT = now + cost / Math.max(wBoost * wPfFactor, 1e-9);
@@ -2075,7 +2301,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
             //   由 completeRequest 的 clamp 夹到 (T − fetchExposure)。实测(8 档)修掉上方
             //   "_cNet 流体累加在波次模式双重计入"的 bug 后 clampRate 恒为 0, 即实际未触发。
             for (let m of curWave.members)
-              m.q._cNet = (m.q._cNet || 0) + m._cost / Math.max(wPfFactor, 1e-9);
+              if (!unified || !m.q._prefillFinished)
+                m.q._cNet = (m.q._cNet || 0) + m._cost / Math.max(wPfFactor, 1e-9);
             for (let m of curWave.members) m.q._wvInFlight = m.chunk; // 在飞 chunk 登记(组波时扣除)
           }
         }
@@ -2123,7 +2350,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     while (decodeWait.length && decoding.length < (s.batching.max_batch_size || 8)) {
       let q = decodeWait.shift();
       q.state = 'decode';
-      q.decodeStart = now;
+      if (!unified || !q._decodeStarted) q.decodeStart = now;
+      q._decodeStarted = true;
       observe('decodeStart', q);
       decoding.push(q);
       dirty = true;
@@ -2135,7 +2363,11 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
 
     if (unified) {
       stepDuration = Math.max(0, Math.min(DT, simCap - now, source.nextTime - now,
-        curWave ? curWave.endT - now : Infinity));
+        pageCache.nextTime - now, curWave ? curWave.endT - now : Infinity));
+      for (const req of [...waitQueue, ...prefillQ]) {
+        if (req._prefetchPolicy?.type === 'timeout' && req._fetchDeadline > now)
+          stepDuration = Math.min(stepDuration, req._fetchDeadline - now);
+      }
       for (const transfer of inFlight) stepDuration = Math.min(stepDuration, Math.max(0, transfer.arriveAt - now));
       if (curWave && stepDuration > 0) {
         stats.pfGpuBusySec += stepDuration;
@@ -2224,7 +2456,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         let l2B = sumD * pIt;                                     // 本步 L2 读字节
         // 排队: 读请求从 max(now, 本方向+反方向共享总线忙到何时) 开始传输
         let l2Start = Math.max(now, l2Link.busyUntil, l2Link.shared.busyUntil);
-        l2Fin = l2B > 0 ? l2Start + l2B / Math.max(l2Link.bw, 1) : l2Start;
+        l2Fin = l2B > 0 ? l2Start + l2B / Math.max(l2Link.bw, 1) : unified ? now : l2Start;
         let l2Wait = Math.max(0, l2Fin - now);                    // 本步 L2 读完成所需墙钟(含排队)
         // L3: 每 pass 读时间 = 需求/可用速率(共享池, 无需迭代)
         let stepWait = Math.max(l2Wait, l3ReadPerPass * pIt);     // 取 L2/L3 较大者(与旧 max 语义一致)
@@ -2293,9 +2525,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
           q._recomputeTok = 0;
         }
         if (unified) {
-          if (tok > 0) {
+          if (tok > 0 && !q._outputBlocked) {
             const tokens = q.outputLen - q.tokensGen <= tok + 1e-12 ? q.outputLen : q.tokensGen + tok;
-            outputEvents.push({ req: q, tokens });
+            outputEvents.push({ req: q, tokens, attempt: q._attempt || 0 });
           }
           continue;
         }
@@ -2344,7 +2576,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       _sQ += xi.waitQueue.length + xi.prefillQ.length;
     }
     if (replay) replayMetrics.observe(now, { activeSessions: replay.sessions.size,
-      activeRequests: _sDec + _sPf + _sQ + completionEvents.length,
+      activeRequests: _sDec + _sPf + _sQ + completionEvents.length
+        + (unified ? instances.reduce((sum, target) => sum + target.decodeWait.length + target.kvXfer.length, 0) : 0),
       queuedRequests: _sQ, ...pageCache.snapshot() });
     let u = _sHbmUsed / Math.max(_sHbmCap, 1);
     stats.memUtilSum += u; stats.memUtilSamples++;
@@ -2369,7 +2602,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     }
 
     let _allDone = source.done && (!replay || (!inFlight.length && now >= replay.options.durationSeconds));
-    if (unified) _allDone = source.done && now >= earliestEnd && !inFlight.length && !outputEvents.length && !completionEvents.length;
+    if (unified) _allDone = source.done && now >= earliestEnd && !pageCache.pending
+      && !inFlight.length && !outputEvents.length && !completionEvents.length;
     for (let ii = 0; _allDone && ii < instances.length; ii++) {
       let xi = instances[ii];
       if (xi.waitQueue.length || xi.prefillQ.length || xi.prefilling.length
@@ -2381,7 +2615,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       if (now >= simCap) break;
       const executing = instances.some(x => x.prefillQ.length || x.prefilling.length || x.kvXfer.length
         || x.decodeWait.length || x.decoding.length || x.curWave || x.prepWave);
-      if (!executing && !outputEvents.length && !inFlight.length && !Number.isFinite(source.nextTime))
+      if (!executing && !outputEvents.length && !inFlight.length && !pageCache.pending && !Number.isFinite(source.nextTime)
+        && (!source.done || waitQueue.length))
         throw new Error('Workload scheduling invariant: unresolved dependencies or HBM pressure without future events');
       previousHbm = pools.hbm.used;
       nextBoundary = Math.min(simCap, now + stepDuration);
@@ -2714,7 +2949,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     result.memUtilAvg = hbmIntegral / simEnd / Math.max(caps.hbm, 1) * 100;
     result.memUtilPeak = stats.memUtilPeak * 100;
   }
-  acceptance?.finish?.({ modelVersion: WORKLOAD_MODEL_VERSION,
+  acceptance?.finish?.({ modelVersion: WORKLOAD_MODEL_VERSION, retractCount, recomputedTokens,
     window: { earliestEnd, hardCutoff: simCap }, counts: source.counts(), cache: pageCache.snapshot() });
   return result;
 }

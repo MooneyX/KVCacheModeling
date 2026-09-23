@@ -385,3 +385,162 @@ test('U2 cache: resource identity and callback bindings isolate equal content an
   assert.equal(shared.lookup(contentRequest([['shared-content', 64]]), 4).hitL1Tokens, 0);
   assert.equal(shared.snapshot().inputPages, 0); assert.equal(a.cache.snapshot().inputPages, 1);
 });
+
+function finiteHarness(cap = 512, options = {}) {
+  const events = [], links = {};
+  for (const [from, to] of [['hbm', 'dram'], ['dram', 'ssd']]) {
+    const a = links[`${from}>${to}`] = { bw: 64, busyUntil: 0 };
+    const b = links[`${to}>${from}`] = { bw: 64, busyUntil: 0 };
+    a.shared = b; b.shared = a;
+  }
+  const h = contentHarness(cap, { finiteCapacity: true, links, onEvent: event => events.push(event), ...options });
+  return { ...h, events, links };
+}
+function warmTier(h, req, tier) {
+  h.cache.warm({ content: req.inputContent, placements: [{ position: 0, tokens: req.inputLen, tier }] });
+}
+function computeInput(h, req, now) {
+  const ranges = h.cache.computeRanges(req, now);
+  h.cache.claimCompute(req, ranges, now);
+  h.cache.completeCompute(req, ranges, now);
+  h.cache.publish(req, now);
+}
+
+test('U3 cache: lookup preserves mixed-tier positions and stops at an unpublished middle page', () => {
+  const h = finiteHarness(), req = contentRequest([['mixed', 256]]);
+  h.cache.warm({ content: req.inputContent, placements: ['ssd', 'dram', 'ssd', 'hbm']
+    .map((tier, i) => ({ tier, position: i * 64, tokens: 64 })) });
+  const before = h.snapshot();
+  const plan = h.cache.lookup(req);
+  assert.deepEqual(plan.slots.map(slot => [slot.position, slot.tier]), [[0, 'ssd'], [64, 'dram'], [128, 'ssd'], [192, 'hbm']]);
+  assert.deepEqual(h.snapshot(), before);
+  h.pools.dram.blocks[0].ready = false;
+  const missing = h.cache.lookup(req);
+  assert.equal(missing.hitL3Tokens, 64); assert.equal(missing.missTokens, 192);
+  assert.deepEqual(missing.slots.map(slot => slot.hit), [true, false, false, false]);
+});
+
+test('U3 cache: running references, pinned pages and transfer locks are never victims', () => {
+  for (const protection of ['refcount', 'pinned', 'transferLocked']) {
+    const h = finiteHarness(64), first = contentRequest([['protected', 64]]);
+    warmTier(h, first, 'hbm');
+    h.pool.blocks[0][protection] = 1;
+    const before = h.snapshot();
+    assert.equal(h.cache.place(contentRequest([['new', 64]]), 0).status, 'wait');
+    assert.deepEqual(h.snapshot(), before);
+    assert.equal(h.events.length, 0);
+  }
+});
+
+test('U3 cache: eviction reserves the destination but retains the locked source until completion', () => {
+  const h = finiteHarness(64), req = contentRequest([['cached', 64]]);
+  warmTier(h, req, 'hbm');
+  assert.equal(h.cache.place(contentRequest([['new', 64]]), 0).status, 'wait');
+  const record = h.cache.ledger[0];
+  assert.equal(record.fromPool, h.pools.hbm); assert.equal(record.toPool, h.pools.dram);
+  assert.equal(record.reservation, 64); assert.equal(record.end, 1);
+  assert.equal(h.pool.used, 64); assert.equal(h.pools.dram.used, 64);
+  assert.ok(record.source.transferLocked); assert.equal(record.target.ready, false);
+  assert.equal(h.cache.snapshot().dramReservedBytes, 64);
+  h.cache.advance(0.5);
+  assert.equal(h.pool.used, 64); assert.equal(record.target.ready, false);
+  h.cache.advance(1);
+  assert.equal(h.pool.used, 0); assert.equal(h.pools.dram.used, 64);
+  assert.equal(record.target.ready, true); assert.equal(record.source.transferLocked, false);
+  assert.equal(h.cache.snapshot().dramReservedBytes, 0);
+});
+
+test('U3 cache: opposite directions and prefetch share one link ledger without double bandwidth', () => {
+  const h = finiteHarness(), down = contentRequest([['down', 64]]), up = contentRequest([['up', 64]]);
+  warmTier(h, down, 'hbm'); warmTier(h, up, 'dram');
+  const move = h.cache.scheduleTransfer(h.pool.blocks[0], 'hbm', 'dram', 0, { move: true });
+  h.cache.prefetch(up, 0, { type: 'none' });
+  const read = h.cache.ledger.find(record => record.prefetch);
+  assert.equal(move.start, 0); assert.equal(move.end, 1);
+  assert.equal(read.start, 1); assert.equal(read.end, 2);
+  h.cache.advance(1);
+  assert.equal(read.target.ready, false);
+  h.cache.advance(2);
+  assert.equal(read.target.ready, true);
+  assert.equal(h.events.filter(event => event.type === 'transfer-progress').reduce((n, event) => n + event.bytes, 0), 128);
+});
+
+test('U3 cache: cancellation retains completed pages, frees unfinished reservations and counts elapsed bytes', () => {
+  const h = finiteHarness(), req = contentRequest([['cancel', 128]]);
+  h.links['dram>hbm'].bw = h.links['hbm>dram'].bw = 640;
+  warmTier(h, req, 'ssd');
+  h.cache.prefetch(req, 0, { type: 'none' });
+  assert.equal(h.cache.snapshot().hbmReservedBytes, 128);
+  h.cache.advance(1.5);
+  assert.equal(h.cache.lookup(req, 1.5).hitL1Tokens, 64);
+  h.cache.cancel(req, 1.5);
+  assert.equal(h.cache.pending, 0);
+  assert.equal(h.pool.used, 64);
+  assert.equal(h.cache.snapshot().hbmReservedBytes, 0);
+  assert.ok(Object.values(h.pools).flatMap(pool => pool.blocks).every(page => !page.transferLocked));
+  const bytes = h.events.filter(event => event.type === 'transfer-progress').reduce((n, event) => n + event.bytes, 0);
+  assert.equal(bytes, 160);
+  const completed = h.events.filter(event => event.type === 'transfer-complete').length;
+  h.cache.advance(10);
+  assert.equal(h.events.filter(event => event.type === 'transfer-complete').length, completed);
+});
+
+test('U3 cache: cancelling one group subscriber cannot cancel another request load-back', () => {
+  const h = finiteHarness(), first = contentRequest([['shared-pull', 64]]), second = contentRequest([['shared-pull', 64]]);
+  warmTier(h, first, 'ssd');
+  h.cache.prefetch(first, 0, { type: 'none', coalesce: true });
+  h.cache.prefetch(second, 0, { type: 'none', coalesce: true });
+  h.cache.cancel(first, 0.5);
+  assert.equal(h.cache.pending, 1);
+  assert.equal(h.events.filter(event => event.type === 'transfer-cancel').length, 0);
+  h.cache.place(second, 0.5);
+  h.cache.advance(2);
+  assert.equal(h.cache.prefillReady(second, 2), true);
+  h.cache.publish(second, 2); h.cache.release(second, 2);
+  assert.equal(h.pool.used, 64);
+  assert.ok(Object.values(h.pools).flatMap(pool => pool.blocks).every(page => !page.transferLocked && !page.refcount));
+});
+
+test('U3 cache: waiting admission never allocates new computation KV into slow tiers', () => {
+  const h = finiteHarness(64), first = contentRequest([['active', 64]], 65), second = contentRequest([['waiting', 64]]);
+  assert.equal(h.cache.place(first, 0).status, 'admitted');
+  const before = h.snapshot();
+  assert.equal(h.cache.place(second, 0).status, 'wait');
+  assert.deepEqual(h.snapshot(), before);
+  computeInput(h, first, 1);
+  assert.equal(h.cache.output(first, 1, 1).status, 'infeasible');
+  assert.equal(h.pools.dram.used, 0); assert.equal(h.pools.ssd.used, 0);
+  assert.equal(first._outAllocTok, 0);
+});
+
+test('U3 cache: retract restores only missing KV and never changes logical output progress', () => {
+  const h = finiteHarness(256), req = contentRequest([['restore', 64]], 65);
+  h.cache.place(req, 0); computeInput(h, req, 1);
+  h.cache.output(req, 65, 1); req.tokensGen = 65;
+  h.cache.release(req, 2, 'retract');
+  assert.equal(h.pool.used, 64);
+  assert.equal(req.tokensGen, 65);
+  h.cache.place(req, 3);
+  assert.equal(h.pool.used, 192);
+  assert.deepEqual(h.cache.computeRanges(req, 3), [{ position: 64, tokens: 65 }]);
+  computeInput(h, req, 4);
+  assert.deepEqual(h.pool.blocks.filter(page => page.output).map(page => page.tokens), [64, 1]);
+  assert.equal(req.tokensGen, 65);
+  h.cache.release(req, 4);
+  assert.ok(h.pool.blocks.every(page => !page.refcount));
+});
+
+test('U3 cache: publication never deduplicates into an in-flight eviction source', () => {
+  const h = finiteHarness(), first = contentRequest([['moving', 64]]), second = contentRequest([['moving', 64]]);
+  h.cache.place(first, 0); h.cache.place(second, 0);
+  computeInput(h, first, 0); h.cache.release(first, 0);
+  const source = h.pool.blocks.find(page => page._published);
+  h.cache.scheduleTransfer(source, 'hbm', 'dram', 0, { move: true });
+  computeInput(h, second, 0.5);
+  const id = second.prefixBlkIds[0];
+  assert.notEqual(id, source.id);
+  h.cache.advance(1);
+  assert.ok(h.pool.blockIndex[id]?.ready);
+  assert.equal(h.pool.blockIndex[id].refcount, 1);
+  h.cache.release(second, 1);
+});

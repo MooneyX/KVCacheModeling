@@ -21,7 +21,8 @@ const close = (actual, expected, path = '') => {
   } else assert.deepEqual(actual, expected, path);
 };
 
-function execute(kind, templates, { twoTurn = false, hardCutoff = 8, earliestEnd = 0.2, params = {} } = {}) {
+function execute(kind, templates, { twoTurn = false, hardCutoff = 8, earliestEnd = 0.2, params = {},
+  strategy = base.strategy, warm = [] } = {}) {
   const bundle = bundleOf(templates), before = structuredClone(bundle);
   const qps = templates.length * 2;
   const first = createReplayRuntime({ bundle, options }, { qps, seed: 42 }).nextTime;
@@ -29,7 +30,7 @@ function execute(kind, templates, { twoTurn = false, hardCutoff = 8, earliestEnd
     multiTurn: twoTurn ? 1 : 0, ...params };
   const events = [], arrivals = [];
   let summary;
-  const result = runWorkloadAcceptance(p, base.strategy, { seed: 42, qps, simMaxTime: hardCutoff - options.durationSeconds,
+  const result = runWorkloadAcceptance(p, strategy, { seed: 42, qps, simMaxTime: hardCutoff - options.durationSeconds,
     ...(kind === 'replay' ? { replay: { bundle, options } } : {}) }, {
     window: { earliestEnd, hardCutoff },
     source(defaultSource) {
@@ -38,7 +39,7 @@ function execute(kind, templates, { twoTurn = false, hardCutoff = 8, earliestEnd
       return {
         get nextTime() { return source.nextTime; }, get done() { return source.done; },
         initialCount: source.initialCount, pendingRequests: () => source.pendingRequests?.() || [],
-        takeInitialCache: () => source.takeInitialCache?.() || [], counts: () => source.counts(),
+        takeInitialCache: () => warm.length ? structuredClone(warm) : source.takeInitialCache?.() || [], counts: () => source.counts(),
         complete: (req, time) => source.complete(req, time), fail: (req, reason, time) => source.fail(req, reason, time),
         drainEvents(now, emit) {
           source.drainEvents(now, req => {
@@ -183,3 +184,270 @@ test('U2: restricted development scope rejects unsupported topology and does not
     unified: true, acceptance: { window: { hardCutoff: 0 } }, workloadModelVersion: WORKLOAD_MODEL_VERSION });
   assert.deepEqual(attempted, ordinary);
 });
+
+const capacityParams = pages => ({
+  hbmPerGpu: (70.54819328 * 1.02 + 48 + (pages + 0.01) * 0.01048576) / 8,
+  tieredKv: false,
+});
+const warmPrefix = (template, tiers) => [{
+  content: [...createReplayRequest(template, 0, 0, { sessionId: 'equivalent', requestIndex: 0 }).inputContent],
+  placements: tiers.map((tier, i) => ({ tier, position: i * 64, tokens: 64 })),
+}];
+
+test('U3: physical input pages queue without changing logical denominators', () => {
+  const run = equivalent([origin(128, 1), origin(128, 1, 0, [[8, 2]])], { params: capacityParams(3) });
+  assert.equal(run.result.completed, 2);
+  assert.equal(run.result.hitTok.total, 256);
+  assert.ok(run.events.some(event => event.type === 'wait'));
+  assert.equal(run.summary.retractCount, 0);
+  assert.equal(run.result.activeEvictions, 0);
+  assert.ok(run.events.every(event => event.cache.hbmBytes <= event.cache.hbmCapacityBytes));
+});
+
+test('U3: output pressure retracts and restores generated history without duplicate tokens or first times', () => {
+  const templates = [origin(64, 129), origin(64, 129, 0, [[8, 1]])];
+  const run = equivalent(templates, { params: capacityParams(5), hardCutoff: 30 });
+  assert.equal(run.result.completed, 2);
+  assert.ok(run.summary.retractCount > 0);
+  assert.ok(run.summary.recomputedTokens > 0);
+  assert.equal(run.result.hitTok.total, 128);
+  assert.equal(run.result.prefillTokensTotal, 128);
+  assert.equal(run.result.prefillReqDone, 2);
+  assert.equal(run.result.decodeTokensTotal, 258);
+  for (const req of run.arrivals) {
+    const events = run.events.filter(event => event.id === req.id);
+    assert.equal(events.filter(event => event.type === 'complete').length, 1);
+    assert.equal(req.admitTime, events.find(event => event.type === 'admit').time);
+    assert.equal(req.prefillEnd, events.find(event => event.type === 'prefillEnd').time);
+    assert.equal(req.decodeStart, events.find(event => event.type === 'decodeStart').time);
+    let last = 0;
+    for (const event of events.filter(event => event.type === 'output')) {
+      assert.ok(event.tokens >= last && event.tokens <= 129);
+      last = event.tokens;
+    }
+    assert.equal(last, 129);
+    assert.equal(req.tokensGen, 129);
+  }
+  const replay = execute('replay', templates, { params: capacityParams(5), hardCutoff: 30 });
+  assert.equal(replay.result.replay.counts.admitted, 2);
+  assert.equal(replay.result.replay.state.retractCount, replay.summary.retractCount);
+  assert.equal(replay.result.replay.state.recomputedTokens, replay.summary.recomputedTokens);
+  assert.equal(replay.result.replay.windows.full.cache.recomputedTokens, 64);
+  assert.equal(replay.result.replay.windows.measurement.cache.recomputedTokens, 0);
+});
+
+test('U3: infeasible input fails while independently arrived work continues', () => {
+  const run = equivalent([origin(256), origin(64, 0, 0, [[8, 1]])], { params: capacityParams(3) });
+  assert.equal(run.summary.counts.failed, 1);
+  assert.equal(run.result.completed, 1);
+  assert.equal(run.result.hitTok.total, 64);
+  assert.ok(run.events.some(event => event.id === 0 && event.type === 'fail' && event.reason === 'infeasible'));
+});
+
+test('U3: final request abort cancels only completion descendants and never ghost-completes', () => {
+  const child = { ...origin(64), timing: { kind: 'completion', anchorReq: 0, offsetMs: 0 } };
+  const run = execute('replay', [origin(128, 65), child, origin(64, 0, 0, [[8, 1]])], {
+    params: capacityParams(3), hardCutoff: 30,
+  });
+  assert.equal(run.summary.counts.aborted, 1);
+  assert.equal(run.summary.counts.cancelled, 1);
+  assert.equal(run.result.completed, 1);
+  assert.ok(!run.events.some(event => event.type === 'complete' && event.id === 0));
+  assert.ok(!run.events.some(event => event.type === 'arrive' && event.id === 1));
+  assert.equal(run.events.filter(event => event.type === 'fail').length, 1);
+});
+
+for (const type of ['none', 'best_effort', 'timeout', 'race']) {
+  test(`U3: ${type} uses real mixed-tier pages identically for both sources`, () => {
+    const request = origin(256, 1);
+    const run = equivalent([request], {
+      warm: warmPrefix(request, ['dram', 'ssd', 'dram', 'ssd']),
+      strategy: { ...base.strategy, prefetch: { type } },
+      params: { ssdBW: 0.02, fetchFixedUs: 1000, chunkSize: 64, maxPrefillTok: 64,
+        pfTimeoutBase: 0.01, pfTimeoutPerPage: 0 }, hardCutoff: 30,
+    });
+    assert.equal(run.result.completed, 1);
+    assert.deepEqual(run.result.hitTok, { l1: 0, l2: 128, l3: 128, miss: 0, total: 256 });
+    assert.ok(run.events.some(event => event.type === 'transfer-start'));
+    if (type === 'none') {
+      assert.equal(run.result.prefillComputeTokensTotal, 0);
+      assert.ok(run.result.transferGB > 0);
+      assert.ok(run.events.some(event => event.type === 'transfer-complete'));
+    } else {
+      assert.ok(run.result.prefillComputeTokensTotal > 0);
+      assert.ok(run.events.some(event => event.type === 'transfer-cancel'));
+    }
+    for (const event of run.events) {
+      for (const tier of ['hbm', 'dram', 'ssd']) {
+        assert.ok(event.cache[`${tier}Bytes`] <= event.cache[`${tier}CapacityBytes`]);
+      }
+    }
+  });
+}
+
+test('U3: slow-tier load-back has an independent two-link time and byte oracle', () => {
+  const request = origin(64);
+  const run = equivalent([request], { warm: warmPrefix(request, ['ssd']),
+    params: { ssdBW: 0.01, pcieBW: 1, dramBW: 400, fetchFixedUs: 500 }, hardCutoff: 30 });
+  const pageBytes = 10485760;
+  const expected = 0.0005 + pageBytes / (0.01 * 1e9 * 0.9) + pageBytes / 1e9;
+  close(run.arrivals[0].prefillEnd - run.arrivals[0].arrive, expected);
+  close(run.result.transferGB, 2 * pageBytes / 1e9);
+  assert.equal(run.result.prefillComputeTokensTotal, 0);
+});
+
+test('U3: shared running input survives a sibling retraction', () => {
+  const run = equivalent([origin(64, 129), origin(64, 129)], { params: capacityParams(4), hardCutoff: 30 });
+  assert.equal(run.result.completed, 2);
+  assert.equal(run.result.hitTok.total, 128);
+  assert.ok(run.summary.retractCount > 0);
+  const retracted = run.events.find(event => event.type === 'retract');
+  assert.ok(retracted.pages.some(page => !page.output && page.references === 1 && page.ready));
+  assert.ok(run.events.filter(event => event.type === 'readmit').every(event => event.hit.hitL1Tokens === 64));
+  assert.equal(run.result.activeEvictions, 0);
+});
+
+test('U3: retraction releases completion successors exactly once, only after successful recovery', () => {
+  const child = { ...origin(64), timing: { kind: 'completion', anchorReq: 0, offsetMs: 0 } };
+  const run = execute('replay', [origin(64, 129), origin(64, 129, 0, [[8, 1]]), child], {
+    params: capacityParams(5), hardCutoff: 30,
+  });
+  assert.equal(run.result.completed, 3);
+  assert.ok(run.events.some(event => event.type === 'retract' && event.id === 0));
+  const parent = run.events.filter(event => event.type === 'complete' && event.id === 0);
+  const arrivals = run.events.filter(event => event.type === 'arrive' && event.id === 2);
+  assert.equal(parent.length, 1); assert.equal(arrivals.length, 1);
+  assert.equal(parent[0].time, arrivals[0].time);
+  assert.equal(run.result.replay.counts.admitted, 3);
+  assert.equal(run.result.replay.state.aborted, 0);
+});
+
+test('U3: eviction retains the HBM source until transfer completes and admission waits for that event', () => {
+  const run = equivalent([origin(128), origin(128, 0, 500, [[8, 2]])], {
+    params: { ...capacityParams(2), tieredKv: true, dram: 0.03, ssd: 0.0001, pcieBW: 0.1 }, hardCutoff: 30,
+  });
+  assert.equal(run.result.completed, 2);
+  assert.equal(run.summary.retractCount, 0);
+  const wait = run.events.find(event => event.type === 'wait' && event.id === 1);
+  const admit = run.events.find(event => event.type === 'admit' && event.id === 1);
+  assert.ok(wait && admit.time > wait.time);
+  assert.ok(run.events.some(event => event.type === 'transfer-complete' && event.from === 'hbm' && event.time <= admit.time));
+  assert.ok(run.result.transferGB > 0);
+  assert.equal(run.result.activeEvictions, 0);
+});
+
+test('U3: a fractional deadline charges only elapsed transfer bytes and never makes the target ready', () => {
+  const request = origin(64, 0, 500), bundle = bundleOf([request]);
+  const first = createReplayRuntime({ bundle, options }, { qps: 2, seed: 42 }).nextTime;
+  const run = equivalent([request], { warm: warmPrefix(request, ['ssd']),
+    params: { ssdBW: 0.01, fetchFixedUs: 0 }, hardCutoff: first + 0.55 });
+  assert.equal(run.result.completed, 0);
+  assert.equal(run.result.truncated, true);
+  close(run.result.transferGB, 0.05 * 0.01 * 0.9);
+  assert.ok(!run.events.some(event => event.type === 'transfer-complete' || event.type === 'prefillEnd'));
+  assert.equal(run.summary.counts.arrivedUnfinished, 1);
+});
+
+test('U3: a first-hop completion at the hard cutoff cannot schedule a future second hop', () => {
+  const request = origin(64, 0, 500), bundle = bundleOf([request]);
+  const first = createReplayRuntime({ bundle, options }, { qps: 2, seed: 42 }).nextTime;
+  const cutoff = first + 0.5 + 10485760 / (0.01 * 1e9 * 0.9);
+  const run = equivalent([request], { warm: warmPrefix(request, ['ssd']),
+    params: { ssdBW: 0.01, fetchFixedUs: 0 }, hardCutoff: cutoff });
+  assert.equal(run.result.completed, 0);
+  assert.ok(run.events.some(event => event.type === 'transfer-complete' && event.to === 'dram'));
+  assert.ok(!run.events.some(event => event.type === 'transfer-start' && event.to === 'hbm'));
+  close(run.result.transferGB, 10485760 / 1e9);
+});
+
+test('U3: race joins a computed head with a physically fetched tail without double-counting work', () => {
+  const request = origin(256);
+  const run = equivalent([request], { warm: warmPrefix(request, ['ssd', 'ssd', 'ssd', 'ssd']),
+    strategy: { ...base.strategy, prefetch: { type: 'race' } },
+    params: { ssdBW: 1, fetchFixedUs: 0, chunkSize: 64, maxPrefillTok: 64 } });
+  assert.equal(run.result.completed, 1);
+  assert.equal(run.result.prefillComputeTokensTotal, 64);
+  assert.equal(run.events.filter(event => event.type === 'transfer-complete' && event.to === 'hbm').length, 3);
+  close(run.arrivals[0].prefillEnd - run.arrivals[0].arrive, 0.064);
+  close(run.result.transferGB, 6 * 10485760 / 1e9);
+  assert.equal(run.result.ttftBreakdown.fetch, 0);
+});
+
+for (const type of ['best_effort', 'timeout']) {
+  test(`U3: ${type} retains completed mixed-tier pages and recomputes only the missing ranges`, () => {
+    const blocker = origin(64, 0, 0, [[8, 1]]), request = origin(256);
+    const run = equivalent([blocker, request], { warm: warmPrefix(request, ['dram', 'ssd', 'dram', 'ssd']),
+      strategy: { ...base.strategy, prefetch: { type } },
+      params: { ssdBW: 0.02, fetchFixedUs: 0, chunkSize: 64, maxPrefillTok: 64,
+        pfTimeoutBase: 0.002, pfTimeoutPerPage: 0 } });
+    assert.equal(run.result.completed, 2);
+    const chunks = run.events.filter(event => event.id === 1 && event.type === 'prefillChunk');
+    const positions = type === 'best_effort' ? [64, 128, 192] : [64, 192];
+    assert.deepEqual(chunks.flatMap(event => event.ranges), positions.map(position => ({ position, tokens: 64 })));
+    assert.equal(run.result.prefillComputeTokensTotal, 64 + positions.length * 64);
+    assert.ok(run.result.fetchGB > 0);
+    assert.ok(run.events.some(event => event.type === 'transfer-cancel'));
+  });
+}
+
+test('U3: explicit group pulling deduplicates intervals rather than whole sessions', () => {
+  const request = origin(128), warm = warmPrefix(request, ['ssd', 'ssd']);
+  const run = coalesce => equivalent([request, request], { warm,
+    params: { fetchCoalesce: coalesce, ssdBW: 1, fetchFixedUs: 0 } });
+  const independent = run(false), shared = run(true);
+  assert.equal(independent.result.completed, 2); assert.equal(shared.result.completed, 2);
+  close(independent.result.transferGB, 8 * 10485760 / 1e9);
+  close(shared.result.transferGB, 4 * 10485760 / 1e9);
+  assert.deepEqual(independent.result.hitTok, shared.result.hitTok);
+  assert.equal(independent.result.prefillComputeTokensTotal, 0);
+  assert.equal(shared.result.prefillComputeTokensTotal, 0);
+});
+
+test('U3: final load-back at the hard cutoff settles zero-output success before releasing successors', () => {
+  const request = origin(64, 0, 500);
+  const child = { ...origin(128), timing: { kind: 'completion', anchorReq: 0, offsetMs: 0 } };
+  const params = { ssdBW: 0.01, pcieBW: 1, fetchFixedUs: 500 };
+  const baseline = execute('replay', [request, child], { warm: warmPrefix(request, ['ssd']), params });
+  const cutoff = baseline.arrivals[0].completeTime;
+  for (const delta of [-1e-8, 0, 1e-8]) {
+    const run = execute('replay', [request, child], { warm: warmPrefix(request, ['ssd']), params, hardCutoff: cutoff + delta });
+    assert.equal(run.result.completed, delta < 0 ? 0 : 1);
+    assert.equal(run.summary.counts.successful, delta < 0 ? 0 : 1);
+    if (delta >= 0) close(run.arrivals[0].completeTime, cutoff);
+    if (delta === 0) {
+      assert.equal(run.arrivals.length, 2);
+      assert.equal(run.arrivals[1].arrive, cutoff);
+      assert.ok(!run.events.some(event => event.id === 1 && event.type === 'admit'));
+      assert.equal(run.result.prefillComputeTokensTotal, 0);
+    }
+  }
+});
+
+test('U3: decodeWait remains active in last samples and exact time-weighted request counts', () => {
+  const run = execute('replay', [origin(64, 64), origin(64, 64)], {
+    strategy: { ...base.strategy, batching: { type: 'continuous', max_batch_size: 1 } },
+  });
+  assert.equal(run.result.completed, 2);
+  const [first, second] = run.arrivals;
+  assert.ok(second.decodeStart > second.prefillEnd);
+  const duringWait = run.result.replay.samples.series.filter(bucket => bucket.start > first.prefillEnd && bucket.end < first.completeTime);
+  assert.ok(duringWait.length > 0);
+  for (const bucket of duringWait) {
+    assert.equal(bucket.last.activeRequests, 2);
+    close(bucket.mean.activeRequests, 2);
+    assert.equal(bucket.last.queuedRequests, 0);
+  }
+  const integral = run.arrivals.reduce((sum, req) => sum + req.completeTime - req.arrive, 0);
+  close(run.result.replay.samples.timeWeightedMean.activeRequests, integral / run.result.simEnd);
+});
+
+for (const input of [64, 128]) {
+  test(`U3: a waiting ${input}-token prefetch cannot force an independently feasible decoder to abort`, () => {
+    const first = origin(64, 1, 0, [[8, 1]]), waiting = origin(input, 0, 65);
+    const run = equivalent([first, waiting], { warm: warmPrefix(waiting, ['dram']),
+      params: { ...capacityParams(2), tieredKv: true, pcieBW: 0.01 }, hardCutoff: 30 });
+    assert.equal(run.result.completed, 2);
+    assert.equal(run.summary.counts.failed, 0);
+    assert.equal(run.result.activeEvictions, 0);
+  });
+}

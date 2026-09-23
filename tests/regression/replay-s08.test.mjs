@@ -45,6 +45,143 @@ test('S08: token accounting is first-admission only, and unknown ratios are null
   assert.equal(report.windows.drain.completionQps, null);
 });
 
+test('U3 metrics: disabling finite capacity preserves the complete legacy metric shape', () => {
+  const run = options => {
+    const m = make(options), a = req(0, 1);
+    m.arrive(a); m.admit(a, hit); m.complete(a);
+    m.observe(0, { activeRequests: 1, hbmBytes: 64 });
+    m.observe(2, { activeRequests: 0, hbmBytes: 0 });
+    return m.finish(4, { truncated: false, terminationReason: 'drained' });
+  };
+  const legacy = run({}), explicit = run({ finiteCapacity: false });
+  assert.deepEqual(explicit, legacy);
+  const keys = ['activeSessions', 'activeRequests', 'queuedRequests', 'hbmBytes', 'inputPages', 'outputPages'];
+  assert.deepEqual(Object.keys(legacy.samples.timeWeightedMean), keys);
+  assert.deepEqual(Object.keys(legacy.samples.peak), keys);
+  for (const sample of legacy.samples.series) {
+    assert.deepEqual(Object.keys(sample.mean), keys);
+    assert.deepEqual(Object.keys(sample.peak), keys);
+    assert.deepEqual(Object.keys(sample.last), keys);
+  }
+  assert.equal(legacy.state.retractCount, 0);
+  assert.equal(legacy.state.supportedScope, 'single-instance/64-token/HBM-capacity-sufficient');
+  assert.equal('recomputedTokens' in legacy.state, false);
+  assert.equal('recomputedTokens' in legacy.cache, false);
+  assert.equal('workloadModelVersion' in legacy.configuration, false);
+});
+
+test('U3 metrics: tier residency and reservations are time weighted only in finite mode', () => {
+  const version = 'workload-u3-64-tiered-v1';
+  const m = make({ finiteCapacity: true, configuration: { workloadModelVersion: version } });
+  const occupied = { hbmBytes: 96, hbmResidentBytes: 64, hbmReservedBytes: 32,
+    dramBytes: 128, dramReservedBytes: 64, ssdBytes: 256, ssdReservedBytes: 128 };
+  const released = Object.fromEntries(Object.keys(occupied).map(key => [key, 0]));
+  m.observe(0, occupied);
+  m.observe(2, released);
+  const report = m.finish(4, {});
+  assert.equal(report.configuration.workloadModelVersion, version);
+  assert.equal(report.state.supportedScope, 'single-instance/64-token/finite-capacity-tiered-four-configurations');
+  assert.ok(report.samples.series.length <= 20000);
+  for (const [key, bytes] of Object.entries(occupied)) {
+    assert.ok(Math.abs(report.samples.timeWeightedMean[key] - bytes / 2) < 1e-9);
+    assert.equal(report.samples.peak[key], bytes);
+    assert.equal(report.samples.series[0].mean[key], bytes);
+    assert.equal(report.samples.series[0].peak[key], bytes);
+    assert.equal(report.samples.series[0].last[key], bytes);
+    assert.equal(report.samples.series.at(-1).mean[key], 0);
+    assert.equal(report.samples.series.at(-1).last[key], 0);
+  }
+});
+
+test('U3 metrics: retries count events without repeating admission denominators or successful output', () => {
+  const m = make({ finiteCapacity: true }), a = req(0, 1);
+  m.arrive(a); m.admit(a, hit);
+  a.firstTokenTime = a.prefillEnd;
+  m.retract(a, 1.5);
+  m.admit(a, { ...hit, hitL1Tokens: 0, missTokens: 64 });
+  m.recompute(a, 64, 2);
+  m.retract(a, 3);
+  m.admit(a, hit);
+  m.recompute(a, 128, 3.5);
+  a.prefillEnd = 3.6;
+  m.complete(a); m.complete(a);
+  m.retract(a, 4); m.recompute(a, 64, 4);
+  const report = m.finish(4, {});
+  assert.equal(report.counts.arrived, 1);
+  assert.equal(report.counts.admitted, 1);
+  assert.equal(report.counts.successful, 1);
+  assert.equal(report.counts.outputTokens, 1);
+  assert.equal(report.samples.requests.length, 1);
+  assert.equal(report.cache.inputTokens, 64);
+  assert.equal(report.cache.hitL1Tokens, 16);
+  assert.equal(report.cache.missTokens, 48);
+  assert.equal(report.cache.hitRate, 0.25);
+  assert.equal(report.state.retractCount, 2);
+  assert.equal(report.state.recomputedTokens, 192);
+  assert.equal(report.windows.measurement.retractCount, 1);
+  assert.equal(report.windows.drain.retractCount, 1);
+  assert.equal(report.windows.measurement.recomputedTokens, 64);
+  assert.equal(report.windows.drain.recomputedTokens, 128);
+  assert.equal(report.windows.full.recomputedTokens, 192);
+  assert.equal(report.cache.recomputedTokens, 64);
+  assert.equal(report.windows.measurement.cache.recomputedTokens, 64);
+  assert.equal(report.windows.drain.cache.recomputedTokens, 128);
+  assert.equal(report.windows.full.cache.recomputedTokens, 192);
+  assert.equal(report.windows.full.completions, 1);
+  assert.equal(report.windows.measurement.successfulArrivals, 1);
+  assert.equal(report.windows.measurement.latency.ttft.count, 1);
+  assert.ok(Math.abs(report.windows.measurement.latency.ttft.mean - 100) < 1e-9);
+  assert.ok(Math.abs(report.windows.measurement.latency.tpot.mean - 2900) < 1e-9);
+  assert.equal(report.windows.measurement.latency.endToEnd.mean, 3000);
+});
+
+test('U3 metrics: a retraction is not a terminal event and does not mutate request state', () => {
+  const m = make({ finiteCapacity: true }), a = req(0, 1);
+  m.arrive(a); m.admit(a, hit);
+  const before = structuredClone(a);
+  m.retract(a, 1.5);
+  assert.deepEqual(a, before);
+  const pending = m.finish(2, {});
+  assert.equal(pending.state.retractCount, 1);
+  assert.equal(pending.counts.successful, 0);
+  assert.equal(pending.counts.failed, 0);
+  assert.equal(pending.counts.cancelled, 0);
+  assert.equal(pending.windows.full.completions, 0);
+  assert.equal(pending.windows.full.unfinishedArrivals, 1);
+  assert.equal(pending.windows.full.latency.ttft.count, 0);
+  assert.deepEqual(pending.samples.requests, []);
+  assert.equal(pending.samples.requestCoverage.total, 0);
+  m.admit(a, hit); m.recompute(a, 64, 3); m.complete(a);
+  const completed = m.finish(4, {});
+  assert.equal(completed.counts.successful, 1);
+  assert.equal(completed.counts.admitted, 1);
+  assert.equal(completed.windows.full.unfinishedArrivals, 0);
+});
+
+test('U3 metrics: retry event validation rejects invalid work without affecting counters', () => {
+  const m = make({ finiteCapacity: true }), a = req(0, 1);
+  m.arrive(a);
+  assert.throws(() => m.retract(a, 1), /before admission/);
+  assert.throws(() => m.recompute(a, 64, 1), /before admission/);
+  m.admit(a, hit);
+  for (const tokens of [-1, 0.5, NaN, Infinity]) assert.throws(() => m.recompute(a, tokens, 2), /token invariant/);
+  for (const time of [-1, 6, NaN, Infinity]) {
+    assert.throws(() => m.retract(a, time), /time invariant/);
+    assert.throws(() => m.recompute(a, 64, time), /time invariant/);
+  }
+  const report = m.finish(4, {});
+  assert.equal(report.state.retractCount, 0);
+  assert.equal(report.state.recomputedTokens, 0);
+  assert.equal(report.cache.inputTokens, 64);
+});
+
+test('U3 metrics: a zero first-token timestamp is retained instead of replaced by a retry prefill end', () => {
+  const m = make({ finiteCapacity: true }), a = req(0, 0);
+  a.firstTokenTime = 0; a.prefillEnd = 3;
+  m.arrive(a); m.admit(a, hit); m.complete(a);
+  assert.equal(m.finish(4, {}).windows.full.latency.ttft.mean, 0);
+});
+
 test('S08: time-weighted sampling integrates idle skips and respects 20000-bucket cap', () => {
   const m = make({ hardCutoff: 100000 });
   m.observe(0, { activeRequests: 2, activeSessions: 1, hbmBytes: 64 });
