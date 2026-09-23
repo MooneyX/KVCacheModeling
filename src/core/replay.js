@@ -788,7 +788,7 @@ export function createReplayRuntime(replay, config) {
           session.states[index] = 2;
           counters.arrived++;
           const request = createReplayRequest(bundle.sessions[session.templateIndex].req[index], session.baseId + index, event.time,
-            { sessionInstanceKey: session.sessionInstanceKey, sessionId: session.sessionInstanceKey, routingKey: session.sessionInstanceKey,
+            { sessionInstanceKey: session.sessionInstanceKey, sessionId: session.sessionInstanceKey, routingKey: `replay:t${session.templateIndex}:n${session.launchIndex}`,
               templateIndex: session.templateIndex, launchIndex: session.launchIndex, requestIndex: index });
           hooks.arrive?.(request);
           for (const child of templates[session.templateIndex].arrival[index]) release(session, child, event.time);

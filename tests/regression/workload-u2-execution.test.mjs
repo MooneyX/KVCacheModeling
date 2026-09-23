@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { runSimulation, runWorkloadAcceptance, WORKLOAD_MODEL_VERSION } from '../../src/core/simulation.js';
 import { createSyntheticRuntime, createReplayRequest } from '../../src/core/requests.js';
 import { createReplayRuntime } from '../../src/core/replay.js';
+import { calcAll, estimatePrefillParams } from '../../src/core/calculations.js';
 
 const base = JSON.parse(readFileSync(new URL('../fixtures/simulation-baseline.json', import.meta.url)))[0];
 const options = { durationSeconds: 0.2, warmupSeconds: 0 };
@@ -49,6 +50,7 @@ function execute(kind, templates, { twoTurn = false, hardCutoff = 8, earliestEnd
             const description = createReplayRequest(template, req.id, req.arrive, { sessionId: 'equivalent', requestIndex: req.id });
             req.inputLen = template.in; req.outputLen = template.out;
             req.inputContent = description.inputContent; req.outputIdentity = description.outputIdentity;
+            req.routingKey = description.routingKey;
             arrivals.push(req); emit(req);
           });
         },
@@ -82,6 +84,232 @@ test('U2: equivalent single requests use identical compute, output, reference an
   assert.deepEqual(last.pages.filter(page => page.output).map(page => page.tokens), [64, 1]);
   assert.ok(last.pages.every(page => page.references === 0));
   assert.equal(run.summary.cache.inputPages, 2); assert.equal(run.summary.cache.outputPages, 2);
+});
+
+for (const blockSize of [16, 32, 64, 128]) {
+  test(`U4.1: equivalent sources use B=${blockSize} across RLE boundaries, input tails and output growth`, () => {
+    const runs = [[0, 1], [7, 2]];
+    const run = equivalent([origin(129, blockSize + 1, 0, runs), origin(129, 0, 2000, runs)], { params: { blockSize } });
+    assert.equal(run.result.completed, 2);
+    assert.deepEqual(run.result.hitTok, { l1: 129, l2: 0, l3: 0, miss: 129, total: 258 });
+    assert.equal(run.summary.cache.inputPages, Math.ceil(129 / blockSize));
+    assert.equal(run.summary.cache.outputPages, 2);
+    const pages = run.events.at(-1).pages;
+    assert.deepEqual(pages.filter(page => page.output).map(page => page.tokens), [blockSize, 1]);
+    assert.ok(pages.every(page => page.references === 0));
+    close(run.summary.cache.hbmBytes, (Math.ceil(129 / blockSize) + 2) * blockSize * 163840);
+  });
+}
+
+for (const prefixAffinity of [false, true]) {
+  test(`U4.2: private instance caches conserve pages and hits with prefixAffinity=${prefixAffinity}`, () => {
+    const run = equivalent([0, 500, 1000, 1500].map(offset => origin(129, 1, offset)), {
+      params: { instances: 2, prefixAffinity, blockSize: 32 },
+      strategy: { ...base.strategy, routing: { type: 'round_robin' } },
+    });
+    assert.equal(run.result.completed, 4);
+    assert.deepEqual(run.arrivals.map(req => req.instId), [0, 1, 0, 1]);
+    assert.deepEqual(run.result.hitTok, { l1: 258, l2: 0, l3: 0, miss: 258, total: 516 });
+    assert.equal(run.summary.cache.inputPages, 10);
+    assert.equal(run.summary.cache.outputPages, 4);
+    for (const event of run.events) {
+      close(event.cache.hbmBytes, event.resources.reduce((sum, resource) => sum + resource.cache.hbmBytes, 0));
+      for (const resource of event.resources) {
+        assert.ok(resource.cache.hbmBytes <= resource.cache.hbmCapacityBytes);
+        assert.ok(resource.pages.every(page => page.resourceId === resource.resourceId));
+      }
+    }
+    const last = run.events.at(-1);
+    assert.ok(last.pages.every(page => page.references === 0));
+    assert.equal(new Set(last.pages.map(page => page.id)).size, last.pages.length);
+  });
+}
+
+test('U4.2: delayed completion releases only its owner while the other instance continues', () => {
+  const run = equivalent([origin(64, 129), origin(64, 1, 0, [[8, 1]])], {
+    params: { instances: 2 }, strategy: { ...base.strategy, routing: { type: 'round_robin' } }, hardCutoff: 30,
+  });
+  assert.equal(run.result.completed, 2);
+  const complete = run.events.filter(event => event.type === 'complete');
+  assert.deepEqual(complete.map(event => event.id), [1, 0]);
+  assert.ok(complete[0].resources[0].pages.some(page => page.references > 0));
+  assert.ok(complete[0].resources[1].pages.every(page => page.references === 0));
+  assert.ok(complete[1].pages.every(page => page.references === 0));
+  assert.equal(run.result.decodeTokensTotal, 130);
+  for (const req of run.arrivals) {
+    assert.ok(req.decodeStart >= req.prefillEnd);
+    assert.ok(req.completeTime > req.decodeStart);
+    assert.equal(req.tokensGen, req.outputLen);
+  }
+});
+
+test('U4.2: shared clock agrees with isolated devices even when their completion boundaries differ', () => {
+  const templates = [origin(64, 1, 500), origin(192, 1, 500, [[8, 3]])];
+  const together = equivalent(templates, { params: { instances: 2 },
+    strategy: { ...base.strategy, routing: { type: 'round_robin' } } });
+  const params = { ...common, gpus: 4, tpSize: 4, epSize: 1 };
+  const estimate = estimatePrefillParams(params);
+  for (const [i, template] of templates.entries()) {
+    const alone = execute('replay', [template], { params: { ...params, prefillA: estimate.a,
+      prefillB: estimate.b, prefillBIdx: estimate.bIdx } });
+    const req = together.arrivals[i], isolated = alone.arrivals[0];
+    close(req.prefillEnd - req.arrive, isolated.prefillEnd - isolated.arrive);
+    close(req.completeTime - req.arrive, isolated.completeTime - isolated.arrive);
+  }
+  const cutoff = together.arrivals[0].completeTime;
+  const cut = equivalent(templates, { params: { instances: 2 }, hardCutoff: cutoff,
+    strategy: { ...base.strategy, routing: { type: 'round_robin' } } });
+  assert.equal(cut.result.completed, 1);
+  assert.ok(cut.arrivals[1].tokensGen < 1);
+});
+
+const pdParams = { pdMode: 2, pdSep: true, pdPrefillGpus: 4, pdLinkBW: 0.1, pdLinkUtil: 0.5, pdKvComp: true };
+const pdCapacity = pages => ({ ...pdParams, pdPrefillGpus: 5, tieredKv: false,
+  hbmPerGpu: (70.54819328 * 1.02 + 18 + (pages + 0.01) * 0.01048576) / 3 });
+
+for (const blockSize of [32, 128]) {
+  test(`U4.3: B=${blockSize} P/D handoff obeys byte/time oracles and grows output only on D`, () => {
+    const run = equivalent([origin(129, 65, 500, [[0, 1], [7, 2]])], { params: { ...pdParams, blockSize } });
+    const req = run.arrivals[0], bytes = 129 * 163840, duration = bytes / 50_000_000;
+    assert.equal(run.result.completed, 1);
+    close(req._kvXferEnd - req.prefillEnd, duration);
+    close(req.firstTokenTime, req._kvXferEnd);
+    assert.ok(req.decodeStart >= req._kvXferEnd);
+    close(run.result.avgTtft, (req.firstTokenTime - req.arrive) * 1000);
+    const during = run.events.find(event => event.cache.decodeHbmReservedBytes > 0);
+    assert.ok(during, 'D capacity must be reserved before KV is ready');
+    assert.equal(during.cache.prefillHbmBytes, Math.ceil(129 / blockSize) * blockSize * 163840);
+    assert.equal(during.cache.decodeHbmReservedBytes, Math.ceil(129 / blockSize) * blockSize * 163840);
+    const start = run.events.find(event => event.type === 'decodeStart');
+    assert.equal(start.cache.decodeHbmReservedBytes, 0);
+    assert.ok(start.resources.filter(resource => resource.resourceId.includes('prefill')).flatMap(resource => resource.pages).every(page => page.references === 0));
+    const last = run.events.at(-1);
+    const device = calcAll({ ...common, ...pdParams, blockSize, gpus: 4, tpSize: 4, epSize: 1 });
+    assert.equal(last.cache.prefillHbmCapacityBytes, device.availHbm);
+    assert.equal(last.cache.decodeHbmCapacityBytes, device.availHbm);
+    assert.equal(last.resources.filter(resource => resource.resourceId.includes('prefill')).length, 1);
+    assert.equal(last.resources.filter(resource => resource.resourceId.includes('decode')).length, 1);
+    assert.equal(last.cache.prefillHbmBytes, Math.ceil(129 / blockSize) * blockSize * 163840);
+    assert.equal(last.cache.decodeHbmBytes, (Math.ceil(129 / blockSize) + Math.ceil(65 / blockSize)) * blockSize * 163840);
+    assert.ok(last.pages.filter(page => page.output).every(page => page.resourceId.includes('decode')));
+    assert.ok(last.pages.every(page => page.references === 0));
+    for (const event of run.events) {
+      assert.ok(event.cache.prefillHbmBytes <= event.cache.prefillHbmCapacityBytes);
+      assert.ok(event.cache.decodeHbmBytes <= event.cache.decodeHbmCapacityBytes);
+      close(event.cache.hbmBytes, event.cache.prefillHbmBytes + event.cache.decodeHbmBytes);
+    }
+    const replay = execute('replay', [origin(129, 65, 500, [[0, 1], [7, 2]])], { params: { ...pdParams, blockSize } });
+    close(replay.result.replay.windows.full.latency.ttft.mean, replay.result.avgTtft);
+  });
+}
+
+for (const pdPrefillGpus of [3, 5]) {
+  test(`U4.3: ${pdPrefillGpus === 3 ? 'P' : 'D'} capacity cannot borrow the other side's spare memory`, () => {
+    const params = { ...pdCapacity(2), pdPrefillGpus };
+    const run = equivalent([origin(192, 1), origin(64, 1, 0, [[8, 1]])], { params, hardCutoff: 30 });
+    assert.equal(run.result.completed, 1);
+    assert.equal(run.summary.counts.failed, 1);
+    assert.ok(run.events.some(event => event.type === 'fail' && event.id === 0));
+    assert.ok(!run.events.some(event => event.type === 'decodeStart' && event.id === 0));
+    const small = pdPrefillGpus === 3 ? 'prefill' : 'decode';
+    assert.ok(run.events.every(event => event.cache[`${small}HbmBytes`] <= event.cache[`${small}HbmCapacityBytes`]));
+  });
+}
+
+test('U4.3: waiting for D capacity retains P ownership and resumes after a decoder completes', () => {
+  const run = equivalent([origin(192, 1), origin(192, 1, 0, [[8, 3]])], { params: pdCapacity(4), hardCutoff: 30 });
+  assert.equal(run.result.completed, 2);
+  const [first, second] = run.arrivals;
+  assert.ok(second._kvX0 >= first.completeTime);
+  assert.equal(run.summary.counts.failed, 0);
+  assert.ok(run.events.every(event => event.cache.decodeHbmBytes <= event.cache.decodeHbmCapacityBytes));
+  assert.ok(run.events.at(-1).pages.every(page => page.references === 0));
+});
+
+test('U4.3: a fractional hard cutoff cannot decode or complete before P/D handoff finishes', () => {
+  const template = origin(64, 1, 500);
+  const full = execute('replay', [template], { params: pdParams });
+  const req = full.arrivals[0], cutoff = req.prefillEnd + (req._kvXferEnd - req.prefillEnd) / 2;
+  const run = equivalent([template], { params: pdParams, hardCutoff: cutoff });
+  assert.equal(run.result.completed, 0);
+  assert.equal(run.summary.counts.arrivedUnfinished, 1);
+  assert.equal(run.arrivals[0].tokensGen, 0);
+  assert.ok(!run.events.some(event => event.type === 'decodeStart' || event.type === 'output'));
+  close(run.arrivals[0]._kvXferSent / (64 * 163840), 0.5);
+});
+
+test('U4.3: zero-output work completes on P without transferring KV or allocating D pages', () => {
+  const run = equivalent([origin(64)], { params: pdParams });
+  assert.equal(run.result.completed, 1);
+  assert.equal(run.arrivals[0].completeTime, run.arrivals[0].prefillEnd);
+  assert.equal(run.summary.cache.decodeHbmBytes, 0);
+  assert.ok(!run.events.some(event => event.type === 'decodeStart'));
+});
+
+test('U4.3: simultaneous handoffs share one PD link without duplicating bandwidth', () => {
+  const run = equivalent([origin(128, 1), origin(128, 1, 0, [[8, 2]])], { params: pdParams });
+  assert.equal(run.result.completed, 2);
+  const [a, b] = run.arrivals;
+  close(a.prefillEnd, b.prefillEnd);
+  close(Math.max(a._kvXferEnd, b._kvXferEnd) - a.prefillEnd, 2 * 128 * 163840 / 50_000_000);
+  for (const req of run.arrivals) {
+    assert.ok(req._kvXferEnd - req.prefillEnd >= 128 * 163840 / 50_000_000 - 1e-10);
+    close(req._kvXferSent, 128 * 163840);
+    assert.ok(req.decodeStart >= req._kvXferEnd);
+  }
+});
+
+test('U4.3: independent P computation does not stop an already-ready D decoder', () => {
+  const run = equivalent([origin(64, 65), origin(4096, 0, 500, [[8, 64]])], { params: pdParams, hardCutoff: 30 });
+  assert.equal(run.result.completed, 2);
+  const prefill = run.arrivals[1];
+  assert.ok(run.events.some(event => event.id === 0 && event.type === 'output'
+    && event.time > prefill.prefillStart && event.time < prefill.prefillEnd));
+});
+
+test('U4.3: exact handoff cutoff settles ownership but produces no future output', () => {
+  const template = origin(64, 1, 500), params = pdParams;
+  const full = execute('replay', [template], { params });
+  const cutoff = full.arrivals[0]._kvXferEnd;
+  for (const delta of [-1e-8, 0, 1e-8]) {
+    const run = equivalent([template], { params, hardCutoff: cutoff + delta });
+    assert.equal(run.result.completed, 0);
+    const transfers = run.events.filter(event => event.type === 'pdTransferComplete');
+    assert.equal(transfers.length, delta < 0 ? 0 : 1);
+    if (delta === 0) {
+      close(transfers[0].time, cutoff);
+      assert.equal(run.arrivals[0].tokensGen, 0);
+      assert.equal(run.summary.cache.decodeHbmReservedBytes, 0);
+      assert.ok(!run.events.some(event => event.type === 'output'));
+    }
+  }
+});
+
+test('U4.3: D output pressure retracts and re-handoffs generated history without duplicate completion', () => {
+  const child = { ...origin(64), timing: { kind: 'completion', anchorReq: 0, offsetMs: 0 } };
+  const run = execute('replay', [origin(64, 129), origin(64, 129, 0, [[8, 1]]), child], {
+    params: pdCapacity(5), hardCutoff: 30,
+  });
+  assert.equal(run.result.completed, 3);
+  assert.ok(run.summary.retractCount > 0);
+  assert.equal(run.result.decodeTokensTotal, 258);
+  assert.equal(run.result.hitTok.total, 192);
+  assert.equal(run.result.replay.counts.admitted, 3);
+  assert.equal(run.events.filter(event => event.type === 'arrive' && event.id === 2).length, 1);
+  for (const req of run.arrivals) {
+    assert.equal(run.events.filter(event => event.type === 'complete' && event.id === req.id).length, 1);
+    if (req.outputLen) {
+      close(req.firstTokenTime, run.events.find(event => event.type === 'pdTransferComplete' && event.id === req.id).time);
+      assert.equal(req.tokensGen, req.outputLen);
+    }
+  }
+  const retried = run.events.filter(event => event.type === 'pdTransferStart' && event.total > 64 * 163840);
+  assert.ok(retried.length > 0, 're-handoff must include already-generated output KV');
+  assert.ok(run.events.at(-1).pages.every(page => page.references === 0 && !page.transferLocked));
+  for (const event of run.events) {
+    assert.ok(event.cache.prefillHbmBytes <= event.cache.prefillHbmCapacityBytes);
+    assert.ok(event.cache.decodeHbmBytes <= event.cache.decodeHbmCapacityBytes);
+  }
 });
 
 test('U2: equivalent shared prefixes have hand-calculated 448 = 192 hit + 256 miss tokens', () => {
@@ -175,8 +403,16 @@ test('U2: unresolved dependencies without executable work or future events fail 
 });
 
 test('U2: restricted development scope rejects unsupported topology and does not change the production entry', () => {
-  for (const overrides of [{ blockSize: 32 }, { instances: 2 }, { pdMode: 2 }, { pdSep: true }]) {
-    assert.throws(() => runWorkloadAcceptance(common, base.strategy, overrides), /U2 acceptance requires/);
+  assert.throws(() => runWorkloadAcceptance(common, base.strategy, { blockSize: 48 }), /blockSize|physical|64/);
+  for (const overrides of [{ instances: 0 }, { instances: 1.5 }, { instances: common.gpus + 1 }]) {
+    assert.throws(() => runWorkloadAcceptance(common, base.strategy, overrides), /U4\.2 acceptance requires/);
+  }
+  for (const overrides of [{ pdSep: true }, { pdMode: 1 }, { ...pdParams, pdPrefillGpus: 0 },
+    { ...pdParams, pdPrefillGpus: common.gpus }, { ...pdParams, pdLinkBW: 0 }, { ...pdParams, pdLinkUtil: 2 }]) {
+    assert.throws(() => runWorkloadAcceptance(common, base.strategy, overrides), /U4\.3 acceptance/);
+  }
+  for (const execute of [runSimulation, runWorkloadAcceptance]) {
+    assert.throws(() => execute(common, base.strategy, { instances: 2, ...pdParams }), /Multiple instances.*P\/D/);
   }
   const overrides = { nreq: 1, inputLen: 64, outputLen: 64, prefixHit: 0, prefixWarm: false };
   const ordinary = runSimulation(common, base.strategy, overrides);
@@ -193,6 +429,21 @@ const warmPrefix = (template, tiers) => [{
   content: [...createReplayRequest(template, 0, 0, { sessionId: 'equivalent', requestIndex: 0 }).inputContent],
   placements: tiers.map((tier, i) => ({ tier, position: i * 64, tokens: 64 })),
 }];
+
+test('U4.3: unrelated P-side slow fetch cannot block D output retraction and progress', () => {
+  const slow = origin(64, 0, 1000, [[16, 1]]);
+  const run = equivalent([origin(64, 129), origin(64, 129, 0, [[8, 1]]), slow], {
+    params: { ...pdCapacity(5), tieredKv: true, ssdBW: 0.00001 },
+    warm: warmPrefix(slow, ['ssd']), hardCutoff: 30,
+  });
+  assert.equal(run.result.completed, 2);
+  assert.equal(run.summary.counts.failed, 0);
+  assert.equal(run.summary.counts.arrivedUnfinished, 1);
+  assert.ok(run.events.some(event => event.type === 'retract'));
+  assert.ok(run.events.some(event => event.type === 'transfer-start' && event.from === 'ssd'));
+  assert.ok(!run.events.some(event => event.type === 'transfer-complete' && event.from === 'ssd'));
+  assert.equal(run.result.decodeTokensTotal, 258);
+});
 
 test('U3: physical input pages queue without changing logical denominators', () => {
   const run = equivalent([origin(128, 1), origin(128, 1, 0, [[8, 2]])], { params: capacityParams(3) });
@@ -234,6 +485,32 @@ test('U3: output pressure retracts and restores generated history without duplic
   assert.equal(replay.result.replay.state.recomputedTokens, replay.summary.recomputedTokens);
   assert.equal(replay.result.replay.windows.full.cache.recomputedTokens, 64);
   assert.equal(replay.result.replay.windows.measurement.cache.recomputedTokens, 0);
+});
+
+test('U4.2: warm caches are real instance-private copies limited by each local tier capacity', () => {
+  const request = origin(64);
+  for (const dram of [0.015, 0.03]) {
+    const run = equivalent([request, request], { params: { instances: 2, dram },
+      warm: warmPrefix(request, ['dram']), strategy: { ...base.strategy, routing: { type: 'round_robin' } } });
+    assert.equal(run.result.completed, 2);
+    const initial = run.events[0], expected = dram === 0.015 ? 0 : 2 * 10485760;
+    assert.equal(initial.cache.dramBytes, expected);
+    assert.equal(run.result.hitTok.l2, expected ? 128 : 0);
+    const ids = initial.resources.flatMap(resource => resource.pages.map(page => page.id));
+    assert.equal(new Set(ids).size, ids.length);
+    for (const event of run.events) for (const resource of event.resources) {
+      assert.ok(resource.cache.dramBytes <= resource.cache.dramCapacityBytes);
+    }
+  }
+});
+
+test('U4.2: the physical reference budget remains global across instance copies', () => {
+  const bundle = bundleOf([origin(64), origin(64, 0, 0, [[8, 1]])]);
+  assert.throws(() => runWorkloadAcceptance({ ...common, instances: 2, blockSize: 32 },
+    { ...base.strategy, routing: { type: 'round_robin' } }, {
+      seed: 42, qps: 4, simMaxTime: 5,
+      replay: { bundle, options: { ...options, limits: { maxBlockReferences: 2 } } },
+    }), /physical block resource limit/);
 });
 
 test('U3: infeasible input fails while independently arrived work continues', () => {
@@ -440,6 +717,51 @@ test('U3: decodeWait remains active in last samples and exact time-weighted requ
   const integral = run.arrivals.reduce((sum, req) => sum + req.completeTime - req.arrive, 0);
   close(run.result.replay.samples.timeWeightedMean.activeRequests, integral / run.result.simEnd);
 });
+
+test('U4.2: all routing algorithms leave synthetic source RNG and follow-up session identity unchanged', () => {
+  const runs = ['round_robin', 'random', 'power_of_two', 'hash_prefix'].map(type => {
+    const arrivals = [];
+    const result = runWorkloadAcceptance({ ...common, instances: 2, inputLen: 64, outputLen: 64,
+      concurrency: 1, multiTurn: 1, qps: 2 }, { ...base.strategy, routing: { type } }, { seed: 42, nreq: 1 }, {
+      window: { earliestEnd: 0, hardCutoff: 30 },
+      source(source) {
+        const drain = source.drainEvents;
+        source.drainEvents = (now, emit) => drain(now, req => { arrivals.push(req); emit(req); });
+        return source;
+      },
+    });
+    assert.equal(result.completed, 2);
+    const [parent, child] = arrivals;
+    assert.equal(child.sessionId, parent.sessionId);
+    assert.equal(child.routingKey, parent.routingKey);
+    if (type === 'hash_prefix') assert.equal(child.instId, parent.instId);
+    return { arrive: parent.arrive, input: parent.inputLen, output: parent.outputLen,
+      childInput: child.inputLen, childOutput: child.outputLen, thinkTime: child.arrive - parent.completeTime };
+  });
+  for (const run of runs.slice(1)) close(run, runs[0]);
+});
+
+for (const type of ['round_robin', 'random', 'power_of_two', 'hash_prefix']) {
+  test(`U4.2: ${type} produces repeatable Replay routes without disturbing session launches`, () => {
+    const run = () => {
+      const arrivals = [];
+      const result = runWorkloadAcceptance({ ...common, instances: 2 }, { ...base.strategy, routing: { type } }, {
+        seed: 42, qps: 60, simMaxTime: 5, replay: { bundle: bundleOf([origin(64, 1)]), options },
+      }, {
+        source(source) {
+          const drain = source.drainEvents;
+          source.drainEvents = (now, emit) => drain(now, req => { arrivals.push(req); emit(req); });
+          return source;
+        },
+      });
+      assert.equal(result.completed, arrivals.length);
+      assert.ok(arrivals.length > 2);
+      return arrivals.map(req => ({ id: req.id, routingKey: req.routingKey, arrive: req.arrive,
+        instance: req.instId, input: req.inputLen, output: req.outputLen }));
+    };
+    assert.deepEqual(run(), run());
+  });
+}
 
 for (const input of [64, 128]) {
   test(`U3: a waiting ${input}-token prefetch cannot force an independently feasible decoder to abort`, () => {

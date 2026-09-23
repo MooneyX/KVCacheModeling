@@ -62,6 +62,33 @@ test('S09: parseJob preserves replay for normalized and controls formats and rej
   assert.throws(() => library.parseJob({ ...controls, mode: 'other' }), /mode/);
 });
 
+test('U4.1: normalized and controls jobs validate the effective physical page mapping', () => {
+  for (const blockSize of [1, 16, 32, 64, 128, 192]) {
+    assert.equal(library.parseJob(normalized({ blockSize })).overrides.blockSize, blockSize);
+    assert.equal(library.parseJob({ pBlockSize: String(blockSize) }).params.blockSize, blockSize);
+  }
+  for (const blockSize of [0, -1, 1.5, 3, 48, 96, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => library.parseJob(normalized({ blockSize })), /blockSize|physical|64/);
+    assert.throws(() => library.parseJob({ pBlockSize: String(blockSize) }), /blockSize|physical|64/);
+  }
+  assert.equal(library.parseJob({ pBlockSize: '48', overrides: { blockSize: 32 } }).overrides.blockSize, 32);
+  assert.equal(library.paramsFromControls({ pBlockSize: '1.5' }).blockSize, 1.5);
+});
+
+test('U4: effective multi-instance and physical P/D conflicts fail for either workload source', () => {
+  const { bundle } = JSON.parse(readFileSync(join(root, 'tests/fixtures/replay/runtime-prefix.json')));
+  for (const replay of [undefined, { bundle, options: { durationSeconds: 1, warmupSeconds: 0 } }]) {
+    const job = normalized({ instances: 2, pdMode: 2, ...(replay ? { replay } : {}) });
+    assert.throws(() => library.parseJob(job), /Multiple instances.*P\/D/);
+    assert.throws(() => library.parseJob({ ...job, params: { ...job.params, instances: 2 },
+      overrides: { ...job.overrides, instances: undefined } }), /instances/);
+    const inherited = { ...job, params: { ...job.params, instances: 2, pdMode: 2 }, overrides: { ...job.overrides } };
+    delete inherited.overrides.instances; delete inherited.overrides.pdMode;
+    assert.throws(() => library.parseJob(inherited), /Multiple instances.*P\/D/);
+    assert.doesNotThrow(() => library.parseJob({ ...inherited, overrides: { ...inherited.overrides, pdMode: 0 } }));
+  }
+});
+
 test('S09: path protection, malformed gzip, byte limits and CLI validation are visible errors', async t => {
   const dir = workspace(t), bundlePath = join(dir, 'bundle.json'), configPath = join(dir, 'config.json');
   const { bundle } = JSON.parse(readFileSync(join(root, 'tests/fixtures/replay/runtime-prefix.json')));

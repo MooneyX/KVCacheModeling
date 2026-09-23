@@ -1,19 +1,28 @@
 import { ReplayValidationError } from './replay.js';
+import { validatePhysicalBlockSize } from './requests.js';
 
-function contentPageKey(parts, resourceId) {
-  return JSON.stringify(['content', resourceId, parts]);
+const cacheContexts = new WeakMap();
+
+// Bundle logical blocks stay at 64 tokens. Ordered parts preserve path, boundary and valid length;
+// different pathIds never imply partial sharing. Input/output tails round up independently,
+// and anonymous output never supplies an inferred trace input identity.
+function contentPageKey(parts, resourceId, blockSize = 64) {
+  return JSON.stringify(blockSize === 64 ? ['content', resourceId, parts] : ['content', resourceId, blockSize, parts]);
 }
 
-export function replayPageKey(instance, blockId, tokens = 64, resourceId = 'default') {
-  return contentPageKey([[JSON.stringify(['replay', instance, 'input', blockId]), 0, tokens]], resourceId);
+export function replayPageKey(instance, blockId, tokens = 64, resourceId = 'default', blockSize = 64, offset = 0) {
+  return contentPageKey([[JSON.stringify(['replay', instance, 'input', blockId]), offset, tokens]], resourceId, blockSize);
 }
 
-export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add, remove,
-  maxBlockReferences = 200000, resourceId = 'default', tierRatio = {},
+export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blockSize = 64, add, remove,
+  maxBlockReferences = 200000, resourceId = 'default', resourceCount = null, tierRatio = {},
   finiteCapacity = false, links = {}, l3Bandwidth = null, canSchedule = () => true, onEvent = () => {} }) {
+  try { validatePhysicalBlockSize(blockSize); }
+  catch (error) { throw new ReplayValidationError('replay.cache.blockSize', error.message); }
   pool ??= pools.hbm;
   const resources = { ...pools, hbm: pool };
   const states = new WeakMap();
+  const incomingHandoffs = new WeakMap(), outgoingHandoffs = new WeakMap(), handoffs = new Set();
   const prefetches = new WeakMap(), pulls = new Map(), transfers = new Set();
   const bindings = new Map(), fetchInitialized = new WeakSet();
   let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0;
@@ -31,7 +40,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     item._cacheLocks = Math.max(0, (item._cacheLocks || 0) - 1);
     item.transferLocked = item._cacheLocks > 0 || !!item._cacheWasLocked;
   };
-  const residentCount = () => [...new Set(Object.values(resources))].reduce((n, p) => n + p.blocks.length, 0);
+  const residentCount = () => resourceCount ? resourceCount()
+    : [...new Set(Object.values(resources))].reduce((n, p) => n + p.blocks.length, 0);
   const checkLimit = count => {
     if (count > maxBlockReferences) {
       throw new ReplayValidationError('replay.cache', 'physical block resource limit exceeded');
@@ -54,13 +64,13 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       expected = segment.position + segment.tokens;
       let offset = 0;
       while (offset < segment.tokens) {
-        const take = Math.min(64 - tokens, segment.tokens - offset);
+        const take = Math.min(blockSize - tokens, segment.tokens - offset);
         parts.push([segment.pathId, offset, take]);
         offset += take;
         tokens += take;
-        if (tokens === 64) {
+        if (tokens === blockSize) {
           checkLimit(++count);
-          yield { key: contentPageKey(parts, resourceId), tokens, position };
+          yield { key: contentPageKey(parts, resourceId, blockSize), tokens, position };
           position += tokens;
           parts = []; tokens = 0;
         }
@@ -68,12 +78,12 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     }
     if (tokens) {
       checkLimit(++count);
-      yield { key: contentPageKey(parts, resourceId), tokens, position };
+      yield { key: contentPageKey(parts, resourceId, blockSize), tokens, position };
     }
   }
 
   function finitePlan(req, now) {
-    const count = Math.ceil(req.inputLen / 64), slots = [];
+    const count = Math.ceil(req.inputLen / blockSize), slots = [];
     if (count * blockBytes > pool.cap) return { response: { status: 'infeasible' } };
     checkLimit(count);
     const response = result(0, 0);
@@ -101,7 +111,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
 
   function plan(req, now) {
     if (finiteCapacity) return finitePlan(req, now);
-    const count = Math.ceil(req.inputLen / 64);
+    const count = Math.ceil(req.inputLen / blockSize);
     if (count * blockBytes > pool.cap) return { response: { status: 'infeasible' } };
     checkLimit(count);
     const slots = [];
@@ -261,7 +271,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     const queueStart = Math.max(now, link.busyUntil || 0, link.shared?.busyUntil || 0);
     const start = queueStart + fixedSeconds;
     const bandwidth = prefetch && from === 'ssd' && l3Bandwidth > 0 ? l3Bandwidth : link.bw;
-    const bytes = sizeAt(item, from) * Math.min(1, (item.tokens ?? 64) / 64), end = start + bytes / bandwidth;
+    const bytes = sizeAt(item, from) * Math.min(1, (item.tokens ?? blockSize) / blockSize), end = start + bytes / bandwidth;
     link.busyUntil = end;
     if (link.shared) link.shared.busyUntil = end;
     target.arriveAt = end;
@@ -446,13 +456,14 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
   }
 
   function prefetch(req, now = 0, policy = {}) {
+    if (incomingHandoffs.has(req)) return { status: 'wait' };
     if (!finiteCapacity) return { status: 'admitted' };
     advance(now);
     let subscription = prefetches.get(req);
     if (subscription) return { status: 'admitted' };
     const planned = plan(req, now);
     if (!planned.slots) return planned.response;
-    const restoredPages = Math.ceil(Math.max(0, Math.floor(req.tokensGen || 0)) / 64);
+    const restoredPages = Math.ceil(Math.max(0, Math.floor(req.tokensGen || 0)) / blockSize);
     if ((planned.slots.length + restoredPages) * blockBytes > pool.cap) return { status: 'infeasible' };
     const lower = planned.slots.filter(slot => slot.hit && slot.tier !== 'hbm');
     if (!lower.length) return { status: 'admitted' };
@@ -493,7 +504,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     prefetches.set(req, subscription);
     if (!fetchInitialized.has(req)) {
       req.fetchTime = lower.reduce((sum, slot) => {
-        const fraction = slot.tokens / 64;
+        const fraction = slot.tokens / blockSize;
         const l2 = blockBytes * (tierRatio.dram ?? 1) * fraction / (links['dram>hbm']?.bw || Infinity);
         const l3 = slot.tier === 'ssd' ? normalized.fixedSeconds
           + blockBytes * (tierRatio.ssd ?? 1) * fraction / (l3Bandwidth || links['ssd>dram']?.bw || Infinity) : 0;
@@ -558,13 +569,13 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     const restored = Math.max(0, Math.floor(req.tokensGen || 0));
     if (!Number.isSafeInteger(restored) || restored > req.outputLen)
       throw new ReplayValidationError('replay.cache', 'invalid generated output length');
-    if ((Math.ceil(req.inputLen / 64) + Math.ceil(restored / 64)) * blockBytes > pool.cap) return { status: 'infeasible' };
+    if ((Math.ceil(req.inputLen / blockSize) + Math.ceil(restored / blockSize)) * blockBytes > pool.cap) return { status: 'infeasible' };
     if (!prefetches.has(req)) {
       const initial = plan(req, now);
       if (!initial.slots) return initial.response;
       const protectedPages = new Set(initial.slots.filter(slot => slot.hit)
         .map(slot => resources[slot.tier]?.blockIndex[slot.key]).filter(Boolean));
-      const needed = initial.slots.filter(slot => !slot.hit || !pool.blockIndex[slot.key]).length + Math.ceil(restored / 64);
+      const needed = initial.slots.filter(slot => !slot.hit || !pool.blockIndex[slot.key]).length + Math.ceil(restored / blockSize);
       const status = ensureSpace('hbm', needed * blockBytes, now, protectedPages);
       if (status !== 'admitted') return { status };
       prefetch(req, now, { type: 'none' });
@@ -579,7 +590,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       const item = target && pool.blockIndex[target.id] === target ? target : pool.blockIndex[slot.key];
       return item?._moving ? null : item;
     });
-    const extra = existing.filter(item => !item).length + Math.ceil(restored / 64);
+    const extra = existing.filter(item => !item).length + Math.ceil(restored / blockSize);
     const protectedPages = new Set([...existing, ...slots.map(slot => resources[slot.tier]?.blockIndex[slot.key])].filter(Boolean));
     const space = ensureSpace('hbm', extra * blockBytes, now, protectedPages);
     if (space !== 'admitted') return { status: space };
@@ -605,10 +616,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       if (!bindings.has(item)) bindings.set(item, new Set());
       bindings.get(item).add({ req, state, entry });
     }
-    for (let i = 0; i < Math.ceil(restored / 64); i++) {
-      const tokens = Math.min(64, restored - i * 64), position = req.inputLen + i * 64;
+    for (let i = 0; i < Math.ceil(restored / blockSize); i++) {
+      const tokens = Math.min(blockSize, restored - i * blockSize), position = req.inputLen + i * blockSize;
       const item = block(JSON.stringify(['output', resourceId, state.id, i]), tokens, req, now, true);
-      if (req.outputIdentity) item.canonicalKey = contentPageKey([[req.outputIdentity.pathId, i * 64, tokens]], resourceId);
+      if (req.outputIdentity) item.canonicalKey = contentPageKey([[req.outputIdentity.pathId, i * blockSize, tokens]], resourceId, blockSize);
       add('hbm', item); state.outputIds.push(item.id); req.ownBlkIds.push(item.id);
       state.entries.push({ id: item.id, position, tokens, output: true, completed: [], claimed: [] });
     }
@@ -624,8 +635,142 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     return response;
   }
 
+  function reserveHandoff(req, outputTokens, now, response) {
+    advance(now);
+    if (incomingHandoffs.has(req) || (states.has(req) && !states.get(req).released)) {
+      throw new Error('Replay cache invariant: handoff target already owns request');
+    }
+    const count = Math.ceil(req.inputLen / blockSize) + Math.ceil(outputTokens / blockSize);
+    if (count * blockBytes > pool.cap) return { status: 'infeasible' };
+    if (!canSchedule(now)) return { status: 'wait' };
+    checkLimit(count);
+    const slots = [...pages(req.inputContent)];
+    if (slots.reduce((sum, slot) => sum + slot.tokens, 0) !== req.inputLen) {
+      throw new ReplayValidationError('replay.cache', 'content length does not match input length');
+    }
+    for (let i = 0; i < Math.ceil(outputTokens / blockSize); i++) {
+      const tokens = Math.min(blockSize, outputTokens - i * blockSize);
+      slots.push({ position: req.inputLen + i * blockSize, tokens, output: true,
+        key: req.outputIdentity ? contentPageKey([[req.outputIdentity.pathId, i * blockSize, tokens]], resourceId, blockSize) : null });
+    }
+    const existing = slots.map(slot => !slot.output && accessible(pool.blockIndex[slot.key], now)
+      ? pool.blockIndex[slot.key] : null);
+    const extra = existing.filter(item => !item).length;
+    checkLimit(residentCount() + extra);
+    const status = finiteCapacity ? ensureSpace('hbm', extra * blockBytes, now, new Set(existing.filter(Boolean)))
+      : pool.used + extra * blockBytes <= pool.cap ? 'admitted' : 'wait';
+    if (status !== 'admitted') return { status };
+    checkLimit(residentCount() + extra);
+    const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], released: false };
+    const reserved = slots.map((slot, i) => {
+      let item = existing[i];
+      if (item) item.refcount++;
+      else {
+        item = block(JSON.stringify(['handoff', resourceId, state.id, i]), slot.tokens, req, now, !!slot.output);
+        if (slot.key) item.canonicalKey = slot.key;
+        add('hbm', item);
+      }
+      lock(item);
+      return { slot, item, created: !existing[i] };
+    });
+    return {
+      status: 'admitted', bytesReserved: extra * blockBytes,
+      cancel(time) {
+        for (const { item, created } of reserved) {
+          unlock(item); item.refcount--; item.lastTouch = time;
+          if (created && item.refcount === 0) remove('hbm', item.id);
+        }
+        incomingHandoffs.delete(req);
+      },
+      complete(time, releaseSource) {
+        for (const entry of reserved) {
+          unlock(entry.item);
+          if (entry.created) { entry.item.ready = true; entry.item.arriveAt = time; }
+          entry.item.lastTouch = time;
+          if (!entry.slot.output && entry.created) entry.item = pool.blockIndex[publishPage(entry.item.id, time)];
+        }
+        releaseSource();
+        req.prefixBlkIds = []; req.ownBlkIds = [];
+        for (const { slot, item } of reserved) {
+          const entry = { ...slot, id: item.id, completed: [{ position: slot.position, tokens: slot.tokens }], claimed: [] };
+          state.entries.push(entry);
+          if (slot.output) { state.outputIds.push(item.id); req.ownBlkIds.push(item.id); }
+          else {
+            req.prefixBlkIds.push(item.id);
+            if (!bindings.has(item)) bindings.set(item, new Set());
+            bindings.get(item).add({ req, state, entry });
+          }
+        }
+        states.set(req, state);
+        incomingHandoffs.delete(req);
+        req._replayPrivate = null;
+        req._outAllocTok = outputTokens; req._outSeq = state.outputIds.length;
+        req.placedTier = 'hbm';
+      },
+    };
+  }
+
+  function beginHandoff(req, destination, now = 0) {
+    if (!Number.isFinite(now)) throw new ReplayValidationError('replay.cache.handoff', 'handoff time must be finite');
+    const validateTime = time => {
+      if (!Number.isFinite(time) || time < now) {
+        throw new ReplayValidationError('replay.cache.handoff', 'handoff completion or cancellation cannot precede its start');
+      }
+    };
+    advance(now);
+    const prior = outgoingHandoffs.get(req);
+    if (prior) return { status: 'admitted', handoff: prior };
+    const state = states.get(req), target = cacheContexts.get(destination);
+    if (!state || state.released) throw new Error('Replay cache invariant: handoff without admission');
+    if (!target || target.pool === pool || target.blockSize !== blockSize) {
+      throw new ReplayValidationError('replay.cache.handoff', 'handoff requires distinct device pools with the same physical block size');
+    }
+    if (!canSchedule(now)) return { status: 'wait' };
+    const sourcePages = [...req.prefixBlkIds, ...req.ownBlkIds].map(id => pool.blockIndex[id]);
+    if (state.privateIds.length || sourcePages.some(item => !ready(item, now))) return { status: 'wait' };
+    const outputTokens = req._outAllocTok || 0;
+    if (!Number.isSafeInteger(outputTokens) || outputTokens < 0 || outputTokens > req.outputLen) {
+      throw new ReplayValidationError('replay.cache.handoff', 'invalid generated output length');
+    }
+    const reservation = target.reserveHandoff(req, outputTokens, now, state.response);
+    if (reservation.status !== 'admitted') return { status: reservation.status };
+    for (const item of sourcePages) lock(item);
+    let phase = 'pending';
+    const details = { sourceResourceId: resourceId, targetResourceId: target.resourceId,
+      inputTokens: req.inputLen, outputTokens, bytesReserved: reservation.bytesReserved };
+    const finish = () => {
+      outgoingHandoffs.delete(req); target.incomingHandoffs.delete(req); handoffs.delete(handoff);
+      for (const item of sourcePages) unlock(item);
+    };
+    const handoff = Object.freeze({
+      ...details,
+      get state() { return phase; },
+      complete(time = now) {
+        validateTime(time);
+        if (phase !== 'pending') return false;
+        if (states.get(req) !== state || state.released) { handoff.cancel(time); return false; }
+        finish();
+        reservation.complete(time, () => cache.release(req, time, 'handoff'));
+        phase = 'completed';
+        emit('handoff-complete', time, details);
+        return true;
+      },
+      cancel(time = now) {
+        validateTime(time);
+        if (phase !== 'pending') return false;
+        reservation.cancel(time); finish(); phase = 'cancelled';
+        emit('handoff-cancel', time, details);
+        return true;
+      },
+    });
+    outgoingHandoffs.set(req, handoff); target.incomingHandoffs.set(req, handoff); handoffs.add(handoff);
+    emit('handoff-reserve', now, details);
+    return { status: 'admitted', handoff };
+  }
+
   const cache = {
     advance,
+    beginHandoff,
     get nextTime() {
       let next = Infinity;
       for (const record of transfers) next = Math.min(next, record.end);
@@ -636,7 +781,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       }
       return next;
     },
-    get pending() { return transfers.size; },
+    get pending() { return transfers.size + handoffs.size; },
     get ledger() { return [...transfers]; },
     scheduleTransfer(item, from, to, now = 0, options = {}) {
       advance(now);
@@ -645,6 +790,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
     prefetch,
     cancel,
     startPrefill(req, now = 0) {
+      if (incomingHandoffs.has(req)) return false;
       advance(now);
       const subscription = prefetches.get(req);
       if (!subscription || subscription.stopped) return true;
@@ -676,6 +822,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       });
     },
     prefillReady(req, now = 0) {
+      if (incomingHandoffs.has(req)) return false;
       computeRanges(req, now);
       return entriesFor(req).every(entry => !uncovered(entry, false).length);
     },
@@ -685,6 +832,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       return slots ? { ...response, slots } : response;
     },
     place(req, now = 0) {
+      if (incomingHandoffs.has(req)) return { status: 'wait' };
       if (finiteCapacity) return finitePlace(req, now);
       const previous = states.get(req);
       if (previous && !previous.released) return previous.response;
@@ -739,12 +887,13 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       req._replayPrivate = null;
     },
     output(req, generatedTokens, now = 0) {
+      if (outgoingHandoffs.has(req)) return { status: 'wait' };
       const state = states.get(req);
       if (!state || state.released) throw new Error('Replay cache invariant: output without admission');
       const want = Math.min(req.outputLen, Math.max(req._outAllocTok || 0, Math.floor(generatedTokens)));
       if (!Number.isSafeInteger(want) || want < 0) throw new ReplayValidationError('replay.cache', 'invalid output length');
-      const count = Math.ceil(want / 64);
-      if ((Math.ceil(req.inputLen / 64) + count) * blockBytes > pool.cap) return { status: 'infeasible' };
+      const count = Math.ceil(want / blockSize);
+      if ((Math.ceil(req.inputLen / blockSize) + count) * blockBytes > pool.cap) return { status: 'infeasible' };
       const extra = count - state.outputIds.length;
       if (finiteCapacity) {
         advance(now);
@@ -761,7 +910,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       while (state.outputIds.length < count) {
         const index = state.outputIds.length;
         const id = JSON.stringify(['output', resourceId, state.id, index]);
-        const item = block(id, Math.min(64, want - index * 64), req, now, true);
+        const item = block(id, Math.min(blockSize, want - index * blockSize), req, now, true);
         item.ready = true;
         add('hbm', item);
         state.outputIds.push(id);
@@ -769,15 +918,17 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       }
       for (let i = 0; i < state.outputIds.length; i++) {
         const item = pool.blockIndex[state.outputIds[i]];
-        item.tokens = Math.min(64, want - i * 64);
+        item.tokens = Math.min(blockSize, want - i * blockSize);
         item.lastTouch = now;
-        if (req.outputIdentity) item.canonicalKey = contentPageKey([[req.outputIdentity.pathId, i * 64, item.tokens]], resourceId);
+        if (req.outputIdentity) item.canonicalKey = contentPageKey([[req.outputIdentity.pathId, i * blockSize, item.tokens]], resourceId, blockSize);
       }
       req._outSeq = count;
       req._outAllocTok = want;
       return { status: 'admitted' };
     },
     release(req, now = 0, reason = null) {
+      outgoingHandoffs.get(req)?.cancel(now);
+      incomingHandoffs.get(req)?.cancel(now);
       if (finiteCapacity) cancel(req, now);
       const state = states.get(req);
       if (!state || state.released) { if (finiteCapacity) prefetches.delete(req); return; }
@@ -806,7 +957,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
       req.prefixBlkIds = [];
       req.ownBlkIds = [];
       req._replayPrivate = null;
-      if (!finiteCapacity || reason !== 'retract') req.replayTemplate = null;
+      if (reason !== 'handoff' && (!finiteCapacity || reason !== 'retract')) req.replayTemplate = null;
     },
     warm(description, now = 0) {
       const descriptions = Array.isArray(description) ? description : [description];
@@ -856,10 +1007,11 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, add
           value[`${tier}ReservedBytes`] = value.tiers[tier]?.reserved || 0;
         }
         value.hbmResidentBytes = value.hbmBytes - value.hbmReservedBytes;
-        value.pendingTransfers = transfers.size;
+        value.pendingTransfers = transfers.size + handoffs.size;
       }
       return value;
     },
   };
+  cacheContexts.set(cache, { pool, blockSize, resourceId, reserveHandoff, incomingHandoffs });
   return cache;
 }

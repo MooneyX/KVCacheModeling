@@ -182,6 +182,37 @@ test('U3 metrics: a zero first-token timestamp is retained instead of replaced b
   assert.equal(m.finish(4, {}).windows.full.latency.ttft.mean, 0);
 });
 
+test('U4 metrics: physical P/D records each device and counts TTFT at the common first-token event', () => {
+  const m = make({ finiteCapacity: true, configuration: { execution: { instances: 1, pdMode: 2 }, blockMapping: { logical: 64, physical: 32 } } });
+  const a = req(0, 1, 4);
+  a.prefillEnd = 1.1; a.firstTokenTime = 1.6; a.decodeStart = 1.6;
+  m.arrive(a); m.admit(a, hit); m.complete(a);
+  m.observe(0, { prefillHbmBytes: 64, prefillHbmCapacityBytes: 128, prefillHbmReservedBytes: 0,
+    decodeHbmBytes: 64, decodeHbmCapacityBytes: 256, decodeHbmReservedBytes: 64 });
+  m.observe(2, { prefillHbmBytes: 0, decodeHbmBytes: 96, decodeHbmReservedBytes: 0 });
+  const result = m.finish(4, {});
+  assert.ok(Math.abs(result.windows.full.latency.ttft.mean - 600) < 1e-9);
+  const actual = Object.fromEntries(Object.entries(result.samples.timeWeightedMean).filter(([key]) => /^(prefill|decode)Hbm/.test(key)));
+  const expected = { prefillHbmBytes: 32, prefillHbmCapacityBytes: 128, prefillHbmReservedBytes: 0,
+    decodeHbmBytes: 80, decodeHbmCapacityBytes: 256, decodeHbmReservedBytes: 32 };
+  assert.deepEqual(Object.keys(actual), Object.keys(expected));
+  for (const [key, value] of Object.entries(expected)) assert.ok(Math.abs(actual[key] - value) < 1e-9, key);
+  assert.match(result.state.supportedScope, /single-instance\/32-token\/.*physical-pd/);
+});
+
+test('U4 metrics: physical P/D cannot fall back to prefill end when first-token information is missing', () => {
+  const m = make({ finiteCapacity: true, configuration: { execution: { pdMode: 2 } } }), a = req(0, 1);
+  m.arrive(a); m.admit(a, hit);
+  assert.throws(() => m.complete(a), /first.token/);
+  assert.equal(m.finish(2, {}).counts.successful, 0);
+  a.firstTokenTime = 2.5; a.decodeStart = 2.5;
+  m.complete(a);
+  assert.equal(m.finish(4, {}).windows.full.latency.ttft.mean, 1500);
+  const empty = make({ finiteCapacity: true, configuration: { execution: { pdMode: 2 } } }), zero = req(1, 1, 1.1, 0);
+  empty.arrive(zero); empty.admit(zero, hit); empty.complete(zero);
+  assert.ok(Math.abs(empty.finish(2, {}).windows.full.latency.ttft.mean - 100) < 1e-9);
+});
+
 test('S08: time-weighted sampling integrates idle skips and respects 20000-bucket cap', () => {
   const m = make({ hardCutoff: 100000 });
   m.observe(0, { activeRequests: 2, activeSessions: 1, hbmBytes: 64 });

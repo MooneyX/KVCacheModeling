@@ -54,7 +54,7 @@ export function readParams(readControl) {
       var raw = (el.value === undefined || el.value === null) ? '' : String(el.value).trim();
       if (raw === '') return true; var v = parseFloat(raw); return !isFinite(v) || v <= 0; })(),
     mfu: (function(){ var v = gv('pMfu')/100; return v > 0 ? v : 1.0; })(),
-    maxBatch: gi('pMaxBatch'), blockSize: gi('pBlockSize'),
+    maxBatch: gi('pMaxBatch'), blockSize: gv('pBlockSize'),
     simMaxTime: gi('pSimMaxTime') || 1200,  // 仿真窗口上限(秒)：窗口 = min(排水估计, 此值)
     prefixHit: gi('pPrefixHit')/100,
     prefixWarm: !!(readControl('pPrefixWarm') && readControl('pPrefixWarm').checked),

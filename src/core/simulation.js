@@ -1,4 +1,4 @@
-import { createSyntheticRuntime } from "./requests.js";
+import { createSyntheticRuntime, validatePhysicalBlockSize } from "./requests.js";
 import { hwPresets } from "./presets.js";
 import { mulberry32, pctOf, unionSpanSec } from "./math.js";
 import { calcAll, estimatePrefillParams, effL2LinkBW, prefillIntegral, prefillTau, perReqMs } from "./calculations.js";
@@ -17,7 +17,7 @@ export function runWorkloadAcceptance(params, strategy, overrides, acceptance = 
   return simulate(params, strategy, overrides, 'dsl', acceptance);
 }
 
-export const WORKLOAD_MODEL_VERSION = 'workload-u3-64-tiered-v1';
+export const WORKLOAD_MODEL_VERSION = 'workload-u4-pages-topology-v1';
 
 function simulate(params, strategy, overrides, strategyMode, acceptance) {
   const unified = acceptance !== null;
@@ -49,6 +49,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // 注意: 故意**不**写 p.ssdBW —— 见上方第 1 条
   }
   for (let k in overrides) { if (k !== 'seed' && k !== 'nreq' && k !== 'hwPreset' && k !== 'replay') p[k] = overrides[k]; }
+  if (p.instances > 1 && p.pdMode === 2)
+    throw new RangeError('Multiple instances cannot be combined with physical P/D separation');
   let replayMetrics = null;
   const replayActive = overrides.replay === undefined ? null : new Map();
   const replayIncomplete = [];
@@ -83,9 +85,11 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     },
   });
   if (replay) {
-    if (p.instances !== 1) throw new ReplayValidationError('replay.instances', 'only a single instance is supported through S09');
-    if (p.blockSize !== 64) throw new ReplayValidationError('replay.blockSize', 'only 64-token pages are supported through S09');
-    if (p.pdMode === 2) throw new ReplayValidationError('replay.pdMode', 'separate physical P/D pools are not yet supported');
+    if (!unified) {
+      if (p.instances !== 1) throw new ReplayValidationError('replay.instances', 'only a single instance is supported through S09');
+      if (p.blockSize !== 64) throw new ReplayValidationError('replay.blockSize', 'only 64-token pages are supported through S09');
+      if (p.pdMode === 2) throw new ReplayValidationError('replay.pdMode', 'separate physical P/D pools are not yet supported');
+    }
     if (strategyMode !== 'dsl') throw new ReplayValidationError('replay.strategyMode', 'custom JavaScript cache hooks are not yet supported');
     if (!(p.simMaxTime >= 0) || !Number.isFinite(p.simMaxTime)) throw new ReplayValidationError('replay.simMaxTime', 'expected finite nonnegative drain seconds');
     if (!Number.isFinite(replay.options.durationSeconds + p.simMaxTime) || (replay.options.durationSeconds + p.simMaxTime) / 0.002 > Number.MAX_SAFE_INTEGER)
@@ -96,9 +100,17 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     p.lenDist = 'fixed'; p.arrivalDist = 'poisson'; p.concurrency = 1;
   }
   if (unified) {
-    if (p.instances !== 1 || p.blockSize !== 64 || p.pdMode !== 0 || p.pdSep)
-      throw new RangeError('U2 acceptance requires one instance, 64-token pages and no P/D separation');
-    if (strategyMode !== 'dsl') throw new RangeError('U2 acceptance requires DSL');
+    if (![0, 2].includes(p.pdMode) || (p.pdSep && p.pdMode !== 2))
+      throw new RangeError('U4.3 acceptance supports mixed execution or physical P/D separation');
+    if (p.pdMode === 2 && (!Number.isSafeInteger(p.pdPrefillGpus) || p.pdPrefillGpus < 1 || p.pdPrefillGpus >= p.gpus))
+      throw new RangeError('U4.3 acceptance requires positive prefill and decode GPU allocations');
+    if (p.pdMode === 2 && (!(p.pdLinkBW > 0) || !Number.isFinite(p.pdLinkBW)
+      || !(p.pdLinkUtil > 0) || p.pdLinkUtil > 1 || !Number.isFinite(p.pdLinkUtil)))
+      throw new RangeError('U4.3 acceptance requires finite positive PD bandwidth and utilization at most one');
+    if (!Number.isSafeInteger(p.instances) || p.instances < 1 || p.instances > p.gpus)
+      throw new RangeError('U4.2 acceptance requires a positive safe-integer instance count not exceeding GPUs');
+    validatePhysicalBlockSize(p.blockSize);
+    if (strategyMode !== 'dsl') throw new RangeError('U4 acceptance requires DSL');
   }
   if (_hwOv) {
     let _e = estimatePrefillParams(p);
@@ -155,6 +167,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // prefill 段消费 rP/pP(算力与 a/b), decode 段消费 rD(HBM 带宽/算力/权重读)。
   // 非真分离档下 rP===rD===r、pP===p —— 行为与改动前**逐位一致**(零回归)。
   let rng = mulberry32((overrides.seed != null ? overrides.seed : p.seed) >>> 0);
+  let routeRng = unified ? mulberry32(((overrides.seed ?? p.seed) ^ 0x726f7574) >>> 0) : rng;
 
   let kvPerTok = r.kvPerToken;
   let blockBytes = r.blockBytes;
@@ -199,9 +212,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       iPP = Object.assign({}, iP, { prefillA: eI.a, prefillB: eI.b, prefillBIdx: eI.bIdx });
     }
     // 分层容量: HBM 随卡数缩放(calcAll 已算), DRAM/SSD 按实例数均分(一台机器的内存/盘由本实例独占)
+    const resourceShare = unified && pdReal ? 2 : instShare;
     let iCaps = { hbm: iR.availHbm,
-      dram: p.tieredKv ? iR.dramTotal / instShare : 0,
-      ssd:  p.tieredKv ? iR.ssdTotal / instShare : 0 };
+      dram: p.tieredKv ? iR.dramTotal / resourceShare : 0,
+      ssd:  p.tieredKv ? iR.ssdTotal / resourceShare : 0 };
     let iPools = {};
     ['hbm','dram','ssd'].forEach(t => iPools[t] = { blocks: [], blockIndex: {}, used: 0, cap: iCaps[t], accessOrder: [], freq: {} });
     // 跨层链路：L2(PCIe/C2C) 与 L3(NVMe) 各为一条共享总线——
@@ -214,19 +228,19 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // 消失 ⇒ attnTp=1)。TP=实例卡数(默认)时 f=1 ⇒ 与旧 min(pcie,dram) 逐位一致。
     let iL2BW = effL2LinkBW(iP);
     let iLinks = {
-      'hbm>dram': { bw: iL2BW * 1e9 / instShare, busyUntil: 0 },
-      'dram>hbm': { bw: iL2BW * 1e9 / instShare, busyUntil: 0 },
-      'dram>ssd': { bw: p.ssdBW * 1e9 / instShare, busyUntil: 0 },
-      'ssd>dram': { bw: p.ssdBW * 1e9 / instShare, busyUntil: 0 },
+      'hbm>dram': { bw: iL2BW * 1e9 / resourceShare, busyUntil: 0 },
+      'dram>hbm': { bw: iL2BW * 1e9 / resourceShare, busyUntil: 0 },
+      'dram>ssd': { bw: p.ssdBW * 1e9 / resourceShare, busyUntil: 0 },
+      'ssd>dram': { bw: p.ssdBW * 1e9 / resourceShare, busyUntil: 0 },
     };
     iLinks['hbm>dram'].shared = iLinks['dram>hbm'];
     iLinks['dram>hbm'].shared = iLinks['hbm>dram'];
     iLinks['dram>ssd'].shared = iLinks['ssd>dram'];
     iLinks['ssd>dram'].shared = iLinks['dram>ssd'];
-    let iEffL3 = p.ssdBW * 1e9 * 0.9 / instShare;
+    let iEffL3 = p.ssdBW * 1e9 * 0.9 / resourceShare;
     // PD 真分离的 P/D 资源视图(与多实例互斥, 见 pdReal 计算): 单实例时沿用全局 rP/rD/pP
     return {
-      id: instId, gpus: instGpus, p: iP, r: iR,
+      id: instId, resourceId: `instance:${instId}`, gpus: instGpus, p: iP, r: iR,
       pools: iPools, caps: iCaps, links: iLinks,
       effL3BW: iEffL3, l3PoolBytes: iEffL3 * DT, prevDecodeL3: 0,
       waitQueue: [], prefillQ: [], prefilling: [], kvXfer: [], decodeWait: [], decoding: [],
@@ -314,11 +328,20 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     let base = Math.floor(p.gpus / instShare), rem = p.gpus % instShare;
     for (let ii = 0; ii < instShare; ii++) instances.push(makeInstance(ii, base + (ii < rem ? 1 : 0)));
   }
+  let decodeResource = null;
+  if (unified && pdReal) {
+    instances = [makeInstance(0, pdPrefillGpus)];
+    instances[0].device = 'prefill'; instances[0].resourceId = 'instance:0:prefill';
+    decodeResource = makeInstance(0, pdDecodeGpus);
+    decodeResource.device = 'decode'; decodeResource.resourceId = 'instance:0:decode';
+  }
+  const cacheResources = decodeResource ? [...instances, decodeResource] : instances;
   // 主循环逐实例处理时, 用下列**视图变量**指向当前实例的容器 —— 数组全程原地修改
   // (push/splice), 故绑定引用即可, 无需把主循环里几百处 `prefillQ` 改写为 `inst.prefillQ`。
   // ⚠️ 但 curWave/prepWave/prevDecodeL3 会被**重新赋值**, 必须写 inst.x
   //    (视图变量赋值只会改局部, 不会回写实例 —— 这是本次重构最易出错的点)。
   let inst = instances[0];
+  let cacheResource = inst, pageCache = null;
   // 生效的路由策略: DSL 的 ROUTE 行优先, 未写则回退 UI 下拉(向后兼容)
   // (声明位置须早于前缀预热段 —— 亲和预热要按路由策略决定各组归属哪台实例)
   // 用 strategy 入参而非 s(后者声明在更后面) —— 两者是同一对象
@@ -335,6 +358,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // 请求的前缀键: 复用已有的 groupId(pfx_A/B/C/D) —— 它天然就是"同前缀请求"的标识,
   // 无需新造。无组请求(不共享前缀)按自身 id 散列, 等价于随机分布。
   function prefixKeyOf(req) {
+    if (unified) return req.routingKey;
     if (replay) return req.sessionInstanceKey;
     return req.groupId ? req.groupId : ('r' + req.id);
   }
@@ -358,6 +382,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // 切换当前实例: 重绑全部视图变量(在主循环的实例遍历里调用)
   function useInstance(x) {
     inst = x;
+    cacheResource = x; pageCache = x.pageCache || null;
     pools = x.pools; caps = x.caps; links = x.links;
     waitQueue = x.waitQueue; prefillQ = x.prefillQ; prefilling = x.prefilling;
     kvXfer = x.kvXfer; decodeWait = x.decodeWait; decoding = x.decoding;
@@ -371,6 +396,15 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     if (multiInst) { rP = x.r; rD = x.r; pP = x.pP; }
   }
 
+  function useCacheResource(resource) {
+    cacheResource = resource; pageCache = resource.pageCache;
+    pools = resource.pools; caps = resource.caps; links = resource.links;
+    effL3BW = resource.effL3BW; l3PoolBytes = resource.l3PoolBytes;
+  }
+  function useRequestResource(req) {
+    useInstance(instances[req.instId]);
+    if (decodeResource && req._cacheDevice === 'decode') useCacheResource(decodeResource);
+  }
   function sizeInTier(blk, tier) { return blk.size * tierRatio[tier]; }
 
   function poolAdd(tier, blk) {
@@ -445,7 +479,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   const N = replay ? 0 : source.initialCount;
   const requests = replay ? [] : source.pendingRequests();
   const initialCache = source.takeInitialCache?.() || [];
-  if (replay) rng = replay.launcher.routeRandom;
+  if (replay) {
+    routeRng = replay.launcher.routeRandom;
+    if (!unified) rng = routeRng;
+  }
   if (!unified && p.prefixHit > 0.001) {
     // S4: 把前缀组表分发给各实例。
     // 亲和关 → 全部实例共用**同一个对象引用**(全局共享前缀池, 与历史口径逐位一致);
@@ -633,8 +670,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       // 经典结论——只需 2 个采样即可把最大负载从 O(log n) 降到 O(log log n),
       // 开销远低于全局扫描(sgl-router 生产实现), 均衡度接近理想 least-connection。
       case 'power_of_two': {
-        let i = Math.floor(rng() * n) % n;
-        let j = Math.floor(rng() * n) % n;
+        let i = Math.floor(routeRng() * n) % n;
+        let j = Math.floor(routeRng() * n) % n;
         if (i === j) j = (j + 1) % n;
         return instLoad(instances[i]) <= instLoad(instances[j]) ? instances[i] : instances[j];
       }
@@ -644,7 +681,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         return instances[hashKey(prefixKeyOf(req)) % n];
       // 纯随机: 作为"最差缓存亲和"的对照基线
       case 'random':
-        return instances[Math.floor(rng() * n) % n];
+        return instances[Math.floor(routeRng() * n) % n];
       case 'round_robin':
       default:
         return instances[_rrCursor++ % n];
@@ -665,7 +702,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // 传输量按请求实际持有的 KV token 数(输入全长, 含命中前缀——KV 无论来自命中还是重算,
   // 都在 P 的 HBM 里, 都要搬到 D)。
   function pdKvXferBytes(q) {
-    let tok = Math.max(0, q.inputLen || 0);
+    let tok = Math.max(0, q.inputLen || 0) + (unified ? Math.max(0, Math.floor(q.tokensGen || 0)) : 0);
     if (p.pdKvComp) return tok * kvPerTok;   // 自适应: MLA 自动走压缩, GQA/MHA 走全秩
     // 全量对照档: 按全秩 KV 计费(MLA 也按 2×kvHeads×headDim 展开)
     let full = 2 * p.layers * Math.max(p.kvHeads || 0, 1) * Math.max(p.headDim || 0, 1) * p.dtypeBytes;
@@ -919,9 +956,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // P0-1: decode 阶段动态分配输出 KV 块——真实系统中输出 token 持续产生新 KV，
   // 显存占用与 decode 读取量随 tokensGen 增长。修复前输出 KV 从不建块。
   // 输出块优先放 HBM（decode 生成的 KV 本就在 GPU 上），容量不足按策略淘汰/下沉。
-  const cacheResource = inst;
-  const pageCache = replay || unified ? createReplayCache({ pool: cacheResource.pools.hbm, pools: cacheResource.pools, tierRatio,
-    resourceId: `instance:${cacheResource.id}`, blockBytes, finiteCapacity: unified,
+  function createInstanceCache(cacheResource) {
+    return createReplayCache({ pool: cacheResource.pools.hbm, pools: cacheResource.pools, tierRatio,
+    resourceId: cacheResource.resourceId, blockSize: p.blockSize, blockBytes, finiteCapacity: unified,
     links: cacheResource.links, l3Bandwidth: cacheResource.effL3BW, canSchedule: time => !unified || time < simCap,
     onEvent: event => {
       if (event.type === 'transfer-progress') {
@@ -933,7 +970,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       if (event.type === 'evict') stats.evictions++;
       if (event.type === 'drop') stats.drops++;
       if (event.type === 'transfer-start' && event.prefetch) stats.prefetches++;
-      if (event.type !== 'transfer-progress') observe(event.type, null, event);
+      if (event.type !== 'transfer-progress') observe(event.type, null, { ...event, instance: cacheResource.id });
     },
     add: (tier, block) => {
       const pool = cacheResource.pools[tier];
@@ -950,16 +987,61 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       if (index >= 0) pool.accessOrder.splice(index, 1);
       return block;
     },
-    maxBlockReferences: replay?.launcher.limits.maxBlockReferences ?? 200_000 }) : null;
+    resourceCount: unified ? () => [...new Set(cacheResources.flatMap(target => Object.values(target.pools)))]
+      .reduce((sum, pool) => sum + pool.blocks.length, 0) : undefined,
+    maxBlockReferences: replay?.launcher.limits.maxBlockReferences ?? 200_000 });
+  }
+  if (replay || unified) {
+    for (const target of cacheResources) target.pageCache = createInstanceCache(target);
+    pageCache = inst.pageCache;
+  }
+  const cachePending = () => cacheResources.reduce((sum, target) => sum + (target.pageCache?.pending || 0), 0);
+  const cacheNextTime = () => Math.min(...cacheResources.map(target => target.pageCache?.nextTime ?? Infinity));
+  const totalHbm = () => cacheResources.reduce((sum, target) => sum + target.pools.hbm.used, 0);
+  const totalDram = () => cacheResources.reduce((sum, target) => sum + target.pools.dram.used, 0);
+  const totalSsd = () => cacheResources.reduce((sum, target) => sum + target.pools.ssd.used, 0);
+  const totalHbmCapacity = () => cacheResources.reduce((sum, target) => sum + target.caps.hbm, 0);
+  function cacheSnapshot() {
+    if (!unified) return pageCache.snapshot();
+    const snapshot = { tiers: {} };
+    for (const target of cacheResources) {
+      const value = target.pageCache.snapshot();
+      if (target.device) {
+        for (const key of ['Bytes', 'CapacityBytes', 'ReservedBytes']) snapshot[`${target.device}Hbm${key}`] = value[`hbm${key}`] || 0;
+      }
+      for (const [key, count] of Object.entries(value)) {
+        if (typeof count === 'number') snapshot[key] = (snapshot[key] || 0) + count;
+      }
+      for (const [tier, fields] of Object.entries(value.tiers || {})) {
+        const aggregate = snapshot.tiers[tier] ||= { used: 0, capacity: 0, reserved: 0 };
+        for (const key of ['used', 'capacity', 'reserved']) aggregate[key] += fields[key] || 0;
+      }
+    }
+    return snapshot;
+  }
+  function resourceSnapshots() {
+    return cacheResources.map(target => ({ instance: target.id, resourceId: target.resourceId,
+      ...(target.device ? { device: target.device } : {}),
+      cache: target.pageCache.snapshot(), pages: Object.entries(target.pools).flatMap(([tier, pool]) => pool.blocks.map(b => ({
+        id: b.id, tokens: b.tokens, references: b.refcount, ready: b.ready, output: b.output,
+        available: b.available, transferLocked: !!b.transferLocked, tier,
+        size: sizeInTier(b, tier), baseSize: b.size, instance: target.id, resourceId: target.resourceId,
+        ...(target.device ? { device: target.device } : {}),
+      }))) }));
+  }
   function observe(type, req, details = {}) {
     if (!acceptance?.observe) return;
-    acceptance.observe({ type, time: now, id: req?.id ?? null, ...details,
-      cache: pageCache.snapshot(), pages: pools.hbm.blocks.map(b => ({
-        id: b.id, tokens: b.tokens, references: b.refcount, ready: b.ready, output: b.output,
-      })) });
+    const owner = details.instance ?? req?.instId ?? inst.id;
+    const resource = details.resourceId ? cacheResources.find(target => target.resourceId === details.resourceId)
+      : decodeResource && req?._cacheDevice === 'decode' ? decodeResource : instances[owner];
+    const resources = resourceSnapshots();
+    acceptance.observe({ type, time: now, id: req?.id ?? null, instance: owner,
+      resourceId: resource.resourceId, ...(resource.device ? { device: resource.device } : {}),
+      ...(req ? { routingKey: req.routingKey } : {}), ...details,
+      cache: cacheSnapshot(), pages: resources.flatMap(resource => resource.pages), resources });
   }
   if (unified) {
-    for (const description of initialCache) pageCache.warm(description, 0);
+    for (const target of instances) target.pageCache.warm(initialCache, 0);
     observe('initial');
   }
 
@@ -967,13 +1049,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     source.drainEvents(now, req => {
       const target = routeRequest(req);
       req.instId = target.id;
+      if (decodeResource) req._cacheDevice = 'prefill';
       target.nRouted++;
       target.waitQueue.push(req);
       observe('arrive', req, { arrive: req.arrive, instance: target.id });
     });
   }
 
-  let recoveringCapacity = false, retractCount = 0, recomputedTokens = 0;
+  let retractCount = 0, recomputedTokens = 0;
   const runningRequests = () => [...prefillQ, ...prefilling, ...decodeWait, ...decoding, ...kvXfer];
 
   function prefetchPolicy(req) {
@@ -1008,6 +1091,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   }
 
   function failRequest(req, reason) {
+    if (decodeResource) useRequestResource(req);
     removeAttempt(req);
     pageCache.cancel(req, now);
     pageCache.release(req, now, reason);
@@ -1017,8 +1101,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   }
 
   function retractRequest(req) {
+    if (decodeResource) useRequestResource(req);
     removeAttempt(req);
     pageCache.release(req, now, 'retract');
+    if (decodeResource) { req._cacheDevice = 'prefill'; req._kvXferDone = false; req._pdHandoff = null; }
     req.state = 'wait';
     req._pfDone = 0; req._pfTotal = 0;
     req._prefetchPolicy = null;
@@ -1027,7 +1113,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     retractCount++;
     replayMetrics?.retract(req, now);
     waitQueue.push(req);
-    recoveringCapacity = true;
+    inst.recoveringCapacity = true;
     observe('retract', req, { generatedTokens: req.tokensGen, attempt: req._attempt });
   }
 
@@ -1035,8 +1121,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     let status = pageCache.output(req, tokens, now).status;
     while (status !== 'admitted') {
       if (status === 'infeasible') { failRequest(req, 'abort'); return false; }
-      if (pageCache.pending) return false;
-      const active = runningRequests().sort((a, b) => a.tokensGen - b.tokensGen || b.inputLen - a.inputLen
+      if (pageCache.pending || (decodeResource && kvXfer.some(candidate => candidate._pdHandoff?.state === 'pending'))) return false;
+      const active = runningRequests().filter(candidate => !decodeResource || candidate._cacheDevice === 'decode')
+        .sort((a, b) => a.tokensGen - b.tokensGen || b.inputLen - a.inputLen
         || String(a.id).localeCompare(String(b.id), 'en', { numeric: true }));
       if (active.length < 2) { failRequest(req, 'abort'); return false; }
       const victim = active[0];
@@ -1069,9 +1156,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   }
 
   function admitRequests() {
-    if (unified && recoveringCapacity) {
-      if (runningRequests().length) return;
-      recoveringCapacity = false;
+    if (unified && inst.recoveringCapacity) {
+      if (runningRequests().some(candidate => !decodeResource || candidate._cacheDevice === 'decode'
+        || candidate._pdHandoff?.state === 'pending')) return;
+      inst.recoveringCapacity = false;
     }
     for (let i = 0; i < waitQueue.length; i++) {
       const req = waitQueue[i];
@@ -1185,7 +1273,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   // prefill 完成统一出口（2026-08-18, 波次模式提取共用）：单飞组状态 + 前缀激活 + 转 decode/decodeWait
   function finishPrefill(q) {
     if (!unified || !q._prefillFinished) q.prefillEnd = now;
-    if (unified && q.firstTokenTime === undefined) q.firstTokenTime = now;
+    if (unified && q.firstTokenTime === undefined && (!pdReal || q.outputLen === 0)) q.firstTokenTime = now;
     // ---- prefill 吞吐统计(2026-08-25) ----
     // 埋在此处而非 completeRequest: prefill 吞吐的完成事件是"prefill 算完", 与 decode 无关。
     // 长输入场景(1M tok)下大量请求 prefill 已完成但 decode 远未结束, 用 stats.completed
@@ -1236,7 +1324,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       // 传输起点 = 本步**初**(now 已是本步末)。若记 now, 则本步循环里立刻推进一份 quota,
       // 等于凭空多算 1 个 DT 的进度 ⇒ 实际墙钟恒比独立耗时少 DT(实测 28.09 vs 30.09ms),
       // 违反"共享链路只会更慢"的物理约束。
-      q._kvX0 = now - DT;
+      q._kvX0 = unified ? null : now - DT;
+      if (unified) q._pdHandoff = null;
       q.state = 'kvXfer';
       kvXfer.push(q);
       dirty = true;
@@ -1245,8 +1334,61 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     finishKvXfer(q);
   }
 
+  function pdTransferDetails(req, bytes = 0) {
+    return { fromResourceId: instances[0].resourceId, toResourceId: decodeResource.resourceId,
+      bytes, sent: req._kvXferSent, total: req._kvXferBytes, start: req._kvX0,
+      reserved: req._pdHandoff?.bytesReserved || 0 };
+  }
+  function startPdTransfers() {
+    if (now >= simCap) return;
+    for (const req of [...kvXfer]) {
+      if (req._pdHandoff) continue;
+      const transfer = inst.pageCache.beginHandoff(req, decodeResource.pageCache, now);
+      if (transfer.status === 'infeasible') { failRequest(req, 'infeasible'); continue; }
+      if (transfer.status !== 'admitted') continue;
+      req._pdHandoff = transfer.handoff;
+      req._pdAttempt = req._attempt || 0;
+      req._kvX0 = now;
+      observe('pdTransferStart', req, pdTransferDetails(req));
+    }
+  }
+  let pdTransferTime = 0;
+  function settlePdTransfers() {
+    const elapsed = now - pdTransferTime;
+    pdTransferTime = now;
+    const active = instances[0].kvXfer.filter(req => req._pdHandoff?.state === 'pending');
+    if (!active.length || elapsed < 0) return;
+    const share = pdLinkEffBW / active.length;
+    for (const req of active) {
+      useRequestResource(req);
+      if ((req._attempt || 0) !== req._pdAttempt) { req._pdHandoff.cancel(now); continue; }
+      const remaining = Math.max(0, req._kvXferBytes - req._kvXferSent);
+      const finished = now >= req._pdReadyAt;
+      const moved = finished ? remaining : Math.min(remaining, share * elapsed);
+      req._kvXferSent += moved; stats.pdXferBytes += moved;
+      if (moved > 0) observe('pdTransferProgress', req, pdTransferDetails(req, moved));
+      if (!finished) continue;
+      if (!req._pdHandoff.complete(now)) continue;
+      req._kvXferDone = true; req._kvXferEnd = now; req._firstKvXferEnd ??= now;
+      req._kvXferSpan = now - req._kvX0;
+      stats.pdXferSpanSum += req._kvXferSpan;
+      stats.pdXferSoloSum += req._kvXferTotal; stats.pdXferCount++;
+      kvXfer.splice(kvXfer.indexOf(req), 1);
+      req._cacheDevice = 'decode';
+      useCacheResource(decodeResource);
+      observe('pdTransferComplete', req, pdTransferDetails(req));
+      finishKvXfer(req);
+    }
+  }
+
   // KV 传输完成 → 原有的转 decode/decodeWait 逻辑(与非 PD 路径完全一致)
   function finishKvXfer(q) {
+    if (unified && pdReal) {
+      if (!q._kvXferDone || q._pdHandoff?.state !== 'completed')
+        throw new Error('Workload PD invariant: decode before device handoff');
+      useCacheResource(decodeResource);
+      q.firstTokenTime ??= now;
+    }
     // prefill 完成 → 转 decode。continuous 批下 decode 并发受 max_batch_size 约束：
     // 槽位满时先入 decodeWait（不占 prefill 流水线），槽位释放后补入。
     let decodeSlots = s.batching.max_batch_size || 8;
@@ -1435,13 +1577,15 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
 
   function completeRequest(req) {
     if (req.state === 'done') return;
+    if (decodeResource) useRequestResource(req);
     req.state = 'done'; req.completeTime = now;
     stats.latencies.push((now - req.arrive) * 1000);
     // TTFT 口径(2026-08-20 PD 真分离): 首 token 产出时刻。
     // 非 PD / 近似档: = prefillEnd(prefill 算完即可出首 token)。
     // 真分离: KV 必须先从 P 传到 D, 首 token 只能在传输完成后产出 ⇒ TTFT 含传输段。
     // _kvXferEnd 由传输完成时写入(= prefillEnd + 实际传输墙钟)。
-    let _ttftAt = (req._kvXferEnd != null) ? req._kvXferEnd : req.prefillEnd;
+    const firstKvReady = unified && req._firstKvXferEnd != null ? req._firstKvXferEnd : req._kvXferEnd;
+    let _ttftAt = unified && req.firstTokenTime != null ? req.firstTokenTime : (firstKvReady != null ? firstKvReady : req.prefillEnd);
     stats.ttfts.push((_ttftAt - req.arrive) * 1000);
     stats.tpots.push((now - (req.decodeStart || _ttftAt)) / Math.max(1, req.outputLen) * 1000); // ms/token（剔除 decodeWait 排队）
     stats.queueWaits.push(req.admitTime - req.arrive);
@@ -1522,7 +1666,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     if (req._pqSkipped) stats.pqSkipN++;
     // PD 真分离: P→D KV 传输段(prefillEnd → KV 到位), 是 TTFT 的第 5 个分量。
     // 非真分离档恒为 0 ⇒ 分解口径与改动前一致。
-    let _xW = (req._kvXferEnd != null) ? Math.max(0, req._kvXferEnd - req.prefillEnd) : 0;
+    let _xW = (firstKvReady != null) ? Math.max(0, firstKvReady - req.prefillEnd) : 0;
     stats.ttftX += _xW;
     stats.fetchSoloSum += (req.fetchTime || 0); // prefill 传输独立用时(不重叠时 L3 拉取单独耗时): race/be 与计算重叠后实际等待≈0, 但独立用时仍在
     // fetchNet(诊断, 不进堆叠柱): 传输过程实际墙钟 = _ft1 − _ft0, 含 L3 并发带宽排队、不含计算。
@@ -1530,7 +1674,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     if (_ft0v !== null && _ft1v !== null) stats.fetchSpanSum += Math.max(0, _ft1v - _ft0v);
     // decode 槽位等待: 从"KV 可用时刻"起算(真分离下 = 传输完成; 否则 = prefillEnd),
     // 避免把 P→D 传输时间重复计入 decodeWait(它已单列为 _xW)
-    let _kvReady = (req._kvXferEnd != null) ? req._kvXferEnd : req.prefillEnd;
+    let _kvReady = (firstKvReady != null) ? firstKvReady : req.prefillEnd;
     let _dW = Math.max(0, (req.decodeStart || _kvReady) - _kvReady);
     let _dT = Math.max(0, req.completeTime - (req.decodeStart || _kvReady));
     // ---- decode 吞吐的时间区间(2026-08-26) ----
@@ -1758,17 +1902,58 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     }
   }
 
+  function decodeCost(sumH) {
+    const memory = (rD.modelWeightBytes * rD.decodeWeightRatio + sumH) / rD.aggHbmBW
+      + perReqMs(decoding.length, rD.activatedParams, multiInst ? inst.gpus : pdDecodeGpus) / 1000;
+    const compute = 2 * rD.activatedParams * decoding.length / rD.computeFlops;
+    return { memory, compute, passTime: Math.max(memory, compute, 1e-6) + rD.commTime(decoding.length) };
+  }
+  function planWorkloadStep() {
+    stepDuration = Math.max(0, Math.min(DT, simCap - now, source.nextTime - now, cacheNextTime() - now));
+    for (const target of instances) {
+      useInstance(target);
+      if (curWave) stepDuration = Math.min(stepDuration, Math.max(0, curWave.endT - now));
+      for (const req of [...waitQueue, ...prefillQ]) {
+        if (req._prefetchPolicy?.type === 'timeout' && req._fetchDeadline > now)
+          stepDuration = Math.min(stepDuration, req._fetchDeadline - now);
+      }
+      if (decodeResource) {
+        const transfers = kvXfer.filter(req => req._pdHandoff?.state === 'pending');
+        for (const req of transfers) {
+          req._pdReadyAt = now + Math.max(0, req._kvXferBytes - req._kvXferSent) * transfers.length / pdLinkEffBW;
+          stepDuration = Math.min(stepDuration, Math.max(0, req._pdReadyAt - now));
+        }
+        useCacheResource(decodeResource);
+      }
+      if (decoding.length && (!curWave || pdReal)) {
+        refreshLocations();
+        const cost = decodeCost(decoding.reduce((sum, req) => sum + req.kvHbm, 0));
+        for (const req of decoding) if (!req._outputBlocked)
+          stepDuration = Math.min(stepDuration, Math.max(0, req.outputLen - req.tokensGen) * cost.passTime);
+      }
+    }
+    for (const transfer of inFlight) stepDuration = Math.min(stepDuration, Math.max(0, transfer.arriveAt - now));
+    for (const event of [...outputEvents, ...completionEvents]) if (event.at > now)
+      stepDuration = Math.min(stepDuration, event.at - now);
+  }
   const outputEvents = [];
   let nextBoundary = 0, stepDuration = DT;
-  let resourceTime = 0, hbmIntegral = 0, previousHbm = pools.hbm.used;
+  let resourceTime = 0, hbmIntegral = 0, previousHbm = totalHbm();
+  let dramIntegral = 0, ssdIntegral = 0, previousDram = totalDram(), previousSsd = totalSsd();
+  function captureResourceUsage() {
+    previousHbm = totalHbm(); previousDram = totalDram(); previousSsd = totalSsd();
+  }
   for (let step = 0; unified || step < maxSteps; step++) {
     let replayIdleLanding = false;
     now = unified ? nextBoundary : replay ? Math.min(step * DT, simCap) : step * DT;
     if (unified) {
       hbmIntegral += (now - resourceTime) * previousHbm;
+      dramIntegral += (now - resourceTime) * previousDram;
+      ssdIntegral += (now - resourceTime) * previousSsd;
       resourceTime = now;
       if (step >= 2_000_000) throw new RangeError('U2 acceptance step resource limit exceeded');
-      pageCache.advance(now);
+      for (const target of cacheResources) target.pageCache.advance(now);
+      if (pdReal) settlePdTransfers();
       for (const target of instances) {
         useInstance(target);
         settlePrefillWave();
@@ -1785,9 +1970,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         }
       }
       for (const event of outputEvents.splice(0)) {
+        if (event.at > now) { outputEvents.push(event); continue; }
         const q = event.req;
         if (q.state !== 'decode' || (q._attempt || 0) !== event.attempt) continue;
-        useInstance(instances[q.instId]);
+        useRequestResource(q);
         if (!reserveOutput(q, Math.floor(event.tokens))) {
           if (q.state === 'decode' && (q._attempt || 0) === event.attempt) {
             q._outputBlocked = true;
@@ -1814,13 +2000,16 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       for (let i = completionEvents.length - 1; i >= 0; i--) {
         if (completionEvents[i].at <= now + 1e-12) {
           const { req } = completionEvents.splice(i, 1)[0];
+          if (unified) useRequestResource(req);
           completeRequest(req);
           dirty = true;
         }
       }
       replayMetrics.observe(now, { activeSessions: replay.sessions.size,
-        activeRequests: waitQueue.length + prefillQ.length + prefilling.length + decoding.length + decodeWait.length + completionEvents.length,
-        queuedRequests: waitQueue.length + prefillQ.length, ...pageCache.snapshot() });
+        activeRequests: (unified ? instances.reduce((sum, target) => sum + instLoad(target), 0)
+          : waitQueue.length + prefillQ.length + prefilling.length + decoding.length + decodeWait.length) + completionEvents.length,
+        queuedRequests: unified ? instances.reduce((sum, target) => sum + target.waitQueue.length + target.prefillQ.length, 0)
+          : waitQueue.length + prefillQ.length, ...cacheSnapshot() });
     }
 
     // 事件跳跃(2026-08-18): 系统全空闲(无在途请求, 拉取/波次自然也不存在)时直接快进至
@@ -1838,13 +2027,13 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         || (unified && (xi.curWave || xi.prepWave))) { allIdle = false; break; }
     }
     if (unified && allIdle && !outputEvents.length && !completionEvents.length) {
-      let next = Math.min(source.nextTime, pageCache.nextTime);
+      let next = Math.min(source.nextTime, cacheNextTime());
       for (const transfer of inFlight) next = Math.min(next, transfer.arriveAt);
       if (!Number.isFinite(next) && !source.done)
         throw new Error('Workload scheduling invariant: unresolved anchors without future events');
       const target = Math.min(simCap, next, source.done ? Math.max(now, earliestEnd) : Infinity);
       if (target > now) {
-        previousHbm = pools.hbm.used;
+        captureResourceUsage();
         nextBoundary = target;
         continue;
       }
@@ -1899,8 +2088,11 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
 
     // ======== 逐实例推进(S2): 每个实例独立完成准入→prefill→传输→decode ========
     // 单实例时循环体只执行一次, 且 useInstance 重绑的就是原来那套容器 ⇒ 行为逐位不变。
+    for (let executionPhase = 0; executionPhase < (unified ? 2 : 1); executionPhase++) {
+      if (unified && executionPhase === 1) planWorkloadStep();
     for (let _ii = 0; _ii < instances.length; _ii++) {
       useInstance(instances[_ii]);
+      if (!unified || executionPhase === 0) {
 
     // 准入：prefill 槽位与 decode 槽位解耦（连续批）
     // 原模型把 prefill/decode 计入同一 running 上限 → decode 波次占满槽位会阻塞后续请求的
@@ -2316,7 +2508,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // ---- PD 真分离: P→D KV 传输推进(2026-08-20) ----
     // 互联带宽在同时传输的请求间**平分**(共享一条链路), 与 L3 拉取的共享池同思路:
     // 并发传输越多, 每个请求越慢 —— 这是 PD 分离在高负载下的真实代价(传输成为新瓶颈)。
-    if (kvXfer.length) {
+    if (!unified && kvXfer.length) {
       let share = pdLinkEffBW / kvXfer.length;      // 每请求本步可用带宽
       let quota = share * DT;                       // 每请求本步可传字节
       for (let i = kvXfer.length - 1; i >= 0; i--) {
@@ -2347,6 +2539,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // decode 槽位释放 → 从 decodeWait 补入
     // (2026-09-02: 原 `s.batching.type === 'static'` 旁路已删 —— sglang 只有 continuous
     //  batching, 无 static 波次语义, 该分支恒不成立。)
+    if (decodeResource) { startPdTransfers(); useCacheResource(decodeResource); }
     while (decodeWait.length && decoding.length < (s.batching.max_batch_size || 8)) {
       let q = decodeWait.shift();
       q.state = 'decode';
@@ -2361,22 +2554,16 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // 后台搬运, 服务 DSL 的 eager 档。sglang 无水位触发的预取, host→device 只在命中时
     // load_back 按需搬运 —— 详见 doPrefetchFor 删除处的注释。
 
-    if (unified) {
-      stepDuration = Math.max(0, Math.min(DT, simCap - now, source.nextTime - now,
-        pageCache.nextTime - now, curWave ? curWave.endT - now : Infinity));
-      for (const req of [...waitQueue, ...prefillQ]) {
-        if (req._prefetchPolicy?.type === 'timeout' && req._fetchDeadline > now)
-          stepDuration = Math.min(stepDuration, req._fetchDeadline - now);
       }
-      for (const transfer of inFlight) stepDuration = Math.min(stepDuration, Math.max(0, transfer.arriveAt - now));
-      if (curWave && stepDuration > 0) {
-        stats.pfGpuBusySec += stepDuration;
-        stats.pfBusySteps++; stats.pfActSum += curWave.members.length;
-      }
+    if (unified && executionPhase === 0) continue;
+    if (decodeResource) useCacheResource(decodeResource);
+    if (unified && curWave && stepDuration > 0) {
+      stats.pfGpuBusySec += stepDuration;
+      stats.pfBusySteps++; stats.pfActSum += curWave.members.length;
     }
     // Decode：批次 Roofline —— passTime = max(访存时间, 算力下限) + TP AllReduce通信
-    if (decoding.length && (!unified || (stepDuration > 0 && !curWave))) {
-      if (dirty || step % TOUCH_EVERY === 0) { refreshLocations(); dirty = false; }
+    if (decoding.length && (!unified || (stepDuration > 0 && (!curWave || pdReal)))) {
+      if (!unified && (dirty || step % TOUCH_EVERY === 0)) { refreshLocations(); dirty = false; }
       // decodeWait 中的块视为活跃（即将进入 decode）：touch 刷新 LRU 时间戳防误淘汰——
       // 否则 LRU 把等待中的 KV 挤到慢层，进入 decode 时读 SSD 拖垮批次（恶性循环：
       // decode 慢 → decodeWait 更多 → HBM 被等待 KV 占满 → decode 块被挤出 → 更慢）
@@ -2400,9 +2587,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       //      有竞争(预取占带宽)时 decode 读被拖慢——物理正确。
       // PD 真分离(2026-08-20): decode 只用 D 节点资源(rD = calcAll 换卡数视图);
       // 非真分离档 rD===r 且 dGpus===p.gpus ⇒ 与改动前逐位一致。
-      let passTime = (rD.modelWeightBytes * rD.decodeWeightRatio + sumH) / rD.aggHbmBW
+      const localCost = unified ? decodeCost(sumH) : null;
+      let passTime = unified ? localCost.memory : (rD.modelWeightBytes * rD.decodeWeightRatio + sumH) / rD.aggHbmBW
         + perReqMs(decoding.length, rD.activatedParams, pdDecodeGpus) / 1000;
-      let cmpFloor = 2 * rD.activatedParams * decoding.length / rD.computeFlops;
+      let cmpFloor = unified ? localCost.compute : 2 * rD.activatedParams * decoding.length / rD.computeFlops;
       // ===== prefill/decode 交替独占 GPU(2026-09-02 第3批, enable_mixed_chunk=False) =====
       // sglang 事件循环每次只跑一个 batch: 有 prefill batch 就跑 prefill(优先),
       // 否则跑 decode(scheduler.py:2880-2892 "Run prefill first if possible") ⇒ 二者
@@ -2434,12 +2622,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       // token 产出、KV 读字节、链路占用三者口径一致 —— 只改其一会让带宽统计与吞吐脱节。
       // pfShare=0(流体基线 / PD 真分离 / 无执行波)时 dtEff===DT ⇒ 逐位零回归。
       let dtEff = (replay ? Math.min(DT, Math.max(0, simCap - now)) : DT) * (1 - pfShare);
-      if (unified) {
-        if (!curWave) {
-          for (const q of decoding) stepDuration = Math.min(stepDuration, Math.max(0, q.outputLen - q.tokensGen) * passTime);
-        }
-        dtEff = curWave ? 0 : stepDuration;
-      }
+      if (unified) dtEff = curWave && !pdReal ? 0 : stepDuration;
       // ---- L2 读链路排队(busyUntil) + L3 读统一共享池(2026-08-18, 问题②修复) ----
       // L2(dram>hbm): 维持 busyUntil 排队模型(decode 读与预取/淘汰共享带宽)。
       // L3(ssd>dram): decode 按需读优先于 prefill 拉取(见拉取段注释)——decode 始终按全速
@@ -2462,10 +2645,11 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         let stepWait = Math.max(l2Wait, l3ReadPerPass * pIt);     // 取 L2/L3 较大者(与旧 max 语义一致)
         let readPerPass = stepWait / Math.max(pIt, 1e-9);          // 分摊到每 pass
         // passTime = 基础项 + 排队读时间(累加, 与旧模型 sumD/bw+sumS/bw 语义一致)
-        let newPt = (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
-          + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000
+        let newPt = (unified ? localCost.memory : (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
+          + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000)
           + readPerPass + rD.commTime(decoding.length);
-        newPt = Math.max(newPt, cmpFloor + rD.commTime(decoding.length), 1e-6);
+        newPt = unified ? Math.max(localCost.memory + readPerPass, cmpFloor, 1e-6) + rD.commTime(decoding.length)
+          : Math.max(newPt, cmpFloor + rD.commTime(decoding.length), 1e-6);
         if (Math.abs(newPt - passTime) < 1e-12) break;
         passTime = newPt;
       }
@@ -2494,7 +2678,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         stats.l2Inst.push(Math.max(instL2, 0)); stats.l3Inst.push(Math.max(instL3, 0));
       }
       // passTime 名义分量 + 瓶颈归因（时间主要花在哪一层；comm 为通信项，cmp 为算力下限）
-      let tHbm = (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
+      let tHbm = unified ? localCost.memory : (r.modelWeightBytes * r.decodeWeightRatio + sumH) / r.aggHbmBW
         + perReqMs(decoding.length, r.activatedParams, p.gpus) / 1000;
       // 实际读等待(含排队)分摊到每 pass —— 与 tHbm/comm 同量纲(每 pass 名义时间)
       let tL2 = Math.max(0, l2Fin - now) / Math.max(passes, 1e-9);
@@ -2527,7 +2711,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         if (unified) {
           if (tok > 0 && !q._outputBlocked) {
             const tokens = q.outputLen - q.tokensGen <= tok + 1e-12 ? q.outputLen : q.tokensGen + tok;
-            outputEvents.push({ req: q, tokens, attempt: q._attempt || 0 });
+            outputEvents.push({ req: q, tokens, attempt: q._attempt || 0, at: now + stepDuration });
           }
           continue;
         }
@@ -2559,6 +2743,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       // 正确口径: 只在**系统整体仍有在途负载**的时间窗内采样(此时路由决策才有意义)。
       if (_busyPhase) { inst.qBusySum += _qh; inst.qBusySamples++; }
     } // ======== end 逐实例推进 ========
+    }
 
     if (!unified && pageCache) {
       drainSourceEvents();
@@ -2575,10 +2760,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       _sDec += xi.decoding.length;    _sPf += xi.prefilling.length;
       _sQ += xi.waitQueue.length + xi.prefillQ.length;
     }
+    if (decodeResource) {
+      _sHbmUsed += decodeResource.pools.hbm.used; _sHbmCap += decodeResource.caps.hbm;
+      _sDram += decodeResource.pools.dram.used; _sSsd += decodeResource.pools.ssd.used;
+    }
     if (replay) replayMetrics.observe(now, { activeSessions: replay.sessions.size,
       activeRequests: _sDec + _sPf + _sQ + completionEvents.length
         + (unified ? instances.reduce((sum, target) => sum + target.decodeWait.length + target.kvXfer.length, 0) : 0),
-      queuedRequests: _sQ, ...pageCache.snapshot() });
+      queuedRequests: _sQ, ...cacheSnapshot() });
     let u = _sHbmUsed / Math.max(_sHbmCap, 1);
     stats.memUtilSum += u; stats.memUtilSamples++;
     if (u > stats.memUtilPeak) stats.memUtilPeak = u;
@@ -2602,7 +2791,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     }
 
     let _allDone = source.done && (!replay || (!inFlight.length && now >= replay.options.durationSeconds));
-    if (unified) _allDone = source.done && now >= earliestEnd && !pageCache.pending
+    if (unified) _allDone = source.done && now >= earliestEnd && !cachePending()
       && !inFlight.length && !outputEvents.length && !completionEvents.length;
     for (let ii = 0; _allDone && ii < instances.length; ii++) {
       let xi = instances[ii];
@@ -2615,10 +2804,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       if (now >= simCap) break;
       const executing = instances.some(x => x.prefillQ.length || x.prefilling.length || x.kvXfer.length
         || x.decodeWait.length || x.decoding.length || x.curWave || x.prepWave);
-      if (!executing && !outputEvents.length && !inFlight.length && !pageCache.pending && !Number.isFinite(source.nextTime)
-        && (!source.done || waitQueue.length))
+      if (!executing && !outputEvents.length && !inFlight.length && !cachePending() && !Number.isFinite(source.nextTime)
+        && (!source.done || instances.some(target => target.waitQueue.length)))
         throw new Error('Workload scheduling invariant: unresolved dependencies or HBM pressure without future events');
-      previousHbm = pools.hbm.used;
+      captureResourceUsage();
       nextBoundary = Math.min(simCap, now + stepDuration);
       continue;
     }
@@ -2928,7 +3117,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     admission: strategy.admission.type, eviction: strategy.eviction.type, prefetch: strategy.prefetch.type,
   };
   if (replay) {
-    Object.assign(result.replay.cache, pageCache.snapshot());
+    Object.assign(result.replay.cache, cacheSnapshot());
     result.replay.samples.legacy = {
       requestCoverage: 'all-arrived-requests',
       concurrencySampling: 'periodic-with-idle-boundaries', concurrencySampleIntervalSeconds: DT * 5,
@@ -2938,18 +3127,20 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       bandwidthSamples: stats.l2Inst.length, bandwidthSampling: 'first-20000-decode-steps',
       requestArrayLimit: replay.launcher.limits.maxRequests,
     };
-    result.memUtilAvg = (result.replay.samples.timeWeightedMean.hbmBytes || 0) / Math.max(caps.hbm, 1) * 100;
-    result.memUtilPeak = result.replay.samples.peak.hbmBytes / Math.max(caps.hbm, 1) * 100;
+    result.memUtilAvg = (result.replay.samples.timeWeightedMean.hbmBytes || 0) / Math.max(unified ? totalHbmCapacity() : caps.hbm, 1) * 100;
+    result.memUtilPeak = result.replay.samples.peak.hbmBytes / Math.max(unified ? totalHbmCapacity() : caps.hbm, 1) * 100;
     result.hitRate && (result.hitRate.input = null);
     const bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
     if (bytes > replay.launcher.limits.maxResultBytes) throw new ReplayValidationError('replay.result', 'result byte resource limit exceeded');
     replay.checkWallTime();
   }
   if (unified) {
-    result.memUtilAvg = hbmIntegral / simEnd / Math.max(caps.hbm, 1) * 100;
+    result.memUtilAvg = hbmIntegral / simEnd / Math.max(totalHbmCapacity(), 1) * 100;
     result.memUtilPeak = stats.memUtilPeak * 100;
+    result.l2AvgGB = dramIntegral / simEnd / 1e9;
+    result.l3AvgGB = ssdIntegral / simEnd / 1e9;
   }
   acceptance?.finish?.({ modelVersion: WORKLOAD_MODEL_VERSION, retractCount, recomputedTokens,
-    window: { earliestEnd, hardCutoff: simCap }, counts: source.counts(), cache: pageCache.snapshot() });
+    window: { earliestEnd, hardCutoff: simCap }, counts: source.counts(), cache: cacheSnapshot(), resources: resourceSnapshots() });
   return result;
 }

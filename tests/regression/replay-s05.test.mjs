@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createReplayLauncher, createReplayRandomStreams, ReplayEventHeap } from '../../src/core/replay.js';
+import { createReplayLauncher, createReplayRandomStreams, createReplayRuntime, ReplayEventHeap } from '../../src/core/replay.js';
 
 const { bundle } = JSON.parse(readFileSync(new URL('../fixtures/replay/runtime-prefix.json', import.meta.url)));
 const options = { qps: 6, durationSeconds: 5, seed: 42 };
@@ -41,6 +41,32 @@ test('S05: templates cycle and cache namespaces isolate launches and runs', () =
   assert.deepEqual(events.map(e => e.templateIndex), events.map((_, i) => i % 2));
   assert.equal(new Set(events.map(e => e.sessionInstanceKey)).size, events.length);
   assert.notEqual(events[0].sessionInstanceKey, b.take().sessionInstanceKey);
+});
+
+test('U4.2: replay routing is repeatable across runs while content remains launch-private', () => {
+  const run = consumeRouting => {
+    const runtime = createReplayRuntime({ bundle, options: { durationSeconds: 5, warmupSeconds: 0 } }, options);
+    if (consumeRouting) for (let i = 0; i < 100; i++) runtime.launcher.routeRandom();
+    const requests = [];
+    while (!runtime.done) {
+      const time = runtime.nextTime;
+      assert.ok(Number.isFinite(time));
+      runtime.drainEvents(time, req => { requests.push(req); runtime.complete(req, time); });
+    }
+    return requests;
+  };
+  const a = run(false), b = run(true);
+  assert.ok(a.length > 3);
+  assert.deepEqual(a.map(req => [req.arrive, req.routingKey]), b.map(req => [req.arrive, req.routingKey]));
+  assert.notEqual(a[0].sessionId, b[0].sessionId);
+  assert.notEqual([...a[0].inputContent][0].pathId, [...b[0].inputContent][0].pathId);
+  const launches = new Map();
+  for (const req of a) {
+    const previous = launches.get(req.launchIndex);
+    if (previous) assert.equal(req.routingKey, previous);
+    launches.set(req.launchIndex, req.routingKey);
+  }
+  assert.equal(new Set(launches.values()).size, launches.size);
 });
 
 test('S05: [0,T) boundary, zero launches, invalid inputs and cumulative limits', () => {

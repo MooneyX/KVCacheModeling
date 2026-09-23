@@ -137,7 +137,7 @@ function contentHarness(cap = 4096, options = {}) {
     assert.ok(item); delete p.blockIndex[id]; p.blocks.splice(p.blocks.indexOf(item), 1);
     p.used -= item.size * (ratio[tier] ?? 1);
   };
-  const cache = createReplayCache({ pools, blockBytes: 64, add, remove, ...options, tierRatio: ratio });
+  const cache = createReplayCache({ pools, blockBytes: options.blockSize ?? 64, add, remove, ...options, tierRatio: ratio });
   const snapshot = () => structuredClone({ pools, cache: cache.snapshot() });
   return { cache, pools, pool: pools.hbm, add, remove, snapshot };
 }
@@ -543,4 +543,333 @@ test('U3 cache: publication never deduplicates into an in-flight eviction source
   assert.ok(h.pool.blockIndex[id]?.ready);
   assert.equal(h.pool.blockIndex[id].refcount, 1);
   h.cache.release(second, 1);
+});
+
+const physicalOracles = [
+  { blockSize: 16, tokens: [16, 16, 16, 16, 16, 16, 16, 16, 1], capacity: 144, tailHit: 64 },
+  { blockSize: 32, tokens: [32, 32, 32, 32, 1], capacity: 160, tailHit: 64 },
+  { blockSize: 64, tokens: [64, 64, 1], capacity: 192, tailHit: 64 },
+  { blockSize: 128, tokens: [128, 1], capacity: 256, tailHit: 0 },
+];
+
+for (const { blockSize, tokens, capacity, tailHit } of physicalOracles) {
+  test(`U4.1 cache: B=${blockSize} maps logical 64-token RLE paths and charges complete physical tail pages`, () => {
+    const h = contentHarness(4096, { blockSize });
+    const template = { in: 129, out: 0, blockRuns: [[0, 1], [7, 2]] };
+    const before = structuredClone(template);
+    const req = createReplayRequest(template, 0, 0, { sessionInstanceKey: 'physical' });
+    assert.deepEqual(Array.from(req.inputContent, part => [part.position, part.tokens]), [[0, 64], [64, 64], [128, 1]]);
+    const plan = h.cache.lookup(req);
+    assert.equal(plan.missTokens, 129);
+    assert.deepEqual(plan.slots.map(slot => slot.tokens), tokens);
+    assert.deepEqual(plan.slots.map(slot => slot.position), tokens.map((_, i) => i * blockSize));
+    if (blockSize <= 64) {
+      assert.equal(plan.slots[0].key, replayPageKey('physical', 0, blockSize, 'default', blockSize));
+      if (blockSize < 64) assert.equal(plan.slots[1].key, replayPageKey('physical', 0, blockSize, 'default', blockSize, blockSize));
+    } else {
+      assert.deepEqual(JSON.parse(plan.slots[0].key).at(-1), [
+        [JSON.stringify(['replay', 'physical', 'input', 0]), 0, 64],
+        [JSON.stringify(['replay', 'physical', 'input', 7]), 0, 64],
+      ]);
+    }
+    h.cache.place(req, 0); h.cache.publish(req, 1); h.cache.release(req, 2);
+    assert.equal(h.pool.used, capacity); assert.equal(h.cache.snapshot().inputPages, tokens.length);
+    assert.equal(h.cache.lookup(req, 3).hitL1Tokens, 129);
+    assert.deepEqual(template, before);
+    const tail = contentRequest([['physical-tail', 65]]);
+    h.cache.place(tail, 3); h.cache.publish(tail, 4); h.cache.release(tail, 4);
+    const extended = h.cache.lookup(contentRequest([['physical-tail', 66]]), 5);
+    assert.equal(extended.hitL1Tokens, tailHit); assert.equal(extended.missTokens, 66 - tailHit);
+  });
+
+  test(`U4.1 cache: B=${blockSize} output growth and retract use independent physical input/output pages`, () => {
+    const h = finiteHarness(8 * blockSize, { blockSize });
+    const req = contentRequest([['physical-output-input', blockSize + 1]], blockSize + 1);
+    h.cache.place(req, 0); computeInput(h, req, 1);
+    assert.equal(h.pool.used, 2 * blockSize);
+    assert.equal(h.cache.output(req, 1, 1).status, 'admitted');
+    assert.equal(h.pool.used, 3 * blockSize);
+    assert.equal(h.cache.output(req, blockSize + 1, 2).status, 'admitted');
+    assert.equal(h.pool.used, 4 * blockSize);
+    assert.deepEqual(h.pool.blocks.filter(page => page.output).map(page => page.tokens), [blockSize, 1]);
+    req.tokensGen = blockSize + 1;
+    h.cache.release(req, 3, 'retract');
+    assert.equal(h.pool.used, 2 * blockSize); assert.equal(req.tokensGen, blockSize + 1);
+    assert.equal(h.cache.place(req, 4).hitL1Tokens, blockSize + 1);
+    assert.deepEqual(h.cache.computeRanges(req, 4), [{ position: blockSize + 1, tokens: blockSize + 1 }]);
+    assert.equal(h.pool.used, 4 * blockSize);
+    computeInput(h, req, 5); h.cache.release(req, 6);
+    assert.deepEqual(h.pool.blocks.filter(page => page.output).map(page => page.tokens), [blockSize, 1]);
+    assert.ok(h.pool.blocks.every(page => !page.refcount));
+    const cramped = finiteHarness(3 * blockSize, { blockSize });
+    const retry = contentRequest([['too-large-restore', blockSize + 1]], blockSize + 1);
+    retry.tokensGen = blockSize + 1;
+    assert.deepEqual(cramped.cache.place(retry, 0), { status: 'infeasible' });
+    assert.deepEqual(cramped.cache.prefetch(retry, 0), { status: 'infeasible' });
+    assert.equal(cramped.pool.used, 0);
+  });
+
+  test(`U4.1 cache: B=${blockSize} physical page budgets reject before allocation and output mutation`, () => {
+    const limited = contentHarness(Infinity, { blockSize, maxBlockReferences: tokens.length - 1 });
+    const req = contentRequest([['budget', 129]], 1);
+    req.inputContent = { [Symbol.iterator]() { assert.fail('over-budget request expanded'); } };
+    assert.throws(() => limited.cache.place(req), ReplayValidationError);
+    assert.equal(limited.pool.used, 0);
+    const h = contentHarness(4096, { blockSize, maxBlockReferences: tokens.length });
+    const admitted = contentRequest([['budget', 129]], 1);
+    assert.equal(h.cache.place(admitted).status, 'admitted');
+    assert.equal(h.pool.used, capacity);
+    const before = h.snapshot(), reqBefore = structuredClone(admitted);
+    assert.throws(() => h.cache.output(admitted, 1, 1), ReplayValidationError);
+    assert.deepEqual(h.snapshot(), before); assert.deepEqual(admitted, reqBefore);
+    const cramped = contentHarness(capacity - 1, { blockSize });
+    assert.deepEqual(cramped.cache.place(contentRequest([['budget', 129]])), { status: 'infeasible' });
+    assert.equal(cramped.pool.used, 0);
+  });
+
+  test(`U4.1 cache: B=${blockSize} tail transfers reserve full pages but charge valid-token bytes`, () => {
+    const h = finiteHarness(4 * blockSize, { blockSize });
+    const req = contentRequest([['physical-transfer', blockSize + 1]]);
+    warmTier(h, req, 'dram');
+    assert.equal(h.pools.dram.used, 2 * blockSize);
+    assert.equal(h.cache.prefetch(req, 0).status, 'admitted');
+    assert.equal(req.fetchTime, (blockSize + 1) / 64);
+    assert.deepEqual(h.cache.ledger.map(record => [record.bytes, record.reservation]), [[blockSize, blockSize], [1, blockSize]]);
+    assert.deepEqual(h.cache.ledger.map(record => [record.start, record.end]), [[0, blockSize / 64], [blockSize / 64, (blockSize + 1) / 64]]);
+    assert.equal(h.cache.snapshot().hbmReservedBytes, 2 * blockSize);
+    h.cache.advance((blockSize + 1) / 64);
+    assert.equal(h.cache.lookup(req, (blockSize + 1) / 64).hitL1Tokens, blockSize + 1);
+    assert.equal(h.cache.snapshot().hbmReservedBytes, 0);
+    assert.equal(h.events.filter(event => event.type === 'transfer-progress').reduce((sum, event) => sum + event.bytes, 0), blockSize + 1);
+    h.cache.cancel(req, 3);
+  });
+}
+
+for (const blockSize of [16, 32]) {
+  test(`U4.1 cache: B=${blockSize} subpage eviction stops at the gap and cannot share a different logical path`, () => {
+    const h = contentHarness(4096, { blockSize });
+    const template = { in: 64, out: 0, blockRuns: [[0, 1]] };
+    const req = createReplayRequest(template, 0, 0, { sessionInstanceKey: 'subpages' });
+    h.cache.place(req); h.cache.publish(req, 1); h.cache.release(req, 2);
+    assert.equal(h.pool.used, 64);
+    h.remove('hbm', h.pool.blocks[1].id);
+    const plan = h.cache.lookup(req, 3);
+    assert.equal(plan.hitL1Tokens, blockSize); assert.equal(plan.missTokens, 64 - blockSize);
+    assert.deepEqual(plan.slots.map(slot => slot.hit), blockSize === 16 ? [true, false, false, false] : [true, false]);
+    const unrelated = createReplayRequest({ ...template, blockRuns: [[1, 1]] }, 1, 0, { sessionInstanceKey: 'subpages' });
+    assert.equal(h.cache.lookup(unrelated, 3).hitL1Tokens, 0);
+    h.cache.place(req, 3); h.cache.publish(req, 4); h.cache.release(req, 5);
+    assert.equal(h.pool.used, 64); assert.equal(h.cache.lookup(req, 6).hitL1Tokens, 64);
+  });
+}
+
+test('U4.1 cache: B=128 crosses RLE runs without changing ordered path or boundary identity', () => {
+  const h = contentHarness(4096, { blockSize: 128 });
+  const req = runs => createReplayRequest({ in: 256, out: 0, blockRuns: runs }, 0, 0, { sessionInstanceKey: 'cross-rle' });
+  const first = req([[0, 1], [1, 1], [8, 1], [9, 1]]);
+  h.cache.place(first); h.cache.publish(first, 1); h.cache.release(first, 2);
+  assert.equal(h.pool.used, 256);
+  assert.equal(h.cache.lookup(req([[0, 2], [8, 2]]), 3).hitL1Tokens, 256);
+  assert.equal(h.cache.lookup(req([[1, 1], [0, 1], [8, 2]]), 3).hitL1Tokens, 0);
+  assert.equal(h.cache.lookup(req([[0, 2], [9, 1], [8, 1]]), 3).hitL1Tokens, 128);
+  seedContent(h, [['A', 32], ['B', 96]]);
+  assert.equal(h.cache.lookup(contentRequest([['A', 32], ['B', 96]]), 3).hitL1Tokens, 128);
+  for (const parts of [[['A', 64], ['B', 64]], [['B', 96], ['A', 32]], [['A', 32], ['other-B', 96]]]) {
+    assert.equal(h.cache.lookup(contentRequest(parts), 3).hitL1Tokens, 0);
+  }
+});
+
+test('U4.1 cache: physical layouts cannot alias equal short tails and unsupported sizes fail explicitly', () => {
+  const h = contentHarness(4096, { blockSize: 16 });
+  seedContent(h, [['same-tail', 1]]);
+  const differentLayout = createReplayCache({ pool: h.pool, blockSize: 32, blockBytes: 32, add: h.add, remove: h.remove });
+  assert.equal(differentLayout.lookup(contentRequest([['same-tail', 1]]), 3).hitL1Tokens, 0);
+  for (const blockSize of [0, -16, 1.5, 3, 48, 96, 129, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '64', null]) {
+    assert.throws(() => contentHarness(4096, { blockSize }), ReplayValidationError);
+  }
+  for (const blockSize of [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]) {
+    assert.doesNotThrow(() => contentHarness(4096, { blockSize }));
+  }
+});
+
+test('U4 cache: global physical reference budget includes other resource domains and in-flight reservations', () => {
+  const contexts = [];
+  const resourceCount = () => contexts.reduce((sum, h) => sum + Object.values(h.pools)
+    .reduce((count, pool) => count + pool.blocks.length, 0), 0);
+  const options = { blockSize: 32, maxBlockReferences: 3, resourceCount };
+  const a = finiteHarness(256, { ...options, resourceId: 'budget-A' });
+  const b = finiteHarness(256, { ...options, resourceId: 'budget-B' });
+  contexts.push(a, b);
+  const first = contentRequest([['budget-A-input', 32]], 1);
+  a.cache.place(first, 0); computeInput(a, first, 0);
+  const second = contentRequest([['budget-B-input', 32]]);
+  warmTier(b, second, 'dram');
+  assert.equal(resourceCount(), 2);
+  b.cache.prefetch(second, 0);
+  assert.equal(resourceCount(), 3); assert.equal(b.cache.snapshot().hbmReservedBytes, 32);
+  const beforeA = a.snapshot(), beforeB = b.snapshot(), reqBefore = structuredClone(first);
+  assert.throws(() => a.cache.output(first, 1, 0), ReplayValidationError);
+  assert.throws(() => a.cache.place(contentRequest([['extra-input', 32]]), 0), ReplayValidationError);
+  assert.throws(() => a.cache.scheduleTransfer(a.pool.blocks[0], 'hbm', 'dram', 0), ReplayValidationError);
+  assert.deepEqual(a.snapshot(), beforeA); assert.deepEqual(b.snapshot(), beforeB); assert.deepEqual(first, reqBefore);
+  b.cache.cancel(second, 0);
+  assert.equal(resourceCount(), 2);
+  assert.equal(a.cache.output(first, 1, 0).status, 'admitted');
+  assert.equal(resourceCount(), 3);
+});
+
+for (const blockSize of [16, 32, 64, 128]) {
+  test(`U4.3 cache: B=${blockSize} handoff reserves D, protects P, and adopts input plus restored output without early visibility`, () => {
+    const p = finiteHarness(8 * blockSize, { blockSize, resourceId: 'P' });
+    const d = finiteHarness(16 * blockSize, { blockSize, blockBytes: 2 * blockSize, resourceId: 'D' });
+    const req = contentRequest([['pd-input', blockSize + 1]], blockSize + 2);
+    req.replayTemplate = { marker: 'retain-on-handoff' };
+    req.arrive = 0.125; req.firstTokenTime = 0.25;
+    p.cache.place(req, 0); computeInput(p, req, 1);
+    p.cache.output(req, blockSize + 1, 1); req.tokensGen = blockSize + 1;
+    const original = structuredClone(req);
+    assert.equal(d.cache.lookup(req, 1).hitL1Tokens, 0);
+    const response = p.cache.beginHandoff(req, d.cache, 2), handoff = response.handoff;
+    assert.equal(response.status, 'admitted'); assert.equal(handoff.state, 'pending');
+    assert.equal(handoff.inputTokens, blockSize + 1); assert.equal(handoff.outputTokens, blockSize + 1);
+    assert.equal(handoff.bytesReserved, 8 * blockSize);
+    assert.equal(p.pool.used, 4 * blockSize); assert.equal(d.pool.used, 8 * blockSize);
+    assert.equal(d.cache.snapshot().hbmReservedBytes, 8 * blockSize);
+    assert.equal(p.cache.pending, 1); assert.equal(d.cache.pending, 0);
+    assert.ok(p.pool.blocks.every(page => page.refcount === 1 && page.transferLocked));
+    assert.ok(d.pool.blocks.every(page => !page.ready && page.transferLocked));
+    assert.deepEqual(req, original);
+    assert.equal(p.cache.beginHandoff(req, d.cache, 2).handoff, handoff);
+    assert.deepEqual(d.cache.place(req, 2), { status: 'wait' }); assert.equal(d.cache.prefillReady(req, 2), false);
+    assert.deepEqual(d.cache.prefetch(req, 2), { status: 'wait' }); assert.equal(d.cache.startPrefill(req, 2), false);
+    assert.deepEqual(p.cache.output(req, blockSize + 2, 2), { status: 'wait' });
+    assert.equal(d.cache.lookup(req, 2).hitL1Tokens, 0);
+    assert.equal(p.cache.ensureSpace('hbm', 8 * blockSize, 2), 'wait');
+    assert.equal(handoff.complete(3), true); assert.equal(handoff.complete(3), false); assert.equal(handoff.cancel(3), false);
+    assert.equal(handoff.state, 'completed'); assert.equal(p.cache.pending, 0);
+    assert.equal(p.pool.used, 2 * blockSize); assert.equal(d.pool.used, 8 * blockSize);
+    assert.ok(p.pool.blocks.every(page => page._published && !page.refcount && !page.transferLocked));
+    assert.ok(d.pool.blocks.every(page => page.ready && page.refcount === 1 && !page.transferLocked));
+    assert.equal(d.cache.snapshot().hbmReservedBytes, 0); assert.equal(d.cache.prefillReady(req, 3), true);
+    assert.equal(req.tokensGen, blockSize + 1); assert.equal(req._outAllocTok, blockSize + 1);
+    assert.equal(req.arrive, original.arrive); assert.equal(req.firstTokenTime, original.firstTokenTime);
+    assert.deepEqual(req.replayTemplate, original.replayTemplate);
+    assert.deepEqual(d.pool.blocks.filter(page => page.output).map(page => page.tokens), [blockSize, 1]);
+    assert.equal(d.cache.output(req, blockSize + 2, 4).status, 'admitted');
+    assert.equal(p.pool.used, 2 * blockSize); assert.equal(d.pool.used, 8 * blockSize);
+    assert.deepEqual(d.pool.blocks.filter(page => page.output).map(page => page.tokens), [blockSize, 2]);
+    const adopted = structuredClone(req); p.cache.release(req, 4); assert.deepEqual(req, adopted);
+    d.cache.release(req, 5);
+    assert.ok(d.pool.blocks.every(page => !page.refcount));
+    assert.equal(d.cache.lookup(contentRequest([['pd-input', blockSize + 1], ['unmapped-trace-output', 1]]), 6).hitL1Tokens, blockSize);
+  });
+}
+
+test('U4.3 cache: D capacity is independent, wait/infeasible leave source handles and target references untouched', () => {
+  const p = finiteHarness(512, { resourceId: 'P' }), d = finiteHarness(64, { resourceId: 'D' });
+  const large = contentRequest([['large-prompt', 65]]);
+  p.cache.place(large, 0); computeInput(p, large, 1);
+  const beforeP = p.snapshot(), beforeD = d.snapshot(), original = structuredClone(large);
+  assert.deepEqual(p.cache.beginHandoff(large, d.cache, 2), { status: 'infeasible' });
+  assert.deepEqual(p.snapshot(), beforeP); assert.deepEqual(d.snapshot(), beforeD); assert.deepEqual(large, original);
+  const req = contentRequest([['small-prompt', 64]]), blocker = contentRequest([['D-running', 64]]);
+  p.cache.place(req, 2); computeInput(p, req, 3); d.cache.place(blocker, 3);
+  const waitP = p.snapshot(), waitD = d.snapshot(), waiting = structuredClone(req);
+  assert.deepEqual(p.cache.beginHandoff(req, d.cache, 3), { status: 'wait' });
+  assert.deepEqual(p.snapshot(), waitP); assert.deepEqual(d.snapshot(), waitD); assert.deepEqual(req, waiting);
+  d.cache.release(blocker, 4, 'abort');
+  const { handoff } = p.cache.beginHandoff(req, d.cache, 4);
+  assert.equal(handoff.cancel(5), true); assert.equal(handoff.cancel(5), false); assert.equal(handoff.complete(5), false);
+  assert.equal(d.pool.used, 0); assert.equal(p.cache.pending, 0);
+  assert.ok(p.pool.blocks.every(page => !page.transferLocked)); assert.deepEqual(req, waiting);
+});
+
+test('U4.3 cache: concurrent handoffs reserve privately, cancel independently and deduplicate only on completion', () => {
+  const p = finiteHarness(256, { resourceId: 'P' }), d = finiteHarness(128, { resourceId: 'D' });
+  const a = contentRequest([['same-pd', 64]]), b = contentRequest([['same-pd', 64]]);
+  p.cache.place(a, 0); computeInput(p, a, 1); p.cache.place(b, 1); computeInput(p, b, 1);
+  const first = p.cache.beginHandoff(a, d.cache, 2).handoff;
+  const second = p.cache.beginHandoff(b, d.cache, 2).handoff;
+  assert.equal(d.pool.used, 128); assert.equal(p.pool.blocks[0].refcount, 2);
+  assert.equal(first.cancel(3), true); assert.equal(d.pool.used, 64);
+  assert.equal(p.pool.blocks[0].transferLocked, true);
+  const retry = p.cache.beginHandoff(a, d.cache, 3).handoff;
+  assert.equal(second.complete(4), true); assert.equal(d.pool.used, 128);
+  assert.equal(d.pool.blocks.filter(page => page.ready).length, 1);
+  assert.equal(retry.complete(4), true); assert.equal(d.pool.used, 64);
+  assert.equal(d.pool.blocks[0].refcount, 2); assert.equal(d.cache.snapshot().deduplicatedPages, 1);
+  assert.equal(p.pool.blocks[0].refcount, 0); assert.equal(p.pool.blocks[0].transferLocked, false);
+  d.cache.release(a, 5); assert.equal(d.pool.blocks[0].refcount, 1); d.cache.release(b, 5);
+  assert.equal(d.pool.blocks[0].refcount, 0);
+  const third = contentRequest([['same-pd', 64]]);
+  p.cache.place(third, 6); computeInput(p, third, 6);
+  const reuse = p.cache.beginHandoff(third, d.cache, 6).handoff;
+  assert.equal(reuse.bytesReserved, 0); assert.equal(d.pool.used, 64);
+  assert.equal(reuse.complete(7), true); d.cache.release(third, 8);
+  assert.equal(d.pool.blocks[0].refcount, 0);
+});
+
+test('U4.3 cache: retract cancels reserved D pages and stale handoff cannot complete a later attempt', () => {
+  const p = finiteHarness(512, { resourceId: 'P' }), d = finiteHarness(512, { resourceId: 'D' });
+  const req = contentRequest([['pd-retry', 65]], 65);
+  p.cache.place(req, 0); computeInput(p, req, 1); p.cache.output(req, 65, 1); req.tokensGen = 65;
+  const stale = p.cache.beginHandoff(req, d.cache, 2).handoff;
+  p.cache.release(req, 3, 'retract');
+  assert.equal(stale.state, 'cancelled'); assert.equal(p.cache.pending, 0); assert.equal(d.pool.used, 0);
+  assert.equal(req.tokensGen, 65); assert.equal(p.pool.used, 128);
+  p.cache.place(req, 4); computeInput(p, req, 5);
+  const current = p.cache.beginHandoff(req, d.cache, 6).handoff;
+  assert.equal(stale.complete(7), false); assert.equal(current.state, 'pending');
+  assert.equal(current.complete(8), true); assert.equal(req.tokensGen, 65);
+  assert.deepEqual(d.pool.blocks.filter(page => page.output).map(page => page.tokens), [64, 1]);
+  d.cache.release(req, 9, 'abort');
+  assert.equal(d.pool.used, 128); assert.ok(p.pool.blocks.every(page => !page.refcount && !page.transferLocked));
+});
+
+test('U4.3 cache: shared global page budget counts both sides and rejects handoff without leaks', () => {
+  const contexts = [], resourceCount = () => contexts.reduce((n, h) => n + h.pool.blocks.length, 0);
+  const p = finiteHarness(512, { resourceId: 'P', resourceCount, maxBlockReferences: 3 });
+  const d = finiteHarness(512, { resourceId: 'D', resourceCount, maxBlockReferences: 3 });
+  contexts.push(p, d);
+  const req = contentRequest([['budget-handoff', 65]]);
+  p.cache.place(req, 0); computeInput(p, req, 1);
+  const beforeP = p.snapshot(), beforeD = d.snapshot(), original = structuredClone(req);
+  assert.throws(() => p.cache.beginHandoff(req, d.cache, 2), ReplayValidationError);
+  assert.deepEqual(p.snapshot(), beforeP); assert.deepEqual(d.snapshot(), beforeD); assert.deepEqual(req, original);
+  assert.equal(p.cache.pending, 0); assert.equal(resourceCount(), 2);
+});
+
+test('U4.3 cache: unready sources cannot hand off and anonymous output retains no inferred identity', () => {
+  const p = finiteHarness(256, { resourceId: 'P' }), d = finiteHarness(256, { resourceId: 'D' });
+  const req = contentRequest([['anonymous-pd', 64]], 1); delete req.outputIdentity;
+  p.cache.place(req, 0);
+  assert.deepEqual(p.cache.beginHandoff(req, d.cache, 0), { status: 'wait' }); assert.equal(d.pool.used, 0);
+  computeInput(p, req, 1); p.cache.output(req, 1, 1); req.tokensGen = 1;
+  const handoff = p.cache.beginHandoff(req, d.cache, 2).handoff;
+  assert.equal(handoff.complete(3), true);
+  assert.equal(d.pool.blocks.find(page => page.output).canonicalKey, undefined);
+  d.cache.release(req, 4);
+  assert.equal(d.cache.lookup(contentRequest([['anonymous-pd', 64], ['guessed-output', 1]]), 5).hitL1Tokens, 64);
+});
+
+test('U4.3 cache: handoff rejects nonfinite and backwards event times without touching reservations or ownership', () => {
+  const p = finiteHarness(256, { resourceId: 'P' }), d = finiteHarness(256, { resourceId: 'D' });
+  const req = contentRequest([['timed-handoff', 64]]);
+  p.cache.place(req, 0); computeInput(p, req, 1);
+  for (const time of [NaN, Infinity, -Infinity, '2']) {
+    assert.throws(() => p.cache.beginHandoff(req, d.cache, time), ReplayValidationError);
+  }
+  assert.equal(d.pool.used, 0); assert.equal(p.cache.pending, 0);
+  const handoff = p.cache.beginHandoff(req, d.cache, 2).handoff;
+  const beforeP = p.snapshot(), beforeD = d.snapshot(), original = structuredClone(req);
+  for (const time of [1.999, NaN, Infinity, -Infinity, '3']) {
+    assert.throws(() => handoff.complete(time), ReplayValidationError);
+    assert.throws(() => handoff.cancel(time), ReplayValidationError);
+    assert.deepEqual(p.snapshot(), beforeP); assert.deepEqual(d.snapshot(), beforeD); assert.deepEqual(req, original);
+    assert.equal(handoff.state, 'pending');
+  }
+  assert.equal(handoff.cancel(2), true);
+  const second = p.cache.beginHandoff(req, d.cache, 3).handoff;
+  assert.equal(second.complete(3), true);
+  assert.equal(d.pool.blocks[0].arriveAt, 3); d.cache.release(req, 4);
 });

@@ -1,6 +1,8 @@
 const TOKEN_KEYS = ['inputTokens', 'hitL1Tokens', 'hitL2Tokens', 'hitL3Tokens', 'missTokens'];
 const BASE_GAUGES = ['activeSessions', 'activeRequests', 'queuedRequests', 'hbmBytes', 'inputPages', 'outputPages'];
 const TIER_GAUGES = ['hbmResidentBytes', 'hbmReservedBytes', 'dramBytes', 'dramReservedBytes', 'ssdBytes', 'ssdReservedBytes'];
+const PD_GAUGES = ['prefillHbmBytes', 'prefillHbmCapacityBytes', 'prefillHbmReservedBytes',
+  'decodeHbmBytes', 'decodeHbmCapacityBytes', 'decodeHbmReservedBytes'];
 const emptyTokens = () => Object.fromEntries(TOKEN_KEYS.map(key => [key, 0]));
 const ratio = (n, d) => d > 0 ? n / d : null;
 function distribution(values) {
@@ -11,7 +13,11 @@ function distribution(values) {
 }
 
 export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup, hardCutoff, stats, seed, qps, lambdaSession, limits, configuration = {}, finiteCapacity = false }) {
-  const GAUGES = finiteCapacity ? [...BASE_GAUGES, ...TIER_GAUGES] : BASE_GAUGES;
+  const physicalPd = finiteCapacity && configuration.execution?.pdMode === 2;
+  const GAUGES = finiteCapacity ? [...BASE_GAUGES, ...TIER_GAUGES, ...(physicalPd ? PD_GAUGES : [])] : BASE_GAUGES;
+  const supportedScope = finiteCapacity
+    ? `${configuration.execution?.instances > 1 ? 'instance-private' : 'single-instance'}/${configuration.blockMapping?.physical ?? 64}-token/finite-capacity-tiered-four-configurations${physicalPd ? '/physical-pd' : ''}`
+    : 'single-instance/64-token/HBM-capacity-sufficient';
   const emptyGauges = () => Object.fromEntries(GAUGES.map(key => [key, 0]));
   const width = Math.max(0.002, hardCutoff / 20_000);
   const windows = Object.fromEntries(['full', 'warmup', 'measurement', 'drain'].map(name => [name, {
@@ -97,12 +103,15 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
       const key = identity(req);
       if (terminal.has(key)) return;
       if (!admitted.has(key)) throw new Error('Replay metrics completion before admission');
+      const firstToken = req.firstTokenTime ?? (physicalPd && req.outputLen > 0 ? req._kvXferEnd : req.prefillEnd);
+      if (physicalPd && (!Number.isFinite(firstToken) || firstToken < req.arrive || firstToken > req.completeTime))
+        throw new Error('Replay metrics invalid P/D first-token event');
       terminal.add(key); counts.successful++; counts.outputTokens += req.outputLen;
       eachWindow(req.completeTime, w => w.completions++);
       bucket(req.completeTime).completions++;
       eachWindow(req.arrive, w => {
         w.successfulArrivals++;
-        w.ttft.push(((req.firstTokenTime ?? req.prefillEnd) - req.arrive) * 1000);
+        w.ttft.push((firstToken - req.arrive) * 1000);
         if (req.outputLen > 0) w.tpot.push((req.completeTime - req.decodeStart) / req.outputLen * 1000);
         w.latency.push((req.completeTime - req.arrive) * 1000);
       });
@@ -171,7 +180,7 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
           infeasible: runtime.infeasible, aborted: runtime.aborted, anchor_unavailable: runtime.anchor_unavailable,
           limits: { ...limits }, stability: 'not_evaluated', idealCache: 'not_evaluated', mainWindow: 'measurement',
           latencyInterpretation: 'observed_window', completionDependencies: 'inferred',
-          supportedScope: finiteCapacity ? 'single-instance/64-token/finite-capacity-tiered-four-configurations' : 'single-instance/64-token/HBM-capacity-sufficient' } };
+          supportedScope } };
     },
   };
 }

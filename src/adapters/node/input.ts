@@ -5,6 +5,7 @@ import { createGunzip } from 'node:zlib';
 import { jobFromControls, paramsFromControls } from './params.js';
 import { parseDSL } from '../../core/strategy.js';
 import { parseReplayBundle, replayLimits, validateReplayOverride } from '../../core/replay.js';
+import { validatePhysicalBlockSize } from '../../core/requests.js';
 import type { ReplayLimits } from '../../contracts/replay';
 import type { SimulationJob, SimulationParams, SimulationStrategy, StrategyMode } from '../../contracts/simulation';
 
@@ -74,6 +75,10 @@ export function parseJob(input: unknown): SimulationJob {
     if (data._strategyMode !== undefined && data._strategyMode !== 'dsl' && data._strategyMode !== 'js') {
       throw new Error('_strategyMode must be dsl or js.');
     }
+    if ('pBlockSize' in data) {
+      const override = data.overrides === undefined ? {} : object(data.overrides, 'overrides');
+      validatePhysicalBlockSize(Number(override.blockSize ?? data.pBlockSize));
+    }
     const controls = jobFromControls(data);
     data = { ...controls, mode: data.mode ?? controls.mode, overrides: data.overrides === undefined ? {} : data.overrides };
   }
@@ -91,6 +96,10 @@ export function parseJob(input: unknown): SimulationJob {
   if (mode !== 'dsl' && mode !== 'js') throw new Error('mode must be dsl or js.');
   const overrides = data.overrides === undefined ? {} : { ...object(data.overrides, 'overrides') };
   validateScalars(overrides, { ...defaults, nreq: 1, seed: 0, hwPreset: '' }, 'overrides');
+  validatePhysicalBlockSize(overrides.blockSize ?? params.blockSize);
+  if (Number(overrides.instances ?? params.instances) > 1 && (overrides.pdMode ?? params.pdMode) === 2) {
+    throw new Error('Multiple instances cannot be combined with physical P/D separation.');
+  }
   if ('replay' in overrides) overrides.replay = validateReplayOverride(overrides.replay);
   return { params: params as SimulationParams, strategy: strategy as SimulationStrategy, mode: mode as StrategyMode, overrides };
 }

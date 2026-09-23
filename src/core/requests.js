@@ -1,5 +1,12 @@
 /** @typedef {{pathId: string, position: number, tokens: number}} ContentSegment */
 
+export function validatePhysicalBlockSize(blockSize) {
+  if (!Number.isSafeInteger(blockSize) || blockSize <= 0 || (64 % blockSize !== 0 && blockSize % 64 !== 0)) {
+    throw new RangeError('blockSize must be a positive safe integer dividing 64 or a multiple of 64');
+  }
+  return blockSize;
+}
+
 function createRequest(id, arrive, inputLen, outputLen, fields = {}) {
   return {
     id, arrive, inputLen, outputLen,
