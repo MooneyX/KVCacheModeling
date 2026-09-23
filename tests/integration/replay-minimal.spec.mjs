@@ -141,6 +141,63 @@ async function runSynthetic(page) {
   return stored.points[0].result;
 }
 
+test('Replay typography matches the legacy interface without changing existing fonts', async ({ page }) => {
+  const { errors } = await start(page, 'synthetic');
+  const typography = locator => locator.evaluate(el => {
+    const style = getComputedStyle(el);
+    return Object.fromEntries(['fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'color'].map(key => [key, style[key]]));
+  });
+  const legacy = await page.context().newPage();
+  try {
+    const markup = await page.evaluate(html => {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      doc.querySelectorAll('script').forEach(script => script.remove());
+      return doc.documentElement.outerHTML;
+    }, readFileSync(new URL('../fixtures/legacy/index.html', import.meta.url), 'utf8'));
+    await legacy.setContent(markup);
+    for (const selector of ['body', '.brand', '.sidebar .nav-item', '.card h2', '#tab-params h3', '.card .subtitle', 'label', '#pQps', '#pArrivalDist', '#sDsl', '#paramsIo', '.formula-box']) {
+      expect(await typography(page.locator(selector).first()), selector).toEqual(await typography(legacy.locator(selector).first()));
+    }
+    const inputHeading = await typography(legacy.locator('#tab-params h3').first());
+    const resultHeading = await typography(legacy.locator('#strategyResults .row2 h3').first());
+    const note = await typography(legacy.locator('.card .subtitle').first());
+    const formula = await typography(legacy.locator('.formula-box').first());
+    await source(page, 'replay');
+    expect(await typography(page.locator('#replayTitle'))).toEqual(inputHeading);
+    for (const selector of ['#replayFileInfo', '#replayStatus']) {
+      expect(await typography(page.locator(selector)), selector).toEqual(note);
+    }
+    expect(await typography(page.locator('#replayQps'))).toEqual(await typography(legacy.locator('#pQps')));
+    await upload(page);
+    await run(page);
+    await expect(page.locator('#replaySummary')).toBeVisible();
+    for (const heading of await page.locator('#replaySummary h3').all()) {
+      expect(await typography(heading)).toEqual(resultHeading);
+    }
+    for (const selector of ['#replayFileInfo', '#replayStatus', '#replaySummary dt', '#replaySummary > p', '#replaySummary summary']) {
+      expect(await typography(page.locator(selector).first()), selector).toEqual(note);
+    }
+    const value = await typography(page.locator('#replaySummary dd').first());
+    expect(value).toEqual({ ...note, color: (await typography(page.locator('body'))).color });
+    await page.locator('#replaySummary summary').first().click();
+    await expect(page.locator('#replaySummary pre').first()).toBeVisible();
+    expect(await typography(page.locator('#replaySummary pre').first())).toEqual(formula);
+    await page.locator('.nav-item[data-tab="tab-schedule"]').click();
+    await expect(page.locator('#ganttPagination')).toBeVisible();
+    expect(await typography(page.locator('#ganttPageStatus'))).toEqual(note);
+    for (const selector of ['#ganttPrev', '#ganttNext']) {
+      expect(await typography(page.locator(selector))).toEqual(await typography(page.locator('#replayDownload')));
+    }
+    await page.locator('.nav-item[data-tab="tab-params"]').click();
+    await source(page, 'synthetic');
+    expect(await typography(page.locator('#pQps'))).toEqual(await typography(legacy.locator('#pQps')));
+    expect(await typography(page.locator('#replaySummary h3').first())).toEqual(resultHeading);
+    expect(errors).toEqual([]);
+  } finally {
+    await legacy.close();
+  }
+});
+
 test('real sample uses frozen Hy4/B300 FP8 configuration and downloads the complete worker result', async ({ page }) => {
   const { errors, posts } = await start(page);
   const { overrides, ...controls } = sampleConfig;

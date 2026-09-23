@@ -80,7 +80,7 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
 .chart-tall{width:100%;min-height:380px;height:55vh;max-height:600px}
 .divider{border:none;border-top:1px solid var(--border);margin:16px 0}
 
-.formula-box{background:var(--surface2);border-radius:6px;padding:10px 14px;margin-top:8px;font-family:'SF Mono','Fira Code',monospace;font-size:.7rem;color:var(--text-dim);line-height:1.7}
+.formula-box,#replaySummary pre{background:var(--surface2);border-radius:6px;padding:10px 14px;margin-top:8px;font-family:'SF Mono','Fira Code',monospace;font-size:.7rem;color:var(--text-dim);line-height:1.7}
 .formula-box code{background:rgba(108,99,255,.15);padding:2px 5px;border-radius:3px;color:var(--accent)}
 
 /* Mode toggle */
@@ -93,3 +93,11 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
 .server-task{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--border)}
 .server-task>span{flex:1;overflow-wrap:anywhere}
 .server-task a{white-space:nowrap;text-decoration:none}
+#replayTitle{font-size:.82rem;color:var(--accent);margin-bottom:8px}
+#replayFileInfo,#replayStatus{font-size:.75rem;color:var(--text-dim);margin:8px 0 14px;overflow-wrap:anywhere}
+#replaySummary{font-size:.75rem;margin-bottom:16px}
+#replaySummary h3{font-size:.85rem;color:var(--accent);margin-bottom:2px}
+#replaySummary dt,#replaySummary>p,#replaySummary summary{color:var(--text-dim)}
+#replaySummary>p{margin-bottom:14px}
+#replaySummary summary{cursor:pointer}
+#ganttPageStatus{font-size:.75rem;color:var(--text-dim);margin:0 8px}
