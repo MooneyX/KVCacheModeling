@@ -3,7 +3,7 @@ import { state } from "./state.js";
 
 import { getCurrentStrategy } from "./strategy.js";
 import { $ } from "../adapters/browser/dom.js";
-import { drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
+import { drawGantt, drawStrategyMetrics, drawStrategyComparisonGantt, drawStrategyTierDemand } from "./charts.js";
 import { executeSimulation, executeBatch, serverVersion } from '../execution/browser/client.ts';
 
 const pending = new Map();
@@ -21,12 +21,13 @@ let running = false;
 async function runSelectedStrategies(list) {
   if (running || list.some(strategy => !strategy)) return;
   const params = getParams();
-  const controls = Object.fromEntries(Array.from(document.querySelectorAll('input[id], select[id]'), el => [el.id, { value: el.value, checked: el.checked }]));
+  const controls = Object.fromEntries(Array.from(document.querySelectorAll('input[id], select[id], textarea[id]'), el => [el.id, { value: el.value, checked: el.checked }]));
   const mode = state.strategyMode;
   const strategies = structuredClone(list);
   const buttons = document.querySelectorAll('button[onclick="applyStrategies()"], button[onclick="runAllStrategies()"]');
   running = true;
   buttons.forEach(button => { button.disabled = true; });
+  setSimulationStatus('正在运行，保留最近一次成功结果…');
   try {
     if (mode === 'js') throw new Error('服务器暂不支持 JavaScript 策略，请选择 DSL。');
     const version = await serverVersion();
@@ -43,8 +44,9 @@ async function runSelectedStrategies(list) {
         },
       });
     }
-    state.simResults = results;
-    state.simInput = { params, controls };
+    state.simResults = results.map((result, index) => ({ ...result, name: strategies[index].name || result.name }));
+    state.simInput = { params, controls, strategies, mode };
+    setSimulationStatus('运行完成');
     showStrategyResults();
   } catch (error) {
     simError(error);
@@ -87,12 +89,18 @@ export function showStrategyResults(){
   drawStrategyMetrics();
   drawStrategyComparisonGantt();
   drawStrategyTierDemand();
+  if (!state.simResults.length || $('tab-schedule').classList.contains('active')) {
+    drawGantt(state.simResults[0], state.simInput);
+  }
 }
 
+function setSimulationStatus(message, failed = false) {
+  const el = $('simulationStatus');
+  el.textContent = message;
+  el.style.color = failed ? 'var(--accent4)' : 'var(--text-dim)';
+}
 
 export function simError(e){
   console.error('Simulation error:', e);
-  $('strategyResults').style.display = 'block';
-  $('strategyMetricsGrid').innerHTML = '<div style="color:var(--accent4);padding:8px">仿真出错: '+e.message+'</div>';
-  // 不再隐藏 sensitivityPanel —— 单次模拟出错不该把独立的敏感性扫描入口也带走
+  setSimulationStatus('仿真出错: ' + e.message, true);
 }

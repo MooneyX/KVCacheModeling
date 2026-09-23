@@ -1,30 +1,44 @@
-import { $, gv, gi } from "../adapters/browser/dom.js";
+import { $ } from "../adapters/browser/dom.js";
 import { echarts } from "./echarts.js";
 import { state } from "./state.js";
 import { getParams } from "../adapters/browser/params.js";
 import { calcAll, effL2LinkBW, l2AttnTp, calcKvPerToken, perReqMs, prefillIntegral } from "../core/calculations.js";
 import { models } from "../core/presets.js";
 import { formatNum, formatBytes, formatRate } from "./format.js";
-import { getCurrentStrategy } from "./strategy.js";
-import { cachedSimulation } from "./simulation.js";
 import { mulberry32 } from "../core/math.js";
 
 function resultInputs() {
-  if (!state.simInput) return { $, gv, gi, getParams };
-  const read = id => state.simInput.controls[id] || $(id);
+  if (!state.simResults.length || !state.simInput?.params || !state.simInput?.controls) return null;
+  const read = id => state.simInput.controls[id];
   return {
-    $: read,
-    gv: id => { const el = read(id); return el ? parseFloat(el.value) || 0 : 0; },
-    gi: id => { const el = read(id); return el ? parseInt(el.value) || 0 : 0; },
-    getParams: () => state.simInput.params,
+    control: read,
+    gv: id => Number.parseFloat(read(id)?.value) || 0,
+    gi: id => Number.parseInt(read(id)?.value) || 0,
+    params: state.simInput.params,
   };
 }
 
+function disposeChart(el) {
+  const old = echarts.getInstanceByDom(el);
+  if (!old) return;
+  old.dispose();
+  state.chartRegistry = state.chartRegistry.filter(chart => chart !== old);
+}
+
+function showRunPlaceholder(chartIds, formulaIds = []) {
+  chartIds.forEach(id => {
+    const el = $(id);
+    if (!el) return;
+    disposeChart(el);
+    el.textContent = '请先运行';
+  });
+  formulaIds.forEach(id => setFormula(id, '请先运行'));
+}
 
 export function initChart(domId){
   let el=$(domId);
-  let old=echarts.getInstanceByDom(el);
-  if(old) old.dispose();
+  disposeChart(el);
+  el.textContent = '';
   let ch = echarts.init(el);
   state.chartRegistry.push(ch);
   return ch;
@@ -186,18 +200,14 @@ export function refreshScheduleTab(){
 
 
 
-let ganttRun = 0;
-export async function drawGantt(){
-  const run = ++ganttRun;
-  // 甘特图展示"当前配置的策略"（方案A：不再隐式绑定 savedStrategies[0]）；结果走缓存，切 tab 不重跑
-  let p = getParams(); // 修复历史 bug：formulaGantt 引用 p.* 但此前未定义 → 甘特图渲染必抛错
-  let s = getCurrentStrategy();
-  if (!s) s = {name:'Default', admission:{type:'always'}, eviction:{type:'lru',hbm_evict_threshold:0.9}, prefetch:{type:'none'}, placement:{type:'hbm_first'}, batching:{type:'continuous',max_batch_size:8}, dsl:''};
-  let r;
-  $('chartGantt').textContent = '正在等待服务器仿真...';
-  try { r = await cachedSimulation(s, undefined, p); }
-  catch (error) { if (run === ganttRun) $('chartGantt').textContent = error.message; return; }
-  if (run !== ganttRun) return;
+export function drawGantt(r = state.simResults[0], input = state.simInput){
+  if (!r || !input?.params || !input?.strategies?.length) {
+    showRunPlaceholder(['chartGantt', 'chartBatchOcc'], ['formulaGantt']);
+    return;
+  }
+  const p = input.params;
+  const s = input.strategies[0];
+  drawBatchOccupancy(r);
   let simEnd = r.simEnd || 1;
   // 合并已完成 + 未完成请求（未完成的最终阶段用浅色显示，截至仿真结束时刻）
   let timeline = (r.timeline || []).map(t => Object.assign({}, t, { state: 'done' }))
@@ -261,24 +271,6 @@ export async function drawGantt(){
     ]
   });
 
-  // 批次并发占用时间线：直观展示多请求并行 decode
-  let occ = r.concTimeline || [];
-  let ch2 = initChart('chartBatchOcc');
-  ch2.setOption({
-    tooltip: { trigger: 'axis' },
-    legend: { data: ['Decode并发数', 'Prefill占用', '排队深度'], top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } },
-    grid: { left: 60, right: 30, top: 30, bottom: 25 },
-    xAxis: { type: 'value', name: '时间(s)', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
-    yAxis: { type: 'value', name: '请求数', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' }, minInterval: 1 },
-    series: [
-      { name: 'Decode并发数', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[1]]),
-        showSymbol: false, lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.22)' } },
-      { name: 'Prefill占用', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[2]]),
-        showSymbol: false, lineStyle: { color: '#fb923c', width: 1.5 }, areaStyle: { color: 'rgba(251,146,60,.22)' } },
-      { name: '排队深度', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[3]]),
-        showSymbol: false, lineStyle: { color: '#9ca0b0', width: 1.5, type: 'dashed' } },
-    ]
-  });
   setFormula('formulaGantt',
     '<b>📐 计算方式 — 仿真引擎真实事件（两级排队）</b><br>'+
     '• <b>Queue(灰)</b> = 到达 → 准入：等 batch 槽位(≤max_batch_size) + 显存可放置(含淘汰/传输耗时)<br>'+
@@ -293,6 +285,26 @@ export async function drawGantt(){
 }
 
 
+
+function drawBatchOccupancy(r) {
+  const occ = r.concTimeline || [];
+  const ch = initChart('chartBatchOcc');
+  ch.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['Decode并发数', 'Prefill占用', '排队深度'], top: 0, textStyle: { color: '#9ca0b0', fontSize: 10 } },
+    grid: { left: 60, right: 30, top: 30, bottom: 25 },
+    xAxis: { type: 'value', name: '时间(s)', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' } },
+    yAxis: { type: 'value', name: '请求数', nameTextStyle: { color: '#9ca0b0' }, axisLabel: { color: '#9ca0b0' }, minInterval: 1 },
+    series: [
+      { name: 'Decode并发数', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[1]]),
+        showSymbol: false, lineStyle: { color: '#6c63ff', width: 2 }, areaStyle: { color: 'rgba(108,99,255,.22)' } },
+      { name: 'Prefill占用', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[2]]),
+        showSymbol: false, lineStyle: { color: '#fb923c', width: 1.5 }, areaStyle: { color: 'rgba(251,146,60,.22)' } },
+      { name: '排队深度', type: 'line', step: 'end', data: occ.map(smp => [smp[0], smp[3]]),
+        showSymbol: false, lineStyle: { color: '#9ca0b0', width: 1.5, type: 'dashed' } },
+    ]
+  });
+}
 
 export function drawBatching(){
   let p=getParams(), r=calcAll(p);
@@ -471,9 +483,10 @@ export function drawEviction(){
 
 
 export function drawStrategyMetrics() {
-  const { $, gv, gi, getParams } = resultInputs();
+  const input = resultInputs();
   let grid = $('strategyMetricsGrid');
-  if (state.simResults.length === 0) { grid.innerHTML = '<div style="color:var(--text-dim)">暂无仿真结果</div>'; return; }
+  if (!input) { grid.textContent = '请先运行'; return; }
+  const { gv } = input;
   let rows = [];
   state.simResults.forEach(sr => {
     rows.push('<div style="grid-column:1/-1;font-size:.78rem;color:var(--accent);margin-bottom:2px;border-bottom:1px solid var(--border);padding-bottom:4px;margin-top:8px">📌 '+sr.name+'</div>');
@@ -624,8 +637,12 @@ export function bottleneckLabel(sr){
 
 // L2/L3 需求推导展示：passTime 分解（瓶颈归因）+ 带宽需求分位 vs 配置 + 驻留时间序列
 export function drawStrategyTierDemand(){
-  if(state.simResults.length === 0) return;
-  let p = resultInputs().getParams();
+  const input = resultInputs();
+  if (!input) {
+    showRunPlaceholder(['chartStrategyPt', 'chartStrategyBwReq', 'chartStrategyResident'], ['formulaStrategyTier']);
+    return;
+  }
+  const p = input.params;
   let colors = {hbm:'#6c63ff', l2:'#fb923c', l3:'#f87171', cmp:'#34d399', comm:'#9ca0b0'};
   let names = {hbm:'HBM读', l2:'L2读', l3:'L3读', cmp:'算力下限', comm:'TP通信'};
   let keys = ['hbm','l2','l3','cmp','comm'];
@@ -713,9 +730,13 @@ export function drawStrategyTierDemand(){
 
 
 export function drawStrategyComparisonGantt() {
-  const { $, gv, gi } = resultInputs();
+  const input = resultInputs();
+  if (!input) {
+    showRunPlaceholder(['chartStrategyGantt'], ['formulaStrategySim']);
+    return;
+  }
+  const { control: $, gv, gi } = input;
   let ch = initChart('chartStrategyGantt');
-  if (state.simResults.length === 0) return;
   ch.setOption({
     tooltip: { trigger: 'axis' },
     legend: { data: ['HBM命中率(%)', 'P50延迟(ms)', 'P99延迟(ms)', '显存利用率峰值(%)'], top: 0, textStyle: { color: '#9ca0b0' } },

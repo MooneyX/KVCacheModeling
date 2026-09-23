@@ -68,11 +68,11 @@ test('scan cache, export, Gantt and cross-analysis use server tasks', async ({ p
   await page.locator('#btnRunSens').click();
   await expect(page.locator('#btnRunSens')).toBeEnabled();
   expect(posts).toEqual([]);
-  page.off('request', listener);
-  const gantt = submitted(page);
   await page.locator('.nav-item[data-tab="tab-schedule"]').click();
-  expect((await gantt).status()).toBe(202);
-  await expect(page.locator('#formulaGantt')).toContainText('完成');
+  await expect(page.locator('#formulaGantt')).toContainText('请先运行');
+  await page.waitForTimeout(200);
+  expect(posts).toEqual([]);
+  page.off('request', listener);
   await page.evaluate(() => {
     document.getElementById('pInputLen').value = '128';
     document.getElementById('pOutputLen').value = '64';
@@ -85,6 +85,14 @@ test('scan cache, export, Gantt and cross-analysis use server tasks', async ({ p
   const crossTask = await (await cross).json();
   expect(crossTask.total).toBe(28);
   await expect(page.locator('#formulaRadar')).toContainText('计算方式', { timeout: 40_000 });
+  const formula = await page.locator('#formulaRadar').innerHTML();
+  page.on('request', listener);
+  await page.locator('.nav-item[data-tab="tab-params"]').click();
+  await page.locator('#pQps').fill('20');
+  await page.locator('.nav-item[data-tab="tab-cross"]').click();
+  await page.waitForTimeout(250);
+  expect(posts).toEqual([]);
+  expect(await page.locator('#formulaRadar').innerHTML()).toBe(formula);
   expect(errors).toEqual([]);
 });
 
@@ -92,7 +100,7 @@ test('JS is explicitly rejected and scan cancellation reaches the server', async
   const errors = await start(page);
   await importControls(page, { ...uiValues, _strategyMode: 'js', sDsl: 'window.__unexpectedJs = true;', sName: 'js-browser' });
   await page.locator('button[onclick="applyStrategies()"]').click();
-  await expect(page.locator('#strategyMetricsGrid')).toContainText('不支持 JavaScript');
+  await expect(page.locator('#simulationStatus')).toContainText('不支持 JavaScript');
   expect(await page.evaluate(() => window.__unexpectedJs)).toBeUndefined();
   await importControls(page, { ...uiValues, _strategyMode: 'dsl' });
   await page.locator('#sSweepRange').fill('1,200,1');
@@ -132,7 +140,7 @@ test('server failure is visible and never falls back to local simulation', async
   await page.route('**/api/tasks', route => route.request().method() === 'POST'
     ? route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"server unavailable"}' }) : route.continue());
   await page.locator('button[onclick="applyStrategies()"]').click();
-  await expect(page.locator('#strategyMetricsGrid')).toContainText('server unavailable');
+  await expect(page.locator('#simulationStatus')).toContainText('server unavailable');
   await expect(page.locator('button[onclick="applyStrategies()"]')).toBeEnabled();
   expect(errors).toEqual([]);
 });

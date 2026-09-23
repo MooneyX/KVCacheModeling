@@ -11,8 +11,8 @@ import { initChart, setFormula } from "./charts.js";
 // ======================== TAB 4: CROSS ANALYSIS ========================
 export function refreshCrossTab(){
   // 懒加载：不默认跑 24+4 次全量仿真（高并发档每次墙钟 5-20s，串行执行会长时间阻塞 UI）。
-  // 进入界面先显示占位，用户点按钮按需运行；已运行过则直接重绘。
-  if (window.__crossAnalyzed) { drawCrossAnalysis(); return; }
+  // 进入界面只展示已有图表；任务只能由显式运行入口提交。
+  if (window.__crossAnalyzed) return;
   $('chartHeatmap').innerHTML = '<div class="progress-note" style="padding:28px 16px;text-align:center;line-height:2">'+
     '交叉分析需运行 <b>24</b> 次「策略 × 并发」仿真 + <b>4</b> 次综合评分仿真<br>'+
     '计算在服务器独立进程执行，任务提交后可关闭页面，在任务列表下载结果<br><br>'+

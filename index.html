@@ -356,10 +356,11 @@
   <!-- Simulation Results（结果区：运行入口在结果卡片内，与交叉分析/敏感性交互模式一致） -->
   <div class="card" id="strategyResults">
     <h2><span>策略仿真</span> 对比结果</h2>
-    <p class="subtitle">事件驱动仿真：含排队、并行Prefill(chunked-prefill)、批次Decode、跨层传输时间、真实前缀共享 · 结果走缓存，改参数/策略自动失效</p>
+    <p class="subtitle">最近一次成功运行的结果与执行配置 · 编辑参数或策略不会改变旧结果，点击运行后更新 · 相同输入复用缓存</p>
     <div class="form-row" style="margin-bottom:8px">
       <div style="flex:0 0 auto;display:flex;align-items:end;gap:6px"><button class="btn" onclick="applyStrategies()" title="只运行当前配置的策略，不写入保存列表">▶️ 运行当前策略</button><button class="btn btn-sm" onclick="runAllStrategies()" style="background:var(--accent2)" title="运行全部已保存策略（未保存时回退当前策略）">📋 运行全部已保存</button></div>
     </div>
+    <div id="simulationStatus" role="status" aria-live="polite" class="progress-note" style="margin-bottom:8px"></div>
     <div id="strategyMetricsGrid" class="result-grid" style="margin-bottom:16px"></div>
     <div id="chartStrategyGantt" class="chart-tall"></div>
     <div class="row2" style="margin-top:14px">
@@ -488,7 +489,7 @@
 <div class="tab-panel" id="tab-schedule">
   <div class="card">
     <h2><span>请求生命周期</span> 甘特图</h2>
-    <p class="subtitle">来自仿真引擎的真实事件时间：排队→等算力→Prefill→Decode，含跨层传输等待</p>
+    <p class="subtitle">最近一次成功运行的首个策略 · 与指标卡共用结果和执行快照 · 排队→等算力→Prefill→Decode，含跨层传输等待</p>
     <div id="chartGantt" class="chart-tall"></div>
     <h3 style="font-size:.85rem;color:var(--accent);margin:14px 0 4px">批次并发占用时间线</h3>
     <p class="subtitle" style="margin-bottom:4px">每个时刻同时在 Decode 的请求数（并行计算的直观证据）、Prefill 占用与排队深度</p>
@@ -497,19 +498,19 @@
   </div>
   <div class="card">
     <h2><span>Continuous Batching</span> 吞吐-延迟分析</h2>
-    <p class="subtitle">Roofline模型：批次增大先受显存带宽限制，越过拐点后受算力限制</p>
+    <p class="subtitle">理论估算（当前编辑参数，非运行结果）· Roofline模型：批次增大先受显存带宽限制，越过拐点后受算力限制</p>
     <div id="chartBatching" class="chart-container"></div>
     <div class="formula-box" id="formulaBatching"></div>
   </div>
   <div class="card">
     <h2><span>Prefix Sharing</span> 显存节省分析</h2>
-    <p class="subtitle">共享前缀命中率对显存占用的影响——命中率越高，有效并发容量越大</p>
+    <p class="subtitle">理论估算（当前编辑参数，非运行结果）· 共享前缀命中率对显存占用的影响</p>
     <div id="chartPrefix" class="chart-container"></div>
     <div class="formula-box" id="formulaPrefix"></div>
   </div>
   <div class="card">
     <h2><span>Eviction策略</span> 命中率对比</h2>
-    <p class="subtitle">LRU / LFU / FIFO / Belady最优 在同一固定种子访问trace下的命中率曲线</p>
+    <p class="subtitle">独立理论对比（当前 seed，非运行结果）· LRU / LFU / FIFO / Belady 在同一访问 trace 下的命中率曲线</p>
     <div id="chartEviction" class="chart-container"></div>
     <div class="formula-box" id="formulaEviction"></div>
   </div>
