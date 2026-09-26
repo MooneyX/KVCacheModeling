@@ -531,7 +531,7 @@ export const DEFAULT_REPLAY_RUN_LIMITS = Object.freeze({
   maxRequests: 20_000,
   maxEvents: 40_000,
   maxBlockReferences: 2_000_000,
-  maxWallTimeMs: 30_000,
+  maxWallTimeMs: 120_000,
   maxResultBytes: 32 * 1024 * 1024,
 });
 
