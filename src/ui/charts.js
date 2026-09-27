@@ -813,9 +813,45 @@ export function drawStrategyTierDemand(){
     ycats.push(s.name + ' · TTFT' + (replay ? ' (全程)' + (!s.ttftBreakdown ? ' 无样本' : '') : ''));
     ycats.push(s.name + ' · 每token前向' + (replay ? ' (全程)' + (!s.ptSamples ? ' 无样本' : '') : ''));
   });
+  // tooltip: axis 触发会把两根条的全部 series 一起列出，不属于当前条的 series 恒为 null ——
+  // 过滤 null 项，避免误显示一片"无样本"；同时给出分量绝对值（TTFT: ms/请求均值, 前向: ms/pass）。
+  const ptKeyByName = new Map();
+  ttftNames.forEach((n, i) => ptKeyByName.set(n, { group: 'ttft', key: ttftKeys[i] }));
+  keys.forEach(k => ptKeyByName.set(names[k], { group: 'pt', key: k }));
+  const ptAbsValue = (si, group, key) => {
+    const s = state.simResults[si];
+    if (!s) return null;
+    if (group === 'ttft') {
+      const b = s.ttftBreakdown;
+      if (!b) return null;
+      const v = (b.computeNet == null) ? (key === 'computeNet' ? b.compute : (key === 'computeWait' ? 0 : b[key])) : b[key];
+      return Number.isFinite(v) ? v : null;
+    }
+    return s.passMs && Number.isFinite(s.passMs[key]) ? s.passMs[key] : null;
+  };
   let ch = initChart('chartStrategyPt');
   ch.setOption({
-    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},valueFormatter:v=>numberText(v,1,'%')},
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:params=>{
+      if (!params || !params.length) return '';
+      const row = params[0].dataIndex, si = Math.floor(row / 2), group = row % 2 === 1 ? 'pt' : 'ttft';
+      const unit = group === 'pt' ? ' ms/pass' : ' ms';
+      let html = '<div style="font-weight:600;margin-bottom:4px">' + escapeHtml(String(params[0].axisValueLabel ?? params[0].name)) + '</div>';
+      let sumPct = 0, sumAbs = 0, hasAbs = false;
+      for (const pt of params) {
+        if (pt.value == null) continue;
+        const meta = ptKeyByName.get(pt.seriesName);
+        const abs = meta ? ptAbsValue(si, meta.group, meta.key) : null;
+        sumPct += +pt.value || 0;
+        if (abs != null) { sumAbs += abs; hasAbs = true; }
+        html += '<div style="display:flex;align-items:center;line-height:18px">' + (pt.marker || '')
+          + '<span style="color:#9ca0b0;margin-right:8px">' + escapeHtml(pt.seriesName) + '</span>'
+          + '<span style="margin-left:auto;color:#9ca0b0">' + numberText(+pt.value, 1, '%')
+          + (abs != null ? ' · ' + numberText(abs, 1, unit) : '') + '</span></div>';
+      }
+      html += '<div style="margin-top:2px;font-weight:600">合计 ' + sumPct.toFixed(1) + '%'
+        + (hasAbs ? ' · ' + numberText(sumAbs, 1, unit) : '') + '</div>';
+      return html;
+    }},
     legend:{data:[...ttftNames, ...keys.map(k=>names[k])],top:0,textStyle:{color:'#9ca0b0',fontSize:9}},
     grid:{left:120,right:30,top:46,bottom:24},
     xAxis:{type:'value',name:'占比(%)',max:100,nameTextStyle:{color:'#9ca0b0'},axisLabel:{color:'#9ca0b0'}},
