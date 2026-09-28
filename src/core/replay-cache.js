@@ -87,24 +87,25 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (count * blockBytes > pool.cap) return { response: { status: 'infeasible' } };
     checkLimit(count);
     const response = result(0, 0);
-    let matching = true;
+    let matching = true, missing = 0;
     for (const description of pages(req.inputContent)) {
+      const hbmItem = pool.blockIndex[description.key];
       let tier = null, item = null;
       if (matching) {
         for (const candidate of tiers) {
-          const found = resources[candidate]?.blockIndex[description.key];
+          const found = candidate === 'hbm' ? hbmItem : resources[candidate]?.blockIndex[description.key];
           if (accessible(found, now)) { tier = candidate; item = found; break; }
         }
       }
       if (!item) matching = false;
       const slot = { ...description, tier, hit: !!item, version: item?.version ?? 0 };
       slots.push(slot);
+      if (!ready(hbmItem, now)) missing++;
       response.inputTokens += slot.tokens;
       if (tier) response[`hitL${tiers.indexOf(tier) + 1}Tokens`] += slot.tokens;
       else response.missTokens += slot.tokens;
     }
     if (response.inputTokens !== req.inputLen) throw new ReplayValidationError('replay.cache', 'content length does not match input length');
-    const missing = slots.filter(slot => !ready(pool.blockIndex[slot.key], now)).length;
     if (pool.used + missing * blockBytes > pool.cap) response.status = 'wait';
     return { slots, response };
   }
