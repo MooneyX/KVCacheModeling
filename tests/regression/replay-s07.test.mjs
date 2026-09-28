@@ -438,6 +438,13 @@ function computeInput(h, req, now) {
   h.cache.publish(req, now);
 }
 
+test('U3 cache: prefetch skips replanning after the request is placed', () => {
+  const h = finiteHarness(), req = contentRequest([['placed', 128]]);
+  assert.equal(h.cache.place(req, 0).status, 'admitted');
+  req.inputContent = Object.freeze({ *[Symbol.iterator]() { assert.fail('placed request was replanned'); } });
+  assert.deepEqual(h.cache.prefetch(req, 1), { status: 'admitted' });
+});
+
 test('U3 cache: lookup preserves mixed-tier positions and stops at an unpublished middle page', () => {
   const h = finiteHarness(), req = contentRequest([['mixed', 256]]);
   h.cache.warm({ content: req.inputContent, placements: ['ssd', 'dram', 'ssd', 'hbm']

@@ -468,6 +468,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (incomingHandoffs.has(req)) return { response: { status: 'wait' }, planned: null };
     if (!finiteCapacity) return { response: { status: 'admitted' }, planned: null };
     advance(now);
+    const state = states.get(req);
+    if (state && !state.released) return { response: { status: 'admitted' }, planned: null };
     let subscription = prefetches.get(req);
     if (subscription) return { response: { status: 'admitted' }, planned: subscription.planned };
     planned ||= plan(req, now);
