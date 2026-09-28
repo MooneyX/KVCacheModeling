@@ -187,6 +187,19 @@ test('U2 cache: long segments have offset-specific pages and a missing middle pa
   assert.equal(h.pool.used, 192); assert.equal(h.cache.snapshot().deduplicatedPages, 1);
 });
 
+test('U2 cache: immutable request page descriptions are expanded once and invalidated by content identity', () => {
+  const h = contentHarness(), req = contentRequest([['cached-pages', 129]]);
+  const content = req.inputContent;
+  let iterations = 0;
+  req.inputContent = Object.freeze({ *[Symbol.iterator]() { iterations++; yield* content; } });
+  const first = h.cache.lookup(req, 0), second = h.cache.lookup(req, 1);
+  assert.equal(iterations, 1);
+  assert.deepEqual(second, first);
+  req.inputContent = Object.freeze({ *[Symbol.iterator]() { iterations++; yield* content; } });
+  assert.deepEqual(h.cache.lookup(req, 2), first);
+  assert.equal(iterations, 2);
+});
+
 for (const [name, change] of [
   ['unavailable', b => { b.available = false; }],
   ['not ready', b => { b.ready = false; }],

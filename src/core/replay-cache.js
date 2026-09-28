@@ -21,7 +21,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   catch (error) { throw new ReplayValidationError('replay.cache.blockSize', error.message); }
   pool ??= pools.hbm;
   const resources = { ...pools, hbm: pool };
-  const states = new WeakMap();
+  const states = new WeakMap(), pageDescriptions = new WeakMap();
   const incomingHandoffs = new WeakMap(), outgoingHandoffs = new WeakMap(), handoffs = new Set();
   const prefetches = new WeakMap(), pulls = new Map(), transfers = new Set();
   const bindings = new Map(), fetchInitialized = new WeakSet();
@@ -82,13 +82,21 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
   }
 
+  function requestPages(req) {
+    const cached = pageDescriptions.get(req);
+    if (cached?.content === req.inputContent && cached.inputLen === req.inputLen) return cached.pages;
+    const descriptions = Object.freeze([...pages(req.inputContent)].map(Object.freeze));
+    pageDescriptions.set(req, { content: req.inputContent, inputLen: req.inputLen, pages: descriptions });
+    return descriptions;
+  }
+
   function finitePlan(req, now) {
     const count = Math.ceil(req.inputLen / blockSize), slots = [];
     if (count * blockBytes > pool.cap) return { response: { status: 'infeasible' } };
     checkLimit(count);
     const response = result(0, 0);
     let matching = true, missing = 0;
-    for (const description of pages(req.inputContent)) {
+    for (const description of requestPages(req)) {
       const hbmItem = pool.blockIndex[description.key];
       let tier = null, item = null;
       if (matching) {
@@ -117,8 +125,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     checkLimit(count);
     const slots = [];
     let matching = true, hitTokens = 0, inputTokens = 0, missing = 0;
-    for (const slot of pages(req.inputContent)) {
-      slot.hit = matching && ready(pool.blockIndex[slot.key], now);
+    for (const description of requestPages(req)) {
+      const slot = { ...description, hit: matching && ready(pool.blockIndex[description.key], now) };
       if (slot.hit) hitTokens += slot.tokens;
       else { matching = false; missing++; }
       inputTokens += slot.tokens;
@@ -650,7 +658,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (count * blockBytes > pool.cap) return { status: 'infeasible' };
     if (!canSchedule(now)) return { status: 'wait' };
     checkLimit(count);
-    const slots = [...pages(req.inputContent)];
+    const slots = requestPages(req).map(slot => ({ ...slot }));
     if (slots.reduce((sum, slot) => sum + slot.tokens, 0) !== req.inputLen) {
       throw new ReplayValidationError('replay.cache', 'content length does not match input length');
     }
