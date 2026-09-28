@@ -231,7 +231,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       dram: p.tieredKv ? iR.dramTotal / resourceShare : 0,
       ssd:  p.tieredKv ? iR.ssdTotal / resourceShare : 0 };
     let iPools = {};
-    ['hbm','dram','ssd'].forEach(t => iPools[t] = { blocks: [], blockIndex: {}, used: 0, cap: iCaps[t], accessOrder: [], freq: {} });
+    // epoch: 页增删计数, 供 refreshLocations 判定 decode 请求的页集合缓存是否失效
+    ['hbm','dram','ssd'].forEach(t => iPools[t] = { blocks: [], blockIndex: {}, used: 0, cap: iCaps[t], accessOrder: [], freq: {}, epoch: 0 });
     // 跨层链路：L2(PCIe/C2C) 与 L3(NVMe) 各为一条共享总线——
     // 物理上 PCIe/NVMe 是双向共享带宽的，故 hbm↔dram 双向共用 busyUntil(L2)，
     // dram↔ssd 双向共用 busyUntil(L3)。传输(预取/淘汰)与 decode 读(见 decode 段)
@@ -423,7 +424,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
 
   function poolAdd(tier, blk) {
     let pool = pools[tier];
-    pool.blocks.push(blk); pool.blockIndex[blk.id] = blk;
+    pool.blocks.push(blk); pool.blockIndex[blk.id] = blk; pool.epoch++;
     pool.used += sizeInTier(blk, tier);
     pool.accessOrder.push(blk.id);
     pool.freq[blk.id] = (pool.freq[blk.id] || 0) + 1;
@@ -434,7 +435,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     let blk = pool.blockIndex[blkId];
     if (!blk) return null;
     pool.used -= sizeInTier(blk, tier);
-    delete pool.blockIndex[blkId];
+    delete pool.blockIndex[blkId]; pool.epoch++;
     let bi = pool.blocks.indexOf(blk); if (bi >= 0) pool.blocks.splice(bi, 1);
     let ai = pool.accessOrder.indexOf(blkId); if (ai >= 0) pool.accessOrder.splice(ai, 1);
     return blk;
@@ -988,14 +989,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     },
     add: (tier, block) => {
       const pool = cacheResource.pools[tier];
-      pool.blocks.push(block); pool.blockIndex[block.id] = block;
+      pool.blocks.push(block); pool.blockIndex[block.id] = block; pool.epoch++;
       pool.used += sizeInTier(block, tier); pool.accessOrder.push(block.id);
       pool.freq[block.id] = (pool.freq[block.id] || 0) + 1; block.tier = tier;
     },
     remove: (tier, id) => {
       const pool = cacheResource.pools[tier], block = pool.blockIndex[id];
       if (!block) return null;
-      pool.used -= sizeInTier(block, tier); delete pool.blockIndex[id];
+      pool.used -= sizeInTier(block, tier); delete pool.blockIndex[id]; pool.epoch++;
       pool.blocks.splice(pool.blocks.indexOf(block), 1);
       const index = pool.accessOrder.indexOf(id);
       if (index >= 0) pool.accessOrder.splice(index, 1);
@@ -1820,20 +1821,42 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   let curWave = inst.curWave;   // 执行中的波 {members:[{q,chunk}], endT}
   let prepWave = inst.prepWave; // 筹备中的波 {members:[{q,chunk}]}(等待成员 L3 拉取完成)
 
+  // unified decode 页位置缓存(2026-09-28 perf): 原实现每步(2ms)对每个 decode 请求逐页全扫
+  // (≈3000 页/请求), 占 replay 墙钟 ~62%。kvHbm 只依赖 ①页集合(prefixBlkIds/ownBlkIds)
+  // ②页所在 HBM 池的增删(epoch; 换 id/逐出/去重均经 add/remove) ③输出页 token 数(只由
+  // cache.output 按 _outAllocTok 改写)——以此为键缓存, 未变则复用, 结果逐位一致。
+  // 去掉逐步 page.lastTouch = now: decode 页 refcount≥1 不入淘汰候选(ensureSpace 只取
+  // refcount 0), 而 refcount 归零只经 release/handoff.cancel, 二者都会写 lastTouch=当时,
+  // 覆盖掉 decode 期的任何刷新 ⇒ 对淘汰顺序无可观测影响。不变式断言在缓存重建时执行。
+  function refreshUnifiedLocation(q) {
+    const pool = cacheResource.pools.hbm, cached = q._kvLoc;
+    if (cached && cached.pool === pool && cached.epoch === pool.epoch
+      && cached.prefix === q.prefixBlkIds && cached.prefixLen === q.prefixBlkIds.length
+      && cached.own === q.ownBlkIds && cached.ownLen === q.ownBlkIds.length
+      && cached.outTok === q._outAllocTok) {
+      q.kvHbm = cached.kvHbm; q.kvDram = 0; q.kvSsd = 0;
+      stats.hbmAcc += cached.pages;
+      return;
+    }
+    let kvHbm = 0, pages = 0;
+    for (const ids of [q.prefixBlkIds, q.ownBlkIds]) {
+      for (const id of ids) {
+        const page = pool.blockIndex[id];
+        if (!page?.available || !page.ready || page.refcount < 1)
+          throw new Error('Workload cache invariant: decode requires ready, referenced HBM pages');
+        kvHbm += page.tokens * kvPerTok;
+        pages++;
+      }
+    }
+    q._kvLoc = { pool, epoch: pool.epoch, prefix: q.prefixBlkIds, prefixLen: q.prefixBlkIds.length,
+      own: q.ownBlkIds, ownLen: q.ownBlkIds.length, outTok: q._outAllocTok, kvHbm, pages };
+    q.kvHbm = kvHbm; q.kvDram = 0; q.kvSsd = 0;
+    stats.hbmAcc += pages;
+  }
+
   function refreshLocations() {
     decoding.forEach(q => {
-      if (unified) {
-        q.kvHbm = 0; q.kvDram = 0; q.kvSsd = 0;
-        for (const id of q.prefixBlkIds.concat(q.ownBlkIds)) {
-          const page = cacheResource.pools.hbm.blockIndex[id];
-          if (!page?.available || !page.ready || page.refcount < 1)
-            throw new Error('Workload cache invariant: decode requires ready, referenced HBM pages');
-          q.kvHbm += page.tokens * kvPerTok;
-          page.lastTouch = now;
-          stats.hbmAcc++;
-        }
-        return;
-      }
+      if (unified) { refreshUnifiedLocation(q); return; }
       let h = 0, d = 0, sd = 0;
       // P0-1: 平均块大小按实际 token 数（输入+已生成输出）计算，修复前只用 inputLen
       let nIds = Math.max(1, q.prefixBlkIds.length + q.ownBlkIds.length);
