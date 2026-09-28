@@ -1959,6 +1959,18 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   const residentWidth = Math.max(DT * 5, simCap / 19_999);
   const residentBuckets = new Map();
   let residentTime = 0;
+  // gauge 降采样(2026-09-28): cacheSnapshot() 逐页全扫全部 tier 的 block, 每步调用是 replay 的
+  // 主要性能瓶颈。与 resident 采样同口径 —— 以 DT*5(10ms) 为下限、全程约 2 万个采样点的间隔
+  // 缓存快照, 间隔内 observe 复用上次的缓存类 gauge 值(时间加权口径不变, 值在采样间隔内保持)。
+  const gaugeWidth = Math.max(DT * 5, simCap / 19_999);
+  let gaugeSnapshot = null, gaugeSnapshotAt = -Infinity;
+  function cacheGauges() {
+    if (!gaugeSnapshot || now - gaugeSnapshotAt >= gaugeWidth) {
+      gaugeSnapshot = cacheSnapshot();
+      gaugeSnapshotAt = now;
+    }
+    return gaugeSnapshot;
+  }
   let bandwidthSampleStart = null, bandwidthSampleEnd = null;
   function sampleResidentUsage(time) {
     if (!unified && !replay) return;
@@ -2046,7 +2058,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       replayMetrics.observe(now, { activeSessions: replay.sessions.size,
         activeRequests: instances.reduce((sum, target) => sum + instLoad(target), 0) + completionEvents.length,
         queuedRequests: unified ? instances.reduce((sum, target) => sum + target.waitQueue.length + target.prefillQ.length, 0)
-          : waitQueue.length + prefillQ.length, ...cacheSnapshot() });
+          : waitQueue.length + prefillQ.length, ...cacheGauges() });
     }
 
     // 事件跳跃(2026-08-18): 系统全空闲(无在途请求, 拉取/波次自然也不存在)时直接快进至
@@ -2807,7 +2819,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     }
     if (replay) replayMetrics.observe(now, { activeSessions: replay.sessions.size,
       activeRequests: instances.reduce((sum, target) => sum + instLoad(target), 0) + completionEvents.length,
-      queuedRequests: _sQ, ...cacheSnapshot() });
+      queuedRequests: _sQ, ...cacheGauges() });
     let u = _sHbmUsed / Math.max(_sHbmCap, 1);
     stats.memUtilSum += u; stats.memUtilSamples++;
     if (u > stats.memUtilPeak) stats.memUtilPeak = u;
@@ -2908,6 +2920,10 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     xi.prefilling.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: null, completeTime: null, state: 'prefilling' }));
     xi.decoding.forEach(q => incomplete.push({ id: q.id, arrive: q.arrive, admitTime: q.admitTime, prefillStart: q.prefillStart, prefillEnd: q.prefillEnd, completeTime: null, state: 'decoding' }));
   });
+
+  // gauge 降采样的边界修正: finish 前强制刷新一次缓存快照, 保证最后一个 bucket 的
+  // last/peak 与最终 gauge 状态反映真实终态(否则最多滞后一个 gaugeWidth)。
+  if (replay) { gaugeSnapshot = null; replayMetrics.observe(now, { ...cacheGauges() }); }
 
   const result = {
     name: strategy.name || autoNameStrategy(strategy),
