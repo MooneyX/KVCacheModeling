@@ -456,19 +456,20 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
   }
 
-  function prefetch(req, now = 0, policy = {}) {
-    if (incomingHandoffs.has(req)) return { status: 'wait' };
-    if (!finiteCapacity) return { status: 'admitted' };
+  function preparePrefetch(req, now = 0, policy = {}, planned = null) {
+    if (incomingHandoffs.has(req)) return { response: { status: 'wait' }, planned: null };
+    if (!finiteCapacity) return { response: { status: 'admitted' }, planned: null };
     advance(now);
     let subscription = prefetches.get(req);
-    if (subscription) return { status: 'admitted' };
-    const planned = plan(req, now);
-    if (!planned.slots) return planned.response;
+    if (subscription) return { response: { status: 'admitted' }, planned: subscription.planned };
+    planned ||= plan(req, now);
+    if (!planned.slots) return { response: planned.response, planned };
     const restoredPages = Math.ceil(Math.max(0, Math.floor(req.tokensGen || 0)) / blockSize);
-    if ((planned.slots.length + restoredPages) * blockBytes > pool.cap) return { status: 'infeasible' };
+    if ((planned.slots.length + restoredPages) * blockBytes > pool.cap)
+      return { response: { status: 'infeasible' }, planned };
     const lower = planned.slots.filter(slot => slot.hit && slot.tier !== 'hbm');
-    if (!lower.length) return { status: 'admitted' };
-    if (!canSchedule(now)) return { status: 'wait' };
+    if (!lower.length) return { response: { status: 'admitted' }, planned };
+    if (!canSchedule(now)) return { response: { status: 'wait' }, planned };
     const normalized = { type: policy.type || 'none', fixedSeconds: Math.max(0, policy.fixedSeconds || 0),
       timeoutSeconds: Math.max(0, policy.timeoutSeconds || 0), coalesce: !!policy.coalesce };
     if (normalized.type === 'race') lower.reverse();
@@ -483,7 +484,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const needed = planned.slots.filter(slot => !(slot.hit && (slot.tier === 'hbm'
       ? pool.blockIndex[slot.key] : reused.has(slot.position)))).length + restoredPages;
     const space = ensureSpace('hbm', needed * blockBytes, now, protectedPages);
-    if (space !== 'admitted') return { status: space };
+    if (space !== 'admitted') return { response: { status: space }, planned };
     const intermediates = lower.filter(slot => slot.tier === 'ssd' && resources.dram
       && (!normalized.coalesce || !resources.dram.blockIndex[slot.key])).length;
     checkLimit(residentCount() + needed + intermediates);
@@ -515,7 +516,11 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
     if (pull.tasks.some(task => task.record)) req._ft0 ??= now;
     progressPull(pull, now);
-    return { status: 'admitted' };
+    return { response: { status: 'admitted' }, planned };
+  }
+
+  function prefetch(req, now = 0, policy = {}) {
+    return preparePrefetch(req, now, policy).response;
   }
 
   function uncovered(entry, includeClaimed = true) {
@@ -563,7 +568,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
   }
 
-  function finitePlace(req, now) {
+  function finitePlace(req, now, initial = null) {
     advance(now);
     const previous = states.get(req);
     if (previous && !previous.released) return previous.response;
@@ -572,17 +577,17 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       throw new ReplayValidationError('replay.cache', 'invalid generated output length');
     if ((Math.ceil(req.inputLen / blockSize) + Math.ceil(restored / blockSize)) * blockBytes > pool.cap) return { status: 'infeasible' };
     if (!prefetches.has(req)) {
-      const initial = plan(req, now);
+      initial ||= plan(req, now);
       if (!initial.slots) return initial.response;
       const protectedPages = new Set(initial.slots.filter(slot => slot.hit)
         .map(slot => resources[slot.tier]?.blockIndex[slot.key]).filter(Boolean));
       const needed = initial.slots.filter(slot => !slot.hit || !pool.blockIndex[slot.key]).length + Math.ceil(restored / blockSize);
       const status = ensureSpace('hbm', needed * blockBytes, now, protectedPages);
       if (status !== 'admitted') return { status };
-      prefetch(req, now, { type: 'none' });
+      preparePrefetch(req, now, { type: 'none' }, initial);
     }
     const subscription = prefetches.get(req);
-    const { slots, response: original } = subscription?.planned || plan(req, now);
+    const { slots, response: original } = subscription?.planned || initial || plan(req, now);
     if (!slots) return original;
     const targets = new Map(subscription?.pull.tasks.map(task => [task.slot.position, task.target]) || []);
     const existing = slots.map(slot => {
@@ -788,6 +793,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       advance(now);
       return transfer(item, from, to, now, options);
     },
+    preparePrefetch,
     prefetch,
     cancel,
     startPrefill(req, now = 0) {
@@ -832,9 +838,9 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       const { slots, response } = plan(req, now);
       return slots ? { ...response, slots } : response;
     },
-    place(req, now = 0) {
+    place(req, now = 0, planned = null) {
       if (incomingHandoffs.has(req)) return { status: 'wait' };
-      if (finiteCapacity) return finitePlace(req, now);
+      if (finiteCapacity) return finitePlace(req, now, planned);
       const previous = states.get(req);
       if (previous && !previous.released) return previous.response;
       const { slots, response } = plan(req, now);

@@ -1178,14 +1178,14 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     }
     for (let i = 0; i < waitQueue.length; i++) {
       const req = waitQueue[i];
-      if (unified) pageCache.prefetch(req, now, prefetchPolicy(req));
+      const prepared = unified ? pageCache.preparePrefetch(req, now, prefetchPolicy(req)) : null;
       if (!pageCache) {
         const fastCap = (caps.hbm + caps.dram) * 0.98;
         const kvInFlight = (decoding.length + decodeWait.length + prefillQ.length + prefilling.length) * r.avgLifetimeKv;
         if (!p.singleBatch && kvInFlight > fastCap) break;
         placeRequest(req, admitTier(req));
       } else {
-        const hit = pageCache.place(req, now);
+        const hit = pageCache.place(req, now, prepared?.planned);
         if (hit.status === 'wait') {
           if (!unified) throw new ReplayValidationError('replay.capacity', 'HBM pressure requires eviction/retract support; result not produced');
           observe('wait', req);
