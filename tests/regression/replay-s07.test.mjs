@@ -141,20 +141,20 @@ function contentRequest(parts, outputLen = 0) {
 }
 
 function contentHarness(cap = 4096, options = {}) {
-  const makePool = cap => ({ cap, used: 0, blocks: [], blockIndex: Object.create(null) });
+  const makePool = cap => ({ cap, used: 0, blocks: [], blockIndex: Object.create(null), epoch: 0 });
   const pools = { hbm: makePool(cap), dram: makePool(options.dramCap ?? 4096), ssd: makePool(options.ssdCap ?? 4096) };
   const ratio = options.tierRatio ?? { hbm: 1, dram: 1, ssd: 1 };
   const add = (tier, item) => {
     const p = pools[tier];
     assert.ok(!p.blockIndex[item.id], 'physical IDs must be unique');
     item.tier = tier;
-    p.blockIndex[item.id] = item; p.blocks.push(item); p.used += item.size * (ratio[tier] ?? 1);
+    p.blockIndex[item.id] = item; p.blocks.push(item); p.used += item.size * (ratio[tier] ?? 1); p.epoch++;
     assert.ok(p.used <= p.cap, `${tier} capacity exceeded`);
   };
   const remove = (tier, id) => {
     const p = pools[tier], item = p.blockIndex[id];
     assert.ok(item); delete p.blockIndex[id]; p.blocks.splice(p.blocks.indexOf(item), 1);
-    p.used -= item.size * (ratio[tier] ?? 1);
+    p.used -= item.size * (ratio[tier] ?? 1); p.epoch++;
   };
   const cache = createReplayCache({ pools, blockBytes: options.blockSize ?? 64, add, remove, ...options, tierRatio: ratio });
   const snapshot = () => structuredClone({ pools, cache: cache.snapshot() });

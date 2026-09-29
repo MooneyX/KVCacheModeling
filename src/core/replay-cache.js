@@ -25,23 +25,29 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   const incomingHandoffs = new WeakMap(), outgoingHandoffs = new WeakMap(), handoffs = new Set();
   const prefetches = new WeakMap(), pulls = new Map(), transfers = new Set();
   const bindings = new Map(), fetchInitialized = new WeakSet();
-  let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0;
+  let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0, pageCountCache = null;
   const tiers = ['hbm', 'dram', 'ssd'];
   const uniqueResources = [...new Set(Object.values(resources))];
   const tiersByResource = new Map(uniqueResources.map(target => [target, []]));
   for (const tier of tiers) if (resources[tier]) tiersByResource.get(resources[tier]).push(tier);
+  let activeCacheLocks = uniqueResources.reduce((sum, target) => sum
+    + target.blocks.filter(item => item.transferLocked).length, 0);
   const sizeAt = (item, tier) => item.size * (tierRatio[tier] ?? 1);
   const emit = (type, time, details = {}) => onEvent({ type, time, resourceId, ...details });
   const accessible = (item, now) => !!item && item.available && item.ready
     && item._published && !item._moving && (item.arriveAt ?? 0) <= now;
   const lock = item => {
-    if (!item._cacheLocks) item._cacheWasLocked = !!item.transferLocked;
+    const wasLocked = !!item.transferLocked;
+    if (!item._cacheLocks) item._cacheWasLocked = wasLocked;
     item._cacheLocks = (item._cacheLocks || 0) + 1;
     item.transferLocked = true;
+    if (!wasLocked) activeCacheLocks++;
   };
   const unlock = item => {
+    const wasLocked = !!item.transferLocked;
     item._cacheLocks = Math.max(0, (item._cacheLocks || 0) - 1);
     item.transferLocked = item._cacheLocks > 0 || !!item._cacheWasLocked;
+    if (wasLocked && !item.transferLocked) activeCacheLocks--;
   };
   const residentCount = () => resourceCount ? resourceCount()
     : [...new Set(Object.values(resources))].reduce((n, p) => n + p.blocks.length, 0);
@@ -799,6 +805,26 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     return { status: 'admitted', handoff };
   }
 
+  function contentPageCounts() {
+    let cacheable = true, unchanged = !!pageCountCache;
+    for (let i = 0; i < uniqueResources.length; i++) {
+      const epoch = uniqueResources[i].epoch;
+      if (!Number.isSafeInteger(epoch)) { cacheable = false; unchanged = false; }
+      else if (pageCountCache?.epochs[i] !== epoch) unchanged = false;
+    }
+    if (unchanged) return pageCountCache;
+    let inputPages = 0, outputPages = 0;
+    for (const target of uniqueResources) for (const item of target.blocks) {
+      if (item._contentResource !== resourceId) continue;
+      if (item.output) outputPages++;
+      else inputPages++;
+    }
+    const counts = { inputPages, outputPages,
+      epochs: cacheable ? uniqueResources.map(target => target.epoch) : null };
+    pageCountCache = cacheable ? counts : null;
+    return counts;
+  }
+
   const cache = {
     advance,
     beginHandoff,
@@ -1017,17 +1043,15 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       return { status: 'admitted', pages: planned.length };
     },
     snapshot() {
-      let inputPages = 0, outputPages = 0;
+      const { inputPages, outputPages } = contentPageCounts();
       const reserved = Object.fromEntries(tiers.map(tier => [tier, 0]));
-      for (const target of uniqueResources) {
-        const targetTiers = tiersByResource.get(target) || [];
-        for (const item of target.blocks) {
-          if (item._contentResource === resourceId) {
-            if (item.output) outputPages++;
-            else inputPages++;
-          }
-          if (finiteCapacity && !item.ready && item.transferLocked) {
-            for (const tier of targetTiers) reserved[tier] += sizeAt(item, tier);
+      if (finiteCapacity && activeCacheLocks > 0) {
+        for (const target of uniqueResources) {
+          const targetTiers = tiersByResource.get(target) || [];
+          for (const item of target.blocks) {
+            if (!item.ready && item.transferLocked) {
+              for (const tier of targetTiers) reserved[tier] += sizeAt(item, tier);
+            }
           }
         }
       }
