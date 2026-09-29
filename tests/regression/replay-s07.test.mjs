@@ -450,6 +450,20 @@ function computeInput(h, req, now) {
   h.cache.publish(req, now);
 }
 
+test('U3 cache: stable pending pages do not repeat readiness index scans', () => {
+  const h = finiteHarness(), req = contentRequest([['stable-pending', 128]]);
+  assert.equal(h.cache.place(req, 0).status, 'admitted');
+  const index = h.pool.blockIndex, pendingIds = new Set(req.ownBlkIds);
+  let reads = 0;
+  h.pool.blockIndex = new Proxy(index, { get(target, key, receiver) {
+    if (pendingIds.has(key)) reads++;
+    return Reflect.get(target, key, receiver);
+  } });
+  assert.equal(h.cache.prefillReady(req, 0), false);
+  assert.equal(h.cache.prefillReady(req, 1), false);
+  assert.equal(reads, 0);
+});
+
 test('U3 cache: claimed ranges are unavailable for compute but not ready before completion', () => {
   const h = finiteHarness(), req = contentRequest([['claimed', 128]]);
   assert.equal(h.cache.place(req, 0).status, 'admitted');
@@ -566,6 +580,7 @@ test('U3 cache: cancelling one group subscriber cannot cancel another request lo
   assert.equal(h.events.filter(event => event.type === 'transfer-cancel').length, 0);
   h.cache.place(second, 0.5);
   h.cache.advance(2);
+  assert.equal(h.cache.pending, 0);
   assert.equal(h.cache.prefillReady(second, 2), true);
   h.cache.publish(second, 2); h.cache.release(second, 2);
   assert.equal(h.pool.used, 64);
