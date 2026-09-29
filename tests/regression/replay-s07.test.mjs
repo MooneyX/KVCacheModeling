@@ -449,6 +449,15 @@ test('U3 cache: claimed ranges are unavailable for compute but not ready before 
   assert.equal(h.cache.prefillReady(req, 1), true);
 });
 
+test('U3 cache: compute range budget returns an exact prefix across physical pages', () => {
+  const h = finiteHarness(), req = contentRequest([['budgeted', 192]]);
+  assert.equal(h.cache.place(req, 0).status, 'admitted');
+  assert.deepEqual(h.cache.computeRanges(req, 0, 65), [{ position: 0, tokens: 65 }]);
+  h.cache.claimCompute(req, [{ position: 0, tokens: 65 }], 0);
+  assert.deepEqual(h.cache.computeRanges(req, 0, 64), [{ position: 65, tokens: 64 }]);
+  assert.deepEqual(h.cache.computeRanges(req, 0), [{ position: 65, tokens: 127 }]);
+});
+
 test('U3 cache: prefetch skips replanning after the request is placed', () => {
   const h = finiteHarness(), req = contentRequest([['placed', 128]]);
   assert.equal(h.cache.place(req, 0).status, 'admitted');

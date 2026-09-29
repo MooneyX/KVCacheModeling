@@ -561,13 +561,18 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     return entries;
   }
 
-  function computeRanges(req, now) {
+  function computeRanges(req, now, maxTokens = Infinity) {
     const ranges = [];
+    let remaining = maxTokens;
     for (const entry of refreshReadyEntries(req, now)) {
       for (const range of uncovered(entry)) {
+        const tokens = Math.min(range.tokens, remaining);
+        if (!(tokens > 0)) return ranges;
         const tail = ranges.at(-1);
-        if (tail && tail.position + tail.tokens === range.position) tail.tokens += range.tokens;
-        else ranges.push({ ...range });
+        if (tail && tail.position + tail.tokens === range.position) tail.tokens += tokens;
+        else ranges.push({ position: range.position, tokens });
+        remaining -= tokens;
+        if (!(remaining > 0)) return ranges;
       }
     }
     return ranges;

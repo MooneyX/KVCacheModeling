@@ -1154,7 +1154,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   function computeChunk(req, budget) {
     const ranges = [];
     let chunk = 0;
-    for (const range of pageCache.computeRanges(req, now)) {
+    for (const range of pageCache.computeRanges(req, now, budget)) {
       const tokens = Math.min(range.tokens, budget - chunk);
       if (tokens <= 0) break;
       ranges.push({ position: range.position, tokens });
