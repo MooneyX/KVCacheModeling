@@ -210,14 +210,36 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     return key;
   }
 
-  function publishInput(id, now) {
+  function flushPublishedInputs(changes) {
+    for (const [req, update] of changes.requests) {
+      req.ownBlkIds = req.ownBlkIds.filter(id => !update.removed.has(id));
+      const existing = new Set(req.prefixBlkIds);
+      for (const id of update.added) if (!existing.has(id)) {
+        existing.add(id);
+        req.prefixBlkIds.push(id);
+      }
+    }
+    for (const [state, removed] of changes.states) {
+      state.privateIds = state.privateIds.filter(id => !removed.has(id));
+    }
+  }
+
+  function publishInput(id, now, changes = null) {
+    const pending = changes || { requests: new Map(), states: new Map() };
     const item = pool.blockIndex[id], key = publishPage(id, now), target = pool.blockIndex[key];
     const refs = bindings.get(item) || new Set();
     for (const binding of refs) {
       binding.entry.id = key;
-      binding.req.ownBlkIds = binding.req.ownBlkIds.filter(oldId => oldId !== id);
-      if (!binding.req.prefixBlkIds.includes(key)) binding.req.prefixBlkIds.push(key);
-      binding.state.privateIds = binding.state.privateIds.filter(oldId => oldId !== id);
+      let requestUpdate = pending.requests.get(binding.req);
+      if (!requestUpdate) {
+        requestUpdate = { removed: new Set(), added: [] };
+        pending.requests.set(binding.req, requestUpdate);
+      }
+      requestUpdate.removed.add(id);
+      requestUpdate.added.push(key);
+      let stateUpdate = pending.states.get(binding.state);
+      if (!stateUpdate) pending.states.set(binding.state, stateUpdate = new Set());
+      stateUpdate.add(id);
     }
     if (target !== item) {
       if (!bindings.has(target)) bindings.set(target, new Set());
@@ -229,7 +251,17 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       if (target !== item && task.targetHeld) { unlock(item); lock(target); }
       task.target = target;
     }
+    if (!changes) flushPublishedInputs(pending);
     return target;
+  }
+
+  function publishInputs(ids, now) {
+    const changes = { requests: new Map(), states: new Map() };
+    try {
+      for (const id of ids) publishInput(id, now, changes);
+    } finally {
+      flushPublishedInputs(changes);
+    }
   }
 
   function transferEvent(record) {
@@ -963,7 +995,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       if (finiteCapacity) {
         if (!cache.prefillReady(req, now)) throw new Error('Replay cache invariant: publication before KV readiness');
         cancel(req, now);
-        for (const id of [...state.privateIds]) publishInput(id, now);
+        publishInputs([...state.privateIds], now);
         req._replayPrivate = null;
         return;
       }

@@ -464,6 +464,37 @@ test('U3 cache: stable pending pages do not repeat readiness index scans', () =>
   assert.equal(reads, 0);
 });
 
+test('U3 cache: multi-page publication batches request array rewrites', () => {
+  const h = finiteHarness(16384), req = contentRequest([['batch-publish', 8192]]);
+  assert.equal(h.cache.place(req, 0).status, 'admitted');
+  const ranges = h.cache.computeRanges(req, 0);
+  h.cache.claimCompute(req, ranges, 0);
+  h.cache.completeCompute(req, ranges, 1);
+  let ownFilters = 0, prefixIncludes = 0, own = req.ownBlkIds;
+  const instrumentOwn = value => {
+    const filter = value.filter;
+    Object.defineProperty(value, 'filter', { configurable: true, value(...args) {
+      ownFilters++;
+      return filter.apply(this, args);
+    } });
+    return value;
+  };
+  own = instrumentOwn(own);
+  Object.defineProperty(req, 'ownBlkIds', { configurable: true,
+    get: () => own, set: value => { own = instrumentOwn(value); } });
+  const includes = req.prefixBlkIds.includes;
+  Object.defineProperty(req.prefixBlkIds, 'includes', { configurable: true, value(...args) {
+    prefixIncludes++;
+    return includes.apply(this, args);
+  } });
+  h.cache.publish(req, 1);
+  assert.equal(ownFilters, 1); assert.equal(prefixIncludes, 0);
+  assert.equal(req.ownBlkIds.length, 0); assert.equal(req.prefixBlkIds.length, 128);
+  assert.equal(new Set(req.prefixBlkIds).size, 128);
+  h.cache.release(req, 2);
+  assert.ok(h.pool.blocks.every(page => !page.refcount));
+});
+
 test('U3 cache: claimed ranges are unavailable for compute but not ready before completion', () => {
   const h = finiteHarness(), req = contentRequest([['claimed', 128]]);
   assert.equal(h.cache.place(req, 0).status, 'admitted');
