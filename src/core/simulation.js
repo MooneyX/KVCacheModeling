@@ -21,6 +21,7 @@ export const WORKLOAD_MODEL_VERSION = 'workload-u5-metrics-v1';
 
 function simulate(params, strategy, overrides, strategyMode, acceptance) {
   const unified = true;
+  const fastPoolMutation = strategyMode !== 'js' && !acceptance;
   overrides = overrides || {};
   let p = JSON.parse(JSON.stringify(params));
   // ---- 硬件预设覆盖(2026-08-25, 为「形状=GPU」的多硬件扫描而加) ----
@@ -232,7 +233,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       ssd:  p.tieredKv ? iR.ssdTotal / resourceShare : 0 };
     let iPools = {};
     // epoch: 页增删计数, 供 refreshLocations 判定 decode 请求的页集合缓存是否失效
-    ['hbm','dram','ssd'].forEach(t => iPools[t] = { blocks: [], blockIndex: {}, used: 0, cap: iCaps[t], accessOrder: [], freq: {}, epoch: 0 });
+    ['hbm','dram','ssd'].forEach(t => iPools[t] = { blocks: [], blockIndex: {},
+      blockPositions: fastPoolMutation ? new WeakMap() : null,
+      used: 0, cap: iCaps[t], accessOrder: [], freq: {}, epoch: 0 });
     // 跨层链路：L2(PCIe/C2C) 与 L3(NVMe) 各为一条共享总线——
     // 物理上 PCIe/NVMe 是双向共享带宽的，故 hbm↔dram 双向共用 busyUntil(L2)，
     // dram↔ssd 双向共用 busyUntil(L3)。传输(预取/淘汰)与 decode 读(见 decode 段)
@@ -422,11 +425,34 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   }
   function sizeInTier(blk, tier) { return blk.size * tierRatio[tier]; }
 
+  function appendPoolBlock(pool, block) {
+    if (pool.blockPositions) pool.blockPositions.set(block, pool.blocks.length);
+    pool.blocks.push(block);
+    if (!pool.blockPositions) pool.accessOrder.push(block.id);
+  }
+  function deletePoolBlock(pool, block, id) {
+    if (pool.blockPositions) {
+      const index = pool.blockPositions.get(block), lastIndex = pool.blocks.length - 1;
+      if (index === undefined || pool.blocks[index] !== block) throw new Error('Cache pool position invariant violated');
+      const last = pool.blocks[lastIndex];
+      if (index !== lastIndex) {
+        pool.blocks[index] = last;
+        pool.blockPositions.set(last, index);
+      }
+      pool.blocks.pop();
+      pool.blockPositions.delete(block);
+      return;
+    }
+    const blockIndex = pool.blocks.indexOf(block);
+    if (blockIndex < 0) throw new Error('Cache pool membership invariant violated');
+    pool.blocks.splice(blockIndex, 1);
+    const accessIndex = pool.accessOrder.indexOf(id);
+    if (accessIndex >= 0) pool.accessOrder.splice(accessIndex, 1);
+  }
   function poolAdd(tier, blk) {
     let pool = pools[tier];
-    pool.blocks.push(blk); pool.blockIndex[blk.id] = blk; pool.epoch++;
+    appendPoolBlock(pool, blk); pool.blockIndex[blk.id] = blk; pool.epoch++;
     pool.used += sizeInTier(blk, tier);
-    pool.accessOrder.push(blk.id);
     pool.freq[blk.id] = (pool.freq[blk.id] || 0) + 1;
     blk.tier = tier;
   }
@@ -436,8 +462,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     if (!blk) return null;
     pool.used -= sizeInTier(blk, tier);
     delete pool.blockIndex[blkId]; pool.epoch++;
-    let bi = pool.blocks.indexOf(blk); if (bi >= 0) pool.blocks.splice(bi, 1);
-    let ai = pool.accessOrder.indexOf(blkId); if (ai >= 0) pool.accessOrder.splice(ai, 1);
+    deletePoolBlock(pool, blk, blkId);
     return blk;
   }
   function touchBlock(tier, blkId) {
@@ -990,17 +1015,15 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     },
     add: (tier, block) => {
       const pool = cacheResource.pools[tier];
-      pool.blocks.push(block); pool.blockIndex[block.id] = block; pool.epoch++;
-      pool.used += sizeInTier(block, tier); pool.accessOrder.push(block.id);
+      appendPoolBlock(pool, block); pool.blockIndex[block.id] = block; pool.epoch++;
+      pool.used += sizeInTier(block, tier);
       pool.freq[block.id] = (pool.freq[block.id] || 0) + 1; block.tier = tier;
     },
     remove: (tier, id) => {
       const pool = cacheResource.pools[tier], block = pool.blockIndex[id];
       if (!block) return null;
       pool.used -= sizeInTier(block, tier); delete pool.blockIndex[id]; pool.epoch++;
-      pool.blocks.splice(pool.blocks.indexOf(block), 1);
-      const index = pool.accessOrder.indexOf(id);
-      if (index >= 0) pool.accessOrder.splice(index, 1);
+      deletePoolBlock(pool, block, id);
       return block;
     },
     resourceCount: unified ? () => [...new Set(cacheResources.flatMap(target => Object.values(target.pools)))]
