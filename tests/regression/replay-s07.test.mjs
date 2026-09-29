@@ -325,6 +325,18 @@ test('U2 cache: output 1 to 65 repairs the former tail and input/output round in
   assert.equal(h.pool.used, 320); assert.equal(req._outSeq, 3); assert.equal(req._outAllocTok, 129);
 });
 
+test('U2 cache: output growth only updates the previous tail and newly allocated pages', () => {
+  const h = contentHarness(), req = contentRequest([['output-growth', 64]], 129);
+  h.cache.place(req); h.cache.publish(req, 1);
+  h.cache.output(req, 65, 2);
+  const first = h.pool.blocks.find(page => page.output);
+  const firstKey = first.canonicalKey, firstTouch = first.lastTouch;
+  h.cache.output(req, 129, 3);
+  assert.equal(first.canonicalKey, firstKey);
+  assert.equal(first.lastTouch, firstTouch);
+  assert.deepEqual(h.pool.blocks.filter(page => page.output).map(page => page.tokens), [64, 64, 1]);
+});
+
 test('U2 cache: output wait and infeasible are atomic before tokens, IDs or allocation counters change', () => {
   const h = contentHarness(256);
   const req = contentRequest([['input', 64]], 65), blocker = contentRequest([['blocker', 128]]);

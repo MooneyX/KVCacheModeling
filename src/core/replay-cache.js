@@ -962,6 +962,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       const count = Math.ceil(want / blockSize);
       if ((Math.ceil(req.inputLen / blockSize) + count) * blockBytes > pool.cap) return { status: 'infeasible' };
       const extra = count - state.outputIds.length;
+      if (want === (req._outAllocTok || 0)) return { status: 'admitted' };
       if (finiteCapacity) {
         advance(now);
         if (pool.used + extra * blockBytes > pool.cap) {
@@ -973,7 +974,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
         const status = ensureSpace('hbm', extra * blockBytes, now);
         if (status !== 'admitted') return { status };
       } else if (pool.used + extra * blockBytes > pool.cap) return { status: 'wait' };
-      checkLimit(residentCount() + extra);
+      if (extra > 0) checkLimit(residentCount() + extra);
+      const previousCount = state.outputIds.length;
       while (state.outputIds.length < count) {
         const index = state.outputIds.length;
         const id = JSON.stringify(['output', resourceId, state.id, index]);
@@ -983,7 +985,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
         state.outputIds.push(id);
         req.ownBlkIds.push(id);
       }
-      for (let i = 0; i < state.outputIds.length; i++) {
+      const start = Math.max(0, previousCount - 1);
+      for (let i = start; i < state.outputIds.length; i++) {
         const item = pool.blockIndex[state.outputIds[i]];
         item.tokens = Math.min(blockSize, want - i * blockSize);
         item.lastTouch = now;
