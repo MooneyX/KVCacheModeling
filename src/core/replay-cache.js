@@ -563,11 +563,15 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
 
   function refreshReadyEntries(req, now) {
     advance(now);
-    const entries = entriesFor(req);
-    for (const entry of entries) {
-      if (pool.blockIndex[entry.id]?.ready) entry.completed = [{ position: entry.position, tokens: entry.tokens }];
+    const state = states.get(req);
+    if (!state || state.released) return [];
+    state.pendingEntries ??= new Set(state.entries.filter(entry => uncovered(entry, false).length));
+    for (const entry of state.pendingEntries) {
+      if (!pool.blockIndex[entry.id]?.ready) continue;
+      entry.completed = [{ position: entry.position, tokens: entry.tokens }];
+      state.pendingEntries.delete(entry);
     }
-    return entries;
+    return state.entries;
   }
 
   function computeRanges(req, now, maxTokens = Infinity) {
@@ -633,7 +637,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (space !== 'admitted') return { status: space };
     checkLimit(residentCount() + extra);
     const response = { ...original, status: 'admitted' };
-    const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], released: false };
+    const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], pendingEntries: new Set(), released: false };
     states.set(req, state);
     req.prefixBlkIds = []; req.ownBlkIds = [];
     for (let i = 0; i < slots.length; i++) {
@@ -650,6 +654,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       }
       const entry = { ...slot, id: item.id, completed: item.ready ? [{ position: slot.position, tokens: slot.tokens }] : [], claimed: [] };
       state.entries.push(entry);
+      if (!entry.completed.length) state.pendingEntries.add(entry);
       if (!bindings.has(item)) bindings.set(item, new Set());
       bindings.get(item).add({ req, state, entry });
     }
@@ -658,7 +663,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       const item = block(JSON.stringify(['output', resourceId, state.id, i]), tokens, req, now, true);
       if (req.outputIdentity) item.canonicalKey = contentPageKey([[req.outputIdentity.pathId, i * blockSize, tokens]], resourceId, blockSize);
       add('hbm', item); state.outputIds.push(item.id); req.ownBlkIds.push(item.id);
-      state.entries.push({ id: item.id, position, tokens, output: true, completed: [], claimed: [] });
+      const entry = { id: item.id, position, tokens, output: true, completed: [], claimed: [] };
+      state.entries.push(entry); state.pendingEntries.add(entry);
     }
     req._replayPrivate = state.privateIds;
     req.prefillTokens = state.entries.reduce((sum, entry) => sum + (entry.completed.length ? 0 : entry.tokens), 0);
@@ -698,7 +704,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       : pool.used + extra * blockBytes <= pool.cap ? 'admitted' : 'wait';
     if (status !== 'admitted') return { status };
     checkLimit(residentCount() + extra);
-    const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], released: false };
+    const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], pendingEntries: new Set(), released: false };
     const reserved = slots.map((slot, i) => {
       let item = existing[i];
       if (item) item.refcount++;
@@ -870,10 +876,12 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     },
     completeCompute(req, ranges, now = 0) {
       advance(now);
+      const state = states.get(req);
       forRanges(req, ranges, (entry, range) => {
         entry.claimed = entry.claimed.filter(claim => claim.position !== range.position || claim.tokens !== range.tokens);
         entry.completed.push(range);
         if (!uncovered(entry, false).length) {
+          state?.pendingEntries?.delete(entry);
           const item = pool.blockIndex[entry.id];
           if (item) { item.ready = true; item.arriveAt = now; }
         }
@@ -881,7 +889,9 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     },
     prefillReady(req, now = 0) {
       if (incomingHandoffs.has(req)) return false;
-      return refreshReadyEntries(req, now).every(entry => !uncovered(entry, false).length);
+      refreshReadyEntries(req, now);
+      const state = states.get(req);
+      return !state || state.released || !state.pendingEntries?.size;
     },
     ensureSpace,
     lookup(req, now = 0) {
