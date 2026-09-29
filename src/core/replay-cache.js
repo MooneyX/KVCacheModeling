@@ -552,11 +552,18 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     return state && !state.released ? state.entries || [] : [];
   }
 
-  function computeRanges(req, now) {
+  function refreshReadyEntries(req, now) {
     advance(now);
-    const ranges = [];
-    for (const entry of entriesFor(req)) {
+    const entries = entriesFor(req);
+    for (const entry of entries) {
       if (pool.blockIndex[entry.id]?.ready) entry.completed = [{ position: entry.position, tokens: entry.tokens }];
+    }
+    return entries;
+  }
+
+  function computeRanges(req, now) {
+    const ranges = [];
+    for (const entry of refreshReadyEntries(req, now)) {
       for (const range of uncovered(entry)) {
         const tail = ranges.at(-1);
         if (tail && tail.position + tail.tokens === range.position) tail.tokens += range.tokens;
@@ -840,8 +847,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     },
     prefillReady(req, now = 0) {
       if (incomingHandoffs.has(req)) return false;
-      computeRanges(req, now);
-      return entriesFor(req).every(entry => !uncovered(entry, false).length);
+      return refreshReadyEntries(req, now).every(entry => !uncovered(entry, false).length);
     },
     ensureSpace,
     lookup(req, now = 0) {

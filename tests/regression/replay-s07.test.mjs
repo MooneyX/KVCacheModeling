@@ -438,6 +438,17 @@ function computeInput(h, req, now) {
   h.cache.publish(req, now);
 }
 
+test('U3 cache: claimed ranges are unavailable for compute but not ready before completion', () => {
+  const h = finiteHarness(), req = contentRequest([['claimed', 128]]);
+  assert.equal(h.cache.place(req, 0).status, 'admitted');
+  const ranges = h.cache.computeRanges(req, 0);
+  h.cache.claimCompute(req, ranges, 0);
+  assert.deepEqual(h.cache.computeRanges(req, 0), []);
+  assert.equal(h.cache.prefillReady(req, 0), false);
+  h.cache.completeCompute(req, ranges, 1);
+  assert.equal(h.cache.prefillReady(req, 1), true);
+});
+
 test('U3 cache: prefetch skips replanning after the request is placed', () => {
   const h = finiteHarness(), req = contentRequest([['placed', 128]]);
   assert.equal(h.cache.place(req, 0).status, 'admitted');
