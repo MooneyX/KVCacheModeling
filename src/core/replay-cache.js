@@ -14,7 +14,7 @@ export function replayPageKey(instance, blockId, tokens = 64, resourceId = 'defa
   return contentPageKey([[JSON.stringify(['replay', instance, 'input', blockId]), offset, tokens]], resourceId, blockSize);
 }
 
-export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blockSize = 64, add, remove,
+export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blockSize = 64, add: rawAdd, remove: rawRemove,
   maxBlockReferences = 200000, resourceId = 'default', resourceCount = null, tierRatio = {},
   finiteCapacity = false, links = {}, l3Bandwidth = null, canSchedule = () => true, onEvent = () => {} }) {
   try { validatePhysicalBlockSize(blockSize); }
@@ -25,13 +25,41 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   const incomingHandoffs = new WeakMap(), outgoingHandoffs = new WeakMap(), handoffs = new Set();
   const prefetches = new WeakMap(), pulls = new Map(), transfers = new Set();
   const bindings = new Map(), fetchInitialized = new WeakSet();
-  let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0, pageCountCache = null;
+  let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0;
   const tiers = ['hbm', 'dram', 'ssd'];
   const uniqueResources = [...new Set(Object.values(resources))];
   const tiersByResource = new Map(uniqueResources.map(target => [target, []]));
   for (const tier of tiers) if (resources[tier]) tiersByResource.get(resources[tier]).push(tier);
+  const countPages = () => {
+    let inputPages = 0, outputPages = 0;
+    for (const target of uniqueResources) for (const item of target.blocks) {
+      if (item._contentResource !== resourceId) continue;
+      if (item.output) outputPages++;
+      else inputPages++;
+    }
+    return { inputPages, outputPages };
+  };
+  let pageCounts = countPages();
+  let pageCountEpochs = uniqueResources.every(target => Number.isSafeInteger(target.epoch))
+    ? uniqueResources.map(target => target.epoch) : null;
   let activeCacheLocks = uniqueResources.reduce((sum, target) => sum
     + target.blocks.filter(item => item.transferLocked).length, 0);
+  const syncPageEpochs = () => {
+    pageCountEpochs = uniqueResources.every(target => Number.isSafeInteger(target.epoch))
+      ? uniqueResources.map(target => target.epoch) : null;
+  };
+  const add = (tier, item) => {
+    rawAdd(tier, item);
+    if (item._contentResource === resourceId) item.output ? pageCounts.outputPages++ : pageCounts.inputPages++;
+    syncPageEpochs();
+  };
+  const remove = (tier, id) => {
+    const item = resources[tier]?.blockIndex[id];
+    const removed = rawRemove(tier, id);
+    if (item?._contentResource === resourceId) item.output ? pageCounts.outputPages-- : pageCounts.inputPages--;
+    syncPageEpochs();
+    return removed ?? item;
+  };
   const sizeAt = (item, tier) => item.size * (tierRatio[tier] ?? 1);
   const emit = (type, time, details = {}) => onEvent({ type, time, resourceId, ...details });
   const accessible = (item, now) => !!item && item.available && item.ready
@@ -812,23 +840,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   }
 
   function contentPageCounts() {
-    let cacheable = true, unchanged = !!pageCountCache;
-    for (let i = 0; i < uniqueResources.length; i++) {
-      const epoch = uniqueResources[i].epoch;
-      if (!Number.isSafeInteger(epoch)) { cacheable = false; unchanged = false; }
-      else if (pageCountCache?.epochs[i] !== epoch) unchanged = false;
-    }
-    if (unchanged) return pageCountCache;
-    let inputPages = 0, outputPages = 0;
-    for (const target of uniqueResources) for (const item of target.blocks) {
-      if (item._contentResource !== resourceId) continue;
-      if (item.output) outputPages++;
-      else inputPages++;
-    }
-    const counts = { inputPages, outputPages,
-      epochs: cacheable ? uniqueResources.map(target => target.epoch) : null };
-    pageCountCache = cacheable ? counts : null;
-    return counts;
+    if (pageCountEpochs && uniqueResources.every((target, i) => target.epoch === pageCountEpochs[i])) return pageCounts;
+    pageCounts = countPages();
+    syncPageEpochs();
+    return pageCounts;
   }
 
   const cache = {
