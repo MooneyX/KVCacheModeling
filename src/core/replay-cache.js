@@ -599,7 +599,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       entry.completed = [{ position: entry.position, tokens: entry.tokens }];
       state.pendingEntries.delete(entry);
     }
-    return state.entries;
+    return state.pendingEntries;
   }
 
   function computeRanges(req, now, maxTokens = Infinity) {
