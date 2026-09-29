@@ -2639,10 +2639,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // Decode：批次 Roofline —— passTime = max(访存时间, 算力下限) + TP AllReduce通信
     if (decoding.length && (!unified || (stepDuration > 0 && (!curWave || pdReal)))) {
       if (!unified && (dirty || step % TOUCH_EVERY === 0)) { refreshLocations(); dirty = false; }
-      // decodeWait 中的块视为活跃（即将进入 decode）：touch 刷新 LRU 时间戳防误淘汰——
-      // 否则 LRU 把等待中的 KV 挤到慢层，进入 decode 时读 SSD 拖垮批次（恶性循环：
-      // decode 慢 → decodeWait 更多 → HBM 被等待 KV 占满 → decode 块被挤出 → 更慢）
-      if (decodeWait.length) {
+      // 旧缓存路径需 touch decodeWait 页以防 LRU 误淘汰。统一 Replay cache 以 refcount
+      // 保护活跃页，且 release 会写入最终 lastTouch；逐步逐页 touch 不影响淘汰结果。
+      if (!unified && decodeWait.length) {
         for (let q of decodeWait) {
           for (let id of q.prefixBlkIds.concat(q.ownBlkIds)) {
             touchBlock('hbm', id); touchBlock('dram', id);
