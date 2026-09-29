@@ -444,7 +444,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     // O(1) 访问记录：时间戳供 LRU，计数供 LFU（避免 accessOrder.indexOf 的 O(n²) 开销）
     let pool = pools[tier];
     let blk = pool.blockIndex[blkId];
-    if (blk) blk.lastTouch = now;
+    if (!blk) return;
+    blk.lastTouch = now;
     pool.freq[blkId] = (pool.freq[blkId] || 0) + 1;
   }
 
