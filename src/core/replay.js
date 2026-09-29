@@ -12,7 +12,8 @@ export const DEFAULT_REPLAY_LIMITS = Object.freeze({
   maxSessions: 10_000,
   maxRequests: 1_000_000,
   maxRuns: 2_000_000,
-  maxBlockReferences: 100_000_000,
+  // Temporary compatibility ceiling for the shipped 338M-reference full bundle.
+  maxBlockReferences: 400_000_000,
 });
 
 export class ReplayValidationError extends Error {
