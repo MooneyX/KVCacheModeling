@@ -27,6 +27,9 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   const bindings = new Map(), fetchInitialized = new WeakSet();
   let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0;
   const tiers = ['hbm', 'dram', 'ssd'];
+  const uniqueResources = [...new Set(Object.values(resources))];
+  const tiersByResource = new Map(uniqueResources.map(target => [target, []]));
+  for (const tier of tiers) if (resources[tier]) tiersByResource.get(resources[tier]).push(tier);
   const sizeAt = (item, tier) => item.size * (tierRatio[tier] ?? 1);
   const emit = (type, time, details = {}) => onEvent({ type, time, resourceId, ...details });
   const accessible = (item, now) => !!item && item.available && item.ready
@@ -1015,19 +1018,23 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     },
     snapshot() {
       let inputPages = 0, outputPages = 0;
-      for (const target of new Set(Object.values(resources))) {
+      const reserved = Object.fromEntries(tiers.map(tier => [tier, 0]));
+      for (const target of uniqueResources) {
+        const targetTiers = tiersByResource.get(target) || [];
         for (const item of target.blocks) {
-          if (item._contentResource !== resourceId) continue;
-          if (item.output) outputPages++;
-          else inputPages++;
+          if (item._contentResource === resourceId) {
+            if (item.output) outputPages++;
+            else inputPages++;
+          }
+          if (finiteCapacity && !item.ready && item.transferLocked) {
+            for (const tier of targetTiers) reserved[tier] += sizeAt(item, tier);
+          }
         }
       }
       const value = { hbmBytes: pool.used, hbmCapacityBytes: pool.cap, inputPages, outputPages, deduplicatedPages };
       if (finiteCapacity) {
         value.tiers = Object.fromEntries(tiers.filter(tier => resources[tier]).map(tier => [tier, {
-          used: resources[tier].used, capacity: resources[tier].cap,
-          reserved: resources[tier].blocks.filter(item => !item.ready && item.transferLocked)
-            .reduce((sum, item) => sum + sizeAt(item, tier), 0),
+          used: resources[tier].used, capacity: resources[tier].cap, reserved: reserved[tier],
         }]));
         for (const tier of tiers) {
           value[`${tier}Bytes`] = resources[tier]?.used || 0;
