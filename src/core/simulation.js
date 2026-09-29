@@ -1822,19 +1822,19 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
   let curWave = inst.curWave;   // 执行中的波 {members:[{q,chunk}], endT}
   let prepWave = inst.prepWave; // 筹备中的波 {members:[{q,chunk}]}(等待成员 L3 拉取完成)
 
-  // unified decode 页位置缓存(2026-09-28 perf): 原实现每步(2ms)对每个 decode 请求逐页全扫
-  // (≈3000 页/请求), 占 replay 墙钟 ~62%。kvHbm 只依赖 ①页集合(prefixBlkIds/ownBlkIds)
-  // ②页所在 HBM 池的增删(epoch; 换 id/逐出/去重均经 add/remove) ③输出页 token 数(只由
-  // cache.output 按 _outAllocTok 改写)——以此为键缓存, 未变则复用, 结果逐位一致。
-  // 去掉逐步 page.lastTouch = now: decode 页 refcount≥1 不入淘汰候选(ensureSpace 只取
-  // refcount 0), 而 refcount 归零只经 release/handoff.cancel, 二者都会写 lastTouch=当时,
-  // 覆盖掉 decode 期的任何刷新 ⇒ 对淘汰顺序无可观测影响。不变式断言在缓存重建时执行。
+  // unified decode 页位置缓存(2026-09-28 perf): 活跃请求持有 refcount, 其页不会被其它
+  // 请求淘汰或迁移。仅所属 pool 或页集合变化时重建；同一输出页内的 token 增长直接累加
+  // KV 字节，避免每 token 对全部输入页重扫。重建时仍校验页存在、ready 且被引用。
+  // release/handoff.cancel 会在 refcount 归零时写最终 lastTouch，故无需 decode 期逐页刷新。
   function refreshUnifiedLocation(q) {
     const pool = cacheResource.pools.hbm, cached = q._kvLoc;
-    if (cached && cached.pool === pool && cached.epoch === pool.epoch
+    const outTok = q._outAllocTok || 0;
+    if (cached && cached.pool === pool
       && cached.prefix === q.prefixBlkIds && cached.prefixLen === q.prefixBlkIds.length
       && cached.own === q.ownBlkIds && cached.ownLen === q.ownBlkIds.length
-      && cached.outTok === q._outAllocTok) {
+      && outTok >= cached.outTok) {
+      cached.kvHbm += (outTok - cached.outTok) * kvPerTok;
+      cached.outTok = outTok;
       q.kvHbm = cached.kvHbm; q.kvDram = 0; q.kvSsd = 0;
       stats.hbmAcc += cached.pages;
       return;
@@ -1849,8 +1849,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
         pages++;
       }
     }
-    q._kvLoc = { pool, epoch: pool.epoch, prefix: q.prefixBlkIds, prefixLen: q.prefixBlkIds.length,
-      own: q.ownBlkIds, ownLen: q.ownBlkIds.length, outTok: q._outAllocTok, kvHbm, pages };
+    q._kvLoc = { pool, prefix: q.prefixBlkIds, prefixLen: q.prefixBlkIds.length,
+      own: q.ownBlkIds, ownLen: q.ownBlkIds.length, outTok, kvHbm, pages };
     q.kvHbm = kvHbm; q.kvDram = 0; q.kvSsd = 0;
     stats.hbmAcc += pages;
   }
