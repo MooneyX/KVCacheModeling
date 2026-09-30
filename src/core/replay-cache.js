@@ -459,8 +459,11 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (target.used + bytes <= target.cap) return 'admitted';
     const state = evictionState(target);
     if (state.noCandidates) return 'wait';
-    const promised = () => [...transfers].reduce((sum, record) => sum
-      + (record.move && record.fromPool === target ? sizeAt(record.source, tier) : 0), 0);
+    let promisedBytes = 0;
+    for (const record of transfers) {
+      if (record.move && record.fromPool === target) promisedBytes += sizeAt(record.source, tier);
+    }
+    if (target.used - promisedBytes + bytes <= target.cap) return 'wait';
     const candidates = [];
     let hasCandidate = false;
     for (const item of target.blocks) {
@@ -475,10 +478,13 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     candidates.sort((a, b) => (a.lastTouch || 0) - (b.lastTouch || 0) || String(a.id).localeCompare(String(b.id)));
     for (const item of candidates) {
       if (target.used + bytes <= target.cap) return 'admitted';
-      if (target.used - promised() + bytes <= target.cap) return 'wait';
+      if (target.used - promisedBytes + bytes <= target.cap) return 'wait';
       const next = tiers[tiers.indexOf(tier) + 1];
       const moved = next && transfer(item, tier, next, now, { move: true });
-      if (moved) emit('evict', now, { key: item.id, from: tier, to: next, bytes: sizeAt(item, tier) });
+      if (moved) {
+        promisedBytes += sizeAt(item, tier);
+        emit('evict', now, { key: item.id, from: tier, to: next, bytes: sizeAt(item, tier) });
+      }
       else {
         remove(tier, item.id);
         emit('drop', now, { key: item.id, tier, bytes: sizeAt(item, tier) });
