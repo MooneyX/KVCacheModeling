@@ -529,9 +529,10 @@ export function orderReplaySessions(entries, orderSeed = 1) {
 /** @type {Readonly<import('../contracts/replay').ReplayRunLimits>} */
 export const DEFAULT_REPLAY_RUN_LIMITS = Object.freeze({
   maxSessions: 10_000,
-  maxRequests: 20_000,
-  maxEvents: 40_000,
-  maxBlockReferences: 2_000_000,
+  maxRequests: 1_000_000,
+  maxEvents: 1_000_000,
+  // Covers one complete cycle of the shipped 338M-reference full bundle.
+  maxBlockReferences: 400_000_000,
   maxWallTimeMs: 1_200_000,
   maxResultBytes: 32 * 1024 * 1024,
 });
