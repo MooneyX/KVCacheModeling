@@ -1,7 +1,7 @@
 import { state } from './state.js';
 import { REPLAY_SWEEP_PARAMETERS } from '../application/sweep.js';
 
-const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const parameterIds = ['replayQps', 'replaySeed', 'replayDuration', 'replayWarmup', 'replayDrain'];
 let bundle = null;
 let fileSummary = null;
@@ -171,7 +171,7 @@ async function selectFile() {
   element('replayFileInfo').textContent = `${file.name} · ${file.size.toLocaleString()} 字节`;
   try {
     if (files.length !== 1 || !/\.json$/i.test(file.name)) throw new Error('只接受一个 .json bundle 文件。');
-    if (file.size > MAX_FILE_BYTES) throw new Error('文件超过 8 MiB 读取上限；请选择小型 bundle。');
+    if (file.size > MAX_FILE_BYTES) throw new Error('文件超过 100 MiB 读取上限；请选择较小的 bundle。');
     reading = true;
     updateRunControls();
     element('replayStatus').textContent = '正在读取并检查 bundle…';

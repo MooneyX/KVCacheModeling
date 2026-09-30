@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync } from 'node:fs';
+import { closeSync, ftruncateSync, openSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { baseControls } from '../fixtures/scenarios.mjs';
 import { visualizationCases } from '../fixtures/replay-visualization.mjs';
@@ -701,7 +701,7 @@ test('same filename changes and identical reruns bypass cache while edits retain
   expect(errors).toEqual([]);
 });
 
-test('upload validation rejects malformed, wrong-shape, invalid UTF-8 and oversized files before submission', async ({ page }) => {
+test('upload validation rejects malformed, wrong-shape, invalid UTF-8 and oversized files before submission', async ({ page }, testInfo) => {
   const { errors, posts } = await start(page);
   await upload(page);
   const { result: previous } = await run(page);
@@ -712,16 +712,21 @@ test('upload validation rejects malformed, wrong-shape, invalid UTF-8 and oversi
     window.replayFileReads = 0;
     File.prototype.arrayBuffer = function () { window.replayFileReads++; return original.call(this); };
   });
+  const oversized = testInfo.outputPath('large.json');
+  const descriptor = openSync(oversized, 'w');
+  ftruncateSync(descriptor, 100 * 1024 * 1024 + 1);
+  closeSync(descriptor);
   const cases = [
     ['broken.json', Buffer.from('{'), /有效的 JSON/],
     ['report.json', Buffer.from('{"stats":{}}'), /bundle v1/],
     ['trace.jsonl', Buffer.from('{}'), /一个 .json/],
     ['encoding.json', Buffer.from([0xff, 0xfe]), /读取失败/],
-    ['large.json', Buffer.alloc(8 * 1024 * 1024 + 1, 32), /8 MiB/],
+    ['large.json', oversized, /100 MiB/],
   ];
-  for (const [name, buffer, error] of cases) {
+  for (const [name, input, error] of cases) {
     const before = await page.evaluate(() => window.replayFileReads);
-    await page.locator('#replayFile').setInputFiles({ name, mimeType: 'application/json', buffer });
+    await page.locator('#replayFile').setInputFiles(typeof input === 'string'
+      ? input : { name, mimeType: 'application/json', buffer: input });
     await expect(page.locator('#replayStatus')).toContainText(error);
     await expect(page.locator(runButton)).toBeDisabled();
     await expect(page.locator('#replayDownload')).toBeEnabled();

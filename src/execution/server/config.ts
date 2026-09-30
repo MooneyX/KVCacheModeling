@@ -25,7 +25,7 @@ export function serverConfig() {
     maxTasks: integer('SIM_MAX_TASKS', 200),
     maxJobs: integer('SIM_MAX_BATCH_JOBS', 2000),
     maxRequests: integer('SIM_MAX_REQUESTS', 100_000),
-    bodyBytes: integer('SIM_BODY_LIMIT_BYTES', 8 * 1024 * 1024),
+    bodyBytes: integer('SIM_BODY_LIMIT_BYTES', 110 * 1024 * 1024),
     resultBytes: integer('SIM_RESULT_LIMIT_BYTES', 64 * 1024 * 1024),
     retentionMs: integer('SIM_RETENTION_MS', 24 * 60 * 60_000),
   };

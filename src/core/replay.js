@@ -8,7 +8,7 @@ import { createReplayRequest } from './requests.js';
 
 /** @type {Readonly<ReplayLimits>} */
 export const DEFAULT_REPLAY_LIMITS = Object.freeze({
-  maxDecompressedBytes: 32 * 1024 * 1024,
+  maxDecompressedBytes: 100 * 1024 * 1024,
   maxSessions: 10_000,
   maxRequests: 1_000_000,
   maxRuns: 2_000_000,
