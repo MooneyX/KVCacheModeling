@@ -2048,7 +2048,8 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
       dramIntegral += (now - resourceTime) * previousDram;
       ssdIntegral += (now - resourceTime) * previousSsd;
       resourceTime = now;
-      if (step >= 2_000_000) throw new RangeError('U2 acceptance step resource limit exceeded');
+      // 长窗口 Replay 在持续繁忙时会合法地超过 200 万个 2ms 步；由 simCap、调度不变量和
+      // Replay 墙钟预算限制资源消耗，不能用与仿真窗口无关的固定总步数提前终止。
       for (const target of cacheResources) target.pageCache.advance(now);
       if (pdReal) settlePdTransfers();
       for (const target of instances) {
