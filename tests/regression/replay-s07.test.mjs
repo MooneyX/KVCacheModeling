@@ -548,6 +548,27 @@ test('U3 cache: running references, pinned pages and transfer locks are never vi
   }
 });
 
+test('U3 cache: full referenced pool scans for eviction candidates only until eligibility changes', () => {
+  const h = finiteHarness(64), active = contentRequest([['active-candidate-cache', 64]]);
+  assert.equal(h.cache.place(active, 0).status, 'admitted');
+  computeInput(h, active, 1);
+  const blocks = h.pool.blocks;
+  let scans = 0;
+  h.pool.blocks = new Proxy(blocks, { get(target, key, receiver) {
+    if (key === Symbol.iterator) return function* iterator() { scans++; yield* target; };
+    return Reflect.get(target, key, receiver);
+  } });
+  const waiting = contentRequest([['waiting-candidate-cache', 64]]);
+  assert.equal(h.cache.place(waiting, 1).status, 'wait');
+  assert.equal(h.cache.place(waiting, 1.5).status, 'wait');
+  assert.equal(scans, 1);
+  h.cache.release(active, 2);
+  assert.equal(h.cache.place(waiting, 2).status, 'wait');
+  assert.equal(scans, 2);
+  h.cache.advance(3);
+  assert.equal(h.cache.place(waiting, 3).status, 'admitted');
+});
+
 test('U3 cache: eviction reserves the destination but retains the locked source until completion', () => {
   const h = finiteHarness(64), req = contentRequest([['cached', 64]]);
   warmTier(h, req, 'hbm');

@@ -2,6 +2,26 @@ import { ReplayValidationError } from './replay.js';
 import { validatePhysicalBlockSize } from './requests.js';
 
 const cacheContexts = new WeakMap();
+const poolEvictionStates = new WeakMap();
+
+function evictionState(pool) {
+  let state = poolEvictionStates.get(pool);
+  if (!state) {
+    state = { epoch: pool.epoch, noCandidates: false };
+    poolEvictionStates.set(pool, state);
+  } else if (state.epoch !== pool.epoch) {
+    state.epoch = pool.epoch;
+    state.noCandidates = false;
+  }
+  return state;
+}
+
+function invalidateEviction(pool) {
+  if (!pool) return;
+  const state = evictionState(pool);
+  state.epoch = pool.epoch;
+  state.noCandidates = false;
+}
 
 // Bundle logical blocks stay at 64 tokens. Ordered parts preserve path, boundary and valid length;
 // different pathIds never imply partial sharing. Input/output tails round up independently,
@@ -28,7 +48,11 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0, readinessVersion = 0;
   const tiers = ['hbm', 'dram', 'ssd'];
   function markReady(item) {
-    if (!item.ready) { item.ready = true; readinessVersion++; }
+    if (!item.ready) {
+      item.ready = true;
+      readinessVersion++;
+      invalidateEviction(resources[item.tier]);
+    }
   }
   const uniqueResources = [...new Set(Object.values(resources))];
   const tiersByResource = new Map(uniqueResources.map(target => [target, []]));
@@ -55,12 +79,14 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     rawAdd(tier, item);
     if (item._contentResource === resourceId) item.output ? pageCounts.outputPages++ : pageCounts.inputPages++;
     syncPageEpochs();
+    invalidateEviction(resources[tier]);
   };
   const remove = (tier, id) => {
     const item = resources[tier]?.blockIndex[id];
     const removed = rawRemove(tier, id);
     if (item?._contentResource === resourceId) item.output ? pageCounts.outputPages-- : pageCounts.inputPages--;
     syncPageEpochs();
+    invalidateEviction(resources[tier]);
     return removed ?? item;
   };
   const sizeAt = (item, tier) => item.size * (tierRatio[tier] ?? 1);
@@ -78,7 +104,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const wasLocked = !!item.transferLocked;
     item._cacheLocks = Math.max(0, (item._cacheLocks || 0) - 1);
     item.transferLocked = item._cacheLocks > 0 || !!item._cacheWasLocked;
-    if (wasLocked && !item.transferLocked) activeCacheLocks--;
+    if (wasLocked && !item.transferLocked) {
+      activeCacheLocks--;
+      invalidateEviction(resources[item.tier]);
+    }
   };
   const residentCount = () => resourceCount ? resourceCount()
     : [...new Set(Object.values(resources))].reduce((n, p) => n + p.blocks.length, 0);
@@ -369,11 +398,22 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const target = resources[tier];
     if (!target || bytes > target.cap) return 'infeasible';
     if (target.used + bytes <= target.cap) return 'admitted';
+    const state = evictionState(target);
+    if (state.noCandidates) return 'wait';
     const promised = () => [...transfers].reduce((sum, record) => sum
       + (record.move && record.fromPool === target ? sizeAt(record.source, tier) : 0), 0);
-    const candidates = target.blocks.filter(item => item.available && item.ready && !item.refcount
-      && !item.pinned && !item.transferLocked && !protectedPages.has(item))
-      .sort((a, b) => (a.lastTouch || 0) - (b.lastTouch || 0) || String(a.id).localeCompare(String(b.id)));
+    const candidates = [];
+    let hasCandidate = false;
+    for (const item of target.blocks) {
+      if (!item.available || !item.ready || item.refcount || item.pinned || item.transferLocked) continue;
+      hasCandidate = true;
+      if (!protectedPages.has(item)) candidates.push(item);
+    }
+    if (!hasCandidate) {
+      state.noCandidates = true;
+      return 'wait';
+    }
+    candidates.sort((a, b) => (a.lastTouch || 0) - (b.lastTouch || 0) || String(a.id).localeCompare(String(b.id)));
     for (const item of candidates) {
       if (target.used + bytes <= target.cap) return 'admitted';
       if (target.used - promised() + bytes <= target.cap) return 'wait';
@@ -786,6 +826,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       cancel(time) {
         for (const { item, created } of reserved) {
           unlock(item); item.refcount--; item.lastTouch = time;
+          if (item.refcount === 0) invalidateEviction(resources[item.tier]);
           if (created && item.refcount === 0) remove('hbm', item.id);
         }
         incomingHandoffs.delete(req);
@@ -1071,6 +1112,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
         if (!item || item.refcount < 1) throw new Error('Replay cache invariant: invalid running reference');
         item.refcount--;
         item.lastTouch = now;
+        if (item.refcount === 0) invalidateEviction(resources[item.tier]);
         if (reason !== null && !item._published && item.refcount === 0) remove('hbm', id);
       }
       state.released = true;
