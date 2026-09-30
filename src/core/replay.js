@@ -533,7 +533,7 @@ export const DEFAULT_REPLAY_RUN_LIMITS = Object.freeze({
   maxEvents: 1_000_000,
   // Covers one complete cycle of the shipped 338M-reference full bundle.
   maxBlockReferences: 400_000_000,
-  maxWallTimeMs: 1_200_000,
+  maxWallTimeMs: 3_600_000,
   maxResultBytes: 32 * 1024 * 1024,
 });
 
