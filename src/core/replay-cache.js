@@ -17,6 +17,12 @@ function planState(pool) {
   return state;
 }
 
+function syncPlanEpoch(pool) {
+  if (!pool) return;
+  const state = poolPlanStates.get(pool);
+  if (state) state.epoch = pool.epoch;
+}
+
 function invalidatePlans(pool) {
   if (!pool) return;
   const state = planState(pool);
@@ -72,7 +78,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       item.ready = true;
       readinessVersion++;
       invalidateEviction(resources[item.tier]);
-      invalidatePlans(resources[item.tier]);
+      if (item._published) invalidatePlans(resources[item.tier]);
     }
   }
   const uniqueResources = [...new Set(Object.values(resources))];
@@ -101,7 +107,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (item._contentResource === resourceId) item.output ? pageCounts.outputPages++ : pageCounts.inputPages++;
     syncPageEpochs();
     invalidateEviction(resources[tier]);
-    invalidatePlans(resources[tier]);
+    if (item._published && item.ready) invalidatePlans(resources[tier]);
+    else syncPlanEpoch(resources[tier]);
   };
   const remove = (tier, id) => {
     const item = resources[tier]?.blockIndex[id];
@@ -198,8 +205,8 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const count = Math.ceil(req.inputLen / blockSize), slots = [];
     if (count * blockBytes > pool.cap) return { response: { status: 'infeasible' } };
     checkLimit(count);
-    const response = result(0, 0);
-    let matching = true, missing = 0, validUntil = Infinity;
+    const response = result(0, 0), hitSlots = [], lowerSlots = [];
+    let matching = true, missing = 0, missPages = 0, validUntil = Infinity;
     for (const description of requestPages(req)) {
       const hbmItem = pool.blockIndex[description.key];
       let tier = null, item = null;
@@ -214,6 +221,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       if ((hbmItem?.arriveAt ?? 0) > now) validUntil = Math.min(validUntil, hbmItem.arriveAt);
       const slot = { ...description, tier, hit: !!item, version: item?.version ?? 0 };
       slots.push(slot);
+      if (slot.hit) {
+        hitSlots.push(slot);
+        if (tier !== 'hbm') lowerSlots.push(slot);
+      } else missPages++;
       if (!ready(hbmItem, now)) missing++;
       response.inputTokens += slot.tokens;
       if (tier) response[`hitL${tiers.indexOf(tier) + 1}Tokens`] += slot.tokens;
@@ -221,7 +232,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
     if (response.inputTokens !== req.inputLen) throw new ReplayValidationError('replay.cache', 'content length does not match input length');
     if (pool.used + missing * blockBytes > pool.cap) response.status = 'wait';
-    const planned = { slots, response };
+    const planned = { slots, response, hitSlots, lowerSlots, missPages };
     if (response.status === 'wait') waitingPlans.set(req, { content: req.inputContent, inputLen: req.inputLen,
       createdAt: now, validUntil, stamp: planStamp(), planned });
     else waitingPlans.delete(req);
@@ -637,12 +648,14 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const restoredPages = Math.ceil(Math.max(0, Math.floor(req.tokensGen || 0)) / blockSize);
     if ((planned.slots.length + restoredPages) * blockBytes > pool.cap)
       return { response: { status: 'infeasible' }, planned };
-    const lower = planned.slots.filter(slot => slot.hit && slot.tier !== 'hbm');
+    if (planned.response.status === 'wait' && evictionState(pool).noCandidates)
+      return { response: { status: 'wait' }, planned };
+    let lower = planned.lowerSlots || planned.slots.filter(slot => slot.hit && slot.tier !== 'hbm');
     if (!lower.length) return { response: { status: 'admitted' }, planned };
     if (!canSchedule(now)) return { response: { status: 'wait' }, planned };
     const normalized = { type: policy.type || 'none', fixedSeconds: Math.max(0, policy.fixedSeconds || 0),
       timeoutSeconds: Math.max(0, policy.timeoutSeconds || 0), coalesce: !!policy.coalesce };
-    if (normalized.type === 'race') lower.reverse();
+    if (normalized.type === 'race') lower = [...lower].reverse();
     const groupKey = JSON.stringify([resourceId, lower.map(slot => [slot.position, slot.tokens, slot.key, slot.version, slot.tier]),
       normalized.coalesce ? null : sequence++]);
     let pull = pulls.get(groupKey);
@@ -650,9 +663,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (normalized.coalesce) for (const slot of lower) {
       if (!reused.has(slot.position) && pool.blockIndex[slot.key]) reused.set(slot.position, pool.blockIndex[slot.key]);
     }
-    const protectedPages = new Set([...planned.slots.map(slot => resources[slot.tier]?.blockIndex[slot.key]), ...reused.values()].filter(Boolean));
-    const needed = planned.slots.filter(slot => !(slot.hit && (slot.tier === 'hbm'
-      ? pool.blockIndex[slot.key] : reused.has(slot.position)))).length + restoredPages;
+    const protectedPages = new Set([...(planned.hitSlots || planned.slots.filter(slot => slot.hit))
+      .map(slot => resources[slot.tier]?.blockIndex[slot.key]), ...reused.values()].filter(Boolean));
+    const needed = (planned.missPages ?? planned.slots.filter(slot => !slot.hit).length)
+      + lower.reduce((count, slot) => count + Number(!reused.has(slot.position)), 0) + restoredPages;
     const space = ensureSpace('hbm', needed * blockBytes, now, protectedPages);
     if (space !== 'admitted') return { response: { status: space }, planned };
     const intermediates = lower.filter(slot => slot.tier === 'ssd' && resources.dram
@@ -768,9 +782,13 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (!prefetches.has(req)) {
       initial ||= plan(req, now);
       if (!initial.slots) return initial.response;
-      const protectedPages = new Set(initial.slots.filter(slot => slot.hit)
-        .map(slot => resources[slot.tier]?.blockIndex[slot.key]).filter(Boolean));
-      const needed = initial.slots.filter(slot => !slot.hit || !pool.blockIndex[slot.key]).length + Math.ceil(restored / blockSize);
+      if (initial.response.status === 'wait' && evictionState(pool).noCandidates) return { status: 'wait' };
+      const hitSlots = initial.hitSlots || initial.slots.filter(slot => slot.hit);
+      const lowerSlots = initial.lowerSlots || hitSlots.filter(slot => slot.tier !== 'hbm');
+      const protectedPages = new Set(hitSlots.map(slot => resources[slot.tier]?.blockIndex[slot.key]).filter(Boolean));
+      const needed = (initial.missPages ?? initial.slots.filter(slot => !slot.hit).length)
+        + lowerSlots.reduce((count, slot) => count + Number(!pool.blockIndex[slot.key]), 0)
+        + Math.ceil(restored / blockSize);
       const status = ensureSpace('hbm', needed * blockBytes, now, protectedPages);
       if (status !== 'admitted') return { status };
       preparePrefetch(req, now, { type: 'none' }, initial);
