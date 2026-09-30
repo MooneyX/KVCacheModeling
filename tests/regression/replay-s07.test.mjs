@@ -548,6 +548,26 @@ test('U3 cache: running references, pinned pages and transfer locks are never vi
   }
 });
 
+test('U3 cache: capacity-wait plans are reused until tier visibility changes', () => {
+  const h = finiteHarness(64), active = contentRequest([['active-plan-cache', 64]]);
+  assert.equal(h.cache.place(active, 0).status, 'admitted');
+  computeInput(h, active, 1);
+  const waiting = contentRequest([['waiting-plan-cache', 64]]), index = h.pools.dram.blockIndex;
+  let reads = 0;
+  h.pools.dram.blockIndex = new Proxy(index, { get(target, key, receiver) {
+    reads++;
+    return Reflect.get(target, key, receiver);
+  } });
+  assert.equal(h.cache.place(waiting, 1).status, 'wait');
+  const firstReads = reads;
+  assert.ok(firstReads > 0);
+  assert.equal(h.cache.place(waiting, 1.5).status, 'wait');
+  assert.equal(reads, firstReads);
+  warmTier(h, waiting, 'dram');
+  assert.equal(h.cache.place(waiting, 2).status, 'wait');
+  assert.ok(reads > firstReads);
+});
+
 test('U3 cache: full referenced pool scans for eviction candidates only until eligibility changes', () => {
   const h = finiteHarness(64), active = contentRequest([['active-candidate-cache', 64]]);
   assert.equal(h.cache.place(active, 0).status, 'admitted');

@@ -3,6 +3,26 @@ import { validatePhysicalBlockSize } from './requests.js';
 
 const cacheContexts = new WeakMap();
 const poolEvictionStates = new WeakMap();
+const poolPlanStates = new WeakMap();
+
+function planState(pool) {
+  let state = poolPlanStates.get(pool);
+  if (!state) {
+    state = { epoch: pool.epoch, generation: 0 };
+    poolPlanStates.set(pool, state);
+  } else if (state.epoch !== pool.epoch) {
+    state.epoch = pool.epoch;
+    state.generation++;
+  }
+  return state;
+}
+
+function invalidatePlans(pool) {
+  if (!pool) return;
+  const state = planState(pool);
+  state.epoch = pool.epoch;
+  state.generation++;
+}
 
 function evictionState(pool) {
   let state = poolEvictionStates.get(pool);
@@ -41,7 +61,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   catch (error) { throw new ReplayValidationError('replay.cache.blockSize', error.message); }
   pool ??= pools.hbm;
   const resources = { ...pools, hbm: pool };
-  const states = new WeakMap(), pageDescriptions = new WeakMap();
+  const states = new WeakMap(), pageDescriptions = new WeakMap(), waitingPlans = new WeakMap();
   const incomingHandoffs = new WeakMap(), outgoingHandoffs = new WeakMap(), handoffs = new Set();
   const prefetches = new WeakMap(), pulls = new Map(), transfers = new Set();
   const bindings = new Map(), fetchInitialized = new WeakSet();
@@ -52,6 +72,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       item.ready = true;
       readinessVersion++;
       invalidateEviction(resources[item.tier]);
+      invalidatePlans(resources[item.tier]);
     }
   }
   const uniqueResources = [...new Set(Object.values(resources))];
@@ -80,6 +101,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (item._contentResource === resourceId) item.output ? pageCounts.outputPages++ : pageCounts.inputPages++;
     syncPageEpochs();
     invalidateEviction(resources[tier]);
+    invalidatePlans(resources[tier]);
   };
   const remove = (tier, id) => {
     const item = resources[tier]?.blockIndex[id];
@@ -87,6 +109,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (item?._contentResource === resourceId) item.output ? pageCounts.outputPages-- : pageCounts.inputPages--;
     syncPageEpochs();
     invalidateEviction(resources[tier]);
+    invalidatePlans(resources[tier]);
     return removed ?? item;
   };
   const sizeAt = (item, tier) => item.size * (tierRatio[tier] ?? 1);
@@ -159,22 +182,36 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     return descriptions;
   }
 
+  function planStamp() {
+    return uniqueResources.map(target => [target, planState(target).generation, target.cap]);
+  }
+
+  function currentPlan(entry, req, now) {
+    return entry?.content === req.inputContent && entry.inputLen === req.inputLen
+      && now >= entry.createdAt && now < entry.validUntil
+      && entry.stamp.every(([target, generation, cap]) => planState(target).generation === generation && target.cap === cap);
+  }
+
   function finitePlan(req, now) {
+    const cached = waitingPlans.get(req);
+    if (currentPlan(cached, req, now)) return cached.planned;
     const count = Math.ceil(req.inputLen / blockSize), slots = [];
     if (count * blockBytes > pool.cap) return { response: { status: 'infeasible' } };
     checkLimit(count);
     const response = result(0, 0);
-    let matching = true, missing = 0;
+    let matching = true, missing = 0, validUntil = Infinity;
     for (const description of requestPages(req)) {
       const hbmItem = pool.blockIndex[description.key];
       let tier = null, item = null;
       if (matching) {
         for (const candidate of tiers) {
           const found = candidate === 'hbm' ? hbmItem : resources[candidate]?.blockIndex[description.key];
+          if ((found?.arriveAt ?? 0) > now) validUntil = Math.min(validUntil, found.arriveAt);
           if (accessible(found, now)) { tier = candidate; item = found; break; }
         }
       }
       if (!item) matching = false;
+      if ((hbmItem?.arriveAt ?? 0) > now) validUntil = Math.min(validUntil, hbmItem.arriveAt);
       const slot = { ...description, tier, hit: !!item, version: item?.version ?? 0 };
       slots.push(slot);
       if (!ready(hbmItem, now)) missing++;
@@ -184,7 +221,11 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
     if (response.inputTokens !== req.inputLen) throw new ReplayValidationError('replay.cache', 'content length does not match input length');
     if (pool.used + missing * blockBytes > pool.cap) response.status = 'wait';
-    return { slots, response };
+    const planned = { slots, response };
+    if (response.status === 'wait') waitingPlans.set(req, { content: req.inputContent, inputLen: req.inputLen,
+      createdAt: now, validUntil, stamp: planStamp(), planned });
+    else waitingPlans.delete(req);
+    return planned;
   }
 
   function plan(req, now) {
@@ -220,6 +261,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const key = item.canonicalKey;
     const existing = key && pool.blockIndex[key];
     markReady(item);
+    if (!item._published) invalidatePlans(pool);
     item._published = true;
     item.lastTouch = now;
     if (!key) return id;
@@ -332,7 +374,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     transfers.delete(record);
     unlock(record.source);
     unlock(record.target);
-    if (record.move) record.source._moving = false;
+    if (record.move) {
+      record.source._moving = false;
+      invalidatePlans(record.fromPool);
+    }
     record.cancelled = cancelled;
     record.completed = !cancelled;
     if (cancelled) {
@@ -386,7 +431,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (link.shared) link.shared.busyUntil = end;
     target.arriveAt = end;
     lock(item); lock(target);
-    if (move) item._moving = true;
+    if (move) {
+      item._moving = true;
+      invalidatePlans(fromPool);
+    }
     const record = { id: transferSequence++, from, to, fromPool, toPool, source: item, target,
       reservation: sizeAt(target, to), queueStart, start, end, bytes, accounted: 0, move, prefetch, bandwidth, link };
     transfers.add(record);
@@ -626,6 +674,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     pull.subscribers.add(subscription);
     for (const task of pull.tasks) if (!task.cancelled) task.subscribers.add(subscription);
     prefetches.set(req, subscription);
+    waitingPlans.delete(req);
     if (!fetchInitialized.has(req)) {
       req.fetchTime = lower.reduce((sum, slot) => {
         const fraction = slot.tokens / blockSize;
@@ -744,6 +793,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const response = { ...original, status: 'admitted' };
     const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], pendingEntries: new Set(), readinessVersion, released: false };
     states.set(req, state);
+    waitingPlans.delete(req);
     req.prefixBlkIds = []; req.ownBlkIds = [];
     for (let i = 0; i < slots.length; i++) {
       const slot = slots[i];
@@ -989,7 +1039,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     ensureSpace,
     lookup(req, now = 0) {
       const { slots, response } = plan(req, now);
-      return slots ? { ...response, slots } : response;
+      return slots ? { ...response, slots: slots.map(slot => ({ ...slot })) } : response;
     },
     place(req, now = 0, planned = null) {
       if (incomingHandoffs.has(req)) return { status: 'wait' };
