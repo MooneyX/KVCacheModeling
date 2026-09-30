@@ -143,11 +143,14 @@ export class TaskQueue {
         this.persist(task);
         child = fork(this.runnerPath, [], {
           execArgv: [`--max-old-space-size=${this.config.memoryMb}`],
-          stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+          stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
           env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, NODE_ENV: 'production' },
           serialization: 'json',
         });
       } catch (error) { this.finish(task, 'failed', String(error)); continue; }
+      let stderrTail = '';
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', chunk => { stderrTail = (stderrTail + chunk).slice(-16_384); });
       const timer = setTimeout(() => this.finish(task, 'failed', 'Task exceeded server time limit.'), this.config.timeoutMs);
       this.active.set(task.id, { child, timer });
       child.on('message', (message: { type: string; index?: number; result?: unknown; error?: string }) => {
@@ -168,10 +171,14 @@ export class TaskQueue {
         } catch (error) { this.finish(task, 'failed', error instanceof Error ? error.message : String(error)); }
       });
       child.on('error', error => this.finish(task, 'failed', error.message));
-      child.once('close', () => {
+      child.once('close', (code, signal) => {
         clearTimeout(timer);
         this.active.delete(task.id);
-        if (!terminalStatuses.includes(task.status)) this.finish(task, 'failed', 'Calculation process exited unexpectedly.');
+        if (!terminalStatuses.includes(task.status)) {
+          const exit = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`;
+          const detail = stderrTail.trim().slice(-800);
+          this.finish(task, 'failed', `Calculation process exited unexpectedly (${exit}).${detail ? ` ${detail}` : ''}`);
+        }
         this.pump();
       });
       try {

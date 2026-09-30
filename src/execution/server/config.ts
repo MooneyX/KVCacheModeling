@@ -21,7 +21,7 @@ export function serverConfig() {
     webDir: resolve(process.env.SIM_WEB_DIR || 'dist/web'),
     concurrency: integer('SIM_CONCURRENCY', Math.max(1, Math.min(2, availableParallelism() - 1)), 32),
     timeoutMs: integer('SIM_TASK_TIMEOUT_MS', 20 * 60_000),
-    memoryMb: integer('SIM_WORKER_MEMORY_MB', 1024),
+    memoryMb: integer('SIM_WORKER_MEMORY_MB', 4096),
     maxTasks: integer('SIM_MAX_TASKS', 200),
     maxJobs: integer('SIM_MAX_BATCH_JOBS', 2000),
     maxRequests: integer('SIM_MAX_REQUESTS', 100_000),
