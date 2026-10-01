@@ -123,6 +123,23 @@ test('U5 metrics: explicit terminal observations preserve zero-duration nulls wi
   assert.deepEqual(after.samples.coverage, [0, 4]);
 });
 
+test('U5 metrics: duplicate observations at one time preserve transient peaks and weighted buckets', () => {
+  const run = duplicate => {
+    const m = make({ finiteCapacity: true });
+    m.observe(0, { hbmBytes: 96, activeRequests: 2 });
+    m.observe(0, { hbmBytes: 32, activeRequests: 1 });
+    if (duplicate) m.observe(0, { hbmBytes: 32, activeRequests: 1 });
+    m.observe(2, { hbmBytes: 16 });
+    if (duplicate) m.observe(2, { hbmBytes: 16 });
+    return m.finish(4, {});
+  };
+  const expected = run(false), actual = run(true);
+  assert.deepEqual(actual, expected);
+  assert.equal(actual.samples.peak.hbmBytes, 96);
+  assert.ok(Math.abs(actual.samples.timeWeightedMean.hbmBytes - 24) < 1e-9);
+  assert.ok(Math.abs(actual.samples.timeWeightedMean.activeRequests - 1) < 1e-9);
+});
+
 test('U3 metrics: retries count events without repeating admission denominators or successful output', () => {
   const m = make({ finiteCapacity: true }), a = req(0, 1);
   m.arrive(a); m.admit(a, hit);

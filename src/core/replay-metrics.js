@@ -31,7 +31,7 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
   const counts = { planned: 0, arrived: 0, successful: 0, failed: 0, cancelled: 0, admitted: 0, launchedSessions: 0,
     plannedInputTokens: 0, plannedOutputTokens: 0, outputTokens: 0 };
   const admitted = new Set(), arrived = new Set(), terminal = new Set();
-  let observedAt = 0, gauges = emptyGauges();
+  let observedAt = 0, recordedAt = -Infinity, gauges = emptyGauges();
   const integral = emptyGauges(), peak = emptyGauges();
   const eventWindow = time => time < warmup ? 'warmup' : time < T ? 'measurement' : 'drain';
   function eachWindow(time, fn) { fn(windows.full); fn(windows[eventWindow(time)]); }
@@ -45,6 +45,11 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
   }
   function observe(time, state, recordState = true) {
     if (time < observedAt || time > hardCutoff + 1e-9) throw new Error('Replay metrics clock invariant violated');
+    if (recordState && time === recordedAt) {
+      let changed = false;
+      for (const key of GAUGES) if (Object.hasOwn(state, key) && state[key] !== gauges[key]) { changed = true; break; }
+      if (!changed) return;
+    }
     let cursor = observedAt;
     while (cursor < time) {
       const b = bucket(cursor);
@@ -62,9 +67,10 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
       cursor = end;
     }
     observedAt = time;
-    gauges = { ...gauges, ...state };
+    Object.assign(gauges, state);
     if (!recordState) return;
     const current = bucket(time);
+    recordedAt = time;
     for (const key of GAUGES) {
       peak[key] = Math.max(peak[key], gauges[key]);
       current.peak[key] = Math.max(current.peak[key], gauges[key]);
