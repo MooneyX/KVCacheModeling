@@ -69,6 +69,7 @@ function object(value: unknown, label: string): Record<string, unknown> {
 
 export function parseJob(input: unknown): SimulationJob {
   let data = object(input, 'Input');
+  let workloadDigest: string | undefined;
   if (data.workload !== undefined) {
     const workload = object(data.workload, 'workload');
     if (!['synthetic', 'replay'].includes(String(workload.source))) throw new Error('workload.source must be synthetic or replay.');
@@ -84,9 +85,7 @@ export function parseJob(input: unknown): SimulationJob {
         || typeof seed !== 'number' || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff
         || typeof simMaxTime !== 'number' || !Number.isFinite(simMaxTime) || simMaxTime < 0) throw new Error('Invalid Replay workload QPS, seed or drain.');
       if (replayOptions.arrivalModel !== 'closed' || replayOptions.superblocks !== false) throw new Error('Replay workload requires closed arrivals without superblocks.');
-      validateReplayOverride({ bundle: replay.bundle, options: replayOptions });
-      const digest = createHash('sha256').update(JSON.stringify(replay.bundle)).digest('hex');
-      if (digest !== summary.digest) throw new Error('Replay bundle digest does not match the imported configuration.');
+      workloadDigest = summary.digest;
       data = { ...data, overrides: { qps, seed, simMaxTime, ...supplied,
         replay: { ...replay, options: { ...replayOptions, ...object(replay.options ?? {}, 'replay.options') } },
       } };
@@ -125,7 +124,11 @@ export function parseJob(input: unknown): SimulationJob {
     throw new Error('Multiple instances cannot be combined with physical P/D separation.');
   }
   if ('replay' in overrides) {
-    overrides.replay = validateReplayOverride(overrides.replay);
+    const validatedReplay = validateReplayOverride(overrides.replay);
+    overrides.replay = validatedReplay;
+    if (workloadDigest !== undefined && createHash('sha256').update(JSON.stringify(validatedReplay.bundle)).digest('hex') !== workloadDigest) {
+      throw new Error('Replay bundle digest does not match the imported configuration.');
+    }
     if (mode !== 'dsl') throw new Error('Replay execution accepts DSL only.');
     for (const key of ['nreq', 'concurrency', 'inputLen', 'outputLen', 'lenDist', 'arrivalDist', 'multiTurn', 'prefixHit', 'prefixWarm', 'prefixWarmL2', 'singleBatch']) {
       if (key in overrides) throw new Error(`Replay does not support synthetic generation override: ${key}.`);

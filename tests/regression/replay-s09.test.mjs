@@ -63,6 +63,13 @@ test('S09: parseJob preserves replay for normalized and controls formats and rej
   assert.throws(() => library.parseJob({ ...controls, mode: 'other' }), /mode/);
 });
 
+test('S09: runtime revalidates a bundle modified after parsing the job', () => {
+  const { bundle } = JSON.parse(readFileSync(join(root, 'tests/fixtures/replay/runtime-prefix.json')));
+  const job = library.parseJob(normalized({ replay: { bundle, options: { durationSeconds: 1, warmupSeconds: 0 } } }));
+  bundle.sessions[0].req[0].in += 64;
+  assert.throws(() => library.executeJob(job), /blockRuns|expanded block count/);
+});
+
 test('U5: exported Replay configuration requires a matching bundle and restores workload options immutably', t => {
   const { bundle } = JSON.parse(readFileSync(join(root, 'tests/fixtures/replay/runtime-prefix.json')));
   const workload = { source: 'replay', bundleSummary: { digest: createHash('sha256').update(JSON.stringify(bundle)).digest('hex') },

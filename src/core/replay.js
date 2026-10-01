@@ -620,7 +620,11 @@ let replayRunSequence = 0;
  * @param {{qps: number, durationSeconds: number, seed: number, limits?: Partial<typeof DEFAULT_REPLAY_RUN_LIMITS>}} options
  */
 export function createReplayLauncher(bundle, options) {
-  const stats = validateReplayBundle(bundle);
+  return replayLauncher(bundle, options, validateReplayBundle(bundle));
+}
+
+/** @param {ReplayBundle} bundle @param {{qps: number, durationSeconds: number, seed: number, limits?: Partial<typeof DEFAULT_REPLAY_RUN_LIMITS>}} options @param {ReplayBundleStats} stats */
+function replayLauncher(bundle, options, stats) {
   const durationSeconds = positiveSeconds(options.durationSeconds, 'replay.durationSeconds');
   const qps = positiveSeconds(options.qps, 'replay.qps');
   const limits = replayRunLimits(options.limits);
@@ -669,8 +673,13 @@ export function createReplayLauncher(bundle, options) {
 
 /** @param {unknown} input @returns {import('../contracts/replay').ReplayOverride} */
 export function validateReplayOverride(input) {
+  return checkedReplayOverride(input).replay;
+}
+
+/** @param {unknown} input @returns {{replay: import('../contracts/replay').ReplayOverride, stats: ReplayBundleStats}} */
+function checkedReplayOverride(input) {
   const value = fields(input, ['bundle', 'options'], 'replay');
-  validateReplayBundle(value.bundle);
+  const stats = validateReplayBundle(value.bundle);
   budget(JSON.stringify(value.bundle).length, DEFAULT_REPLAY_LIMITS.maxDecompressedBytes, 'replay.bundle.bytes');
   const options = record(value.options, 'replay.options');
   const allowed = ['arrivalModel', 'durationSeconds', 'warmupSeconds', 'superblocks', 'limits'];
@@ -682,7 +691,7 @@ export function validateReplayOverride(input) {
   if (options.superblocks !== undefined && typeof options.superblocks !== 'boolean') invalid('replay.options.superblocks', 'expected boolean');
   if (options.superblocks === true) invalid('replay.options.superblocks', 'unsupported before logical-block equivalence validation');
   const limits = replayRunLimits(options.limits);
-  return { bundle: value.bundle, options: { arrivalModel: 'closed', durationSeconds, warmupSeconds, superblocks: false, limits } };
+  return { replay: { bundle: value.bundle, options: { arrivalModel: 'closed', durationSeconds, warmupSeconds, superblocks: false, limits } }, stats };
 }
 
 /**
@@ -691,8 +700,9 @@ export function validateReplayOverride(input) {
  * @param {{qps: number, seed: number, hooks?: Record<string, Function>}} config
  */
 export function createReplayRuntime(replay, config) {
-  const { bundle, options } = validateReplayOverride(replay);
-  const launcher = createReplayLauncher(bundle, { ...options, qps: config.qps, seed: config.seed });
+  const { replay: validated, stats } = checkedReplayOverride(replay);
+  const { bundle, options } = validated;
+  const launcher = replayLauncher(bundle, { ...options, qps: config.qps, seed: config.seed }, stats);
   const heap = new ReplayEventHeap(launcher.limits.maxEvents);
   const hooks = config.hooks || {};
   const templates = bundle.sessions.map(session => {
