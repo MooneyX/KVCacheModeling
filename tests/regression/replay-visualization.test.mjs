@@ -110,14 +110,13 @@ test('V2: infeasible failures have real terminal times, while cancelled and futu
   assert.ok(cutoff.incomplete.every(row => row.prefillEnd === null && row.completeTime === null));
 });
 
-test('V2: active sampling continues past 20000 points at 10ms and ends at the exact fractional cutoff', () => {
+test('V2: long active concurrency retains transitions and exact cutoff without redundant points', () => {
   const r = result('longActive'), series = r.concTimeline;
-  assert.ok(series.length > 20_000);
+  assert.ok(series.length < 100);
   assert.equal(r.simEnd, 205.831);
   assert.ok(series.some(point => point[0] > 201 && point[1] > 0));
-  for (let i = 1; i < series.length; i++) {
-    if (series[i - 1][0] < 0.13) continue;
-    assert.ok(series[i][0] - series[i - 1][0] <= 0.010000001);
+  for (let i = 1; i < series.length - 1; i++) {
+    assert.notDeepEqual(series[i].slice(1), series[i - 1].slice(1));
   }
   assert.equal(r.l2Series.length, 20_000);
   assert.equal(r.l3Series.length, 20_000);
@@ -125,9 +124,11 @@ test('V2: active sampling continues past 20000 points at 10ms and ends at the ex
   assert.equal(legacy.maxTimelineSamples, undefined);
   assert.equal(legacy.maxSeriesSamples, undefined);
   assert.equal(legacy.requestCoverage, 'all-arrived-requests');
-  assert.equal(legacy.concurrencySampling, 'periodic-with-idle-boundaries');
+  assert.equal(legacy.concurrencySampling, 'state-changes-with-bounded-decimation');
   assert.equal(legacy.concurrencySampleIntervalSeconds, 0.01);
   assert.deepEqual(legacy.concurrencyCoverage, [0, r.simEnd]);
+  assert.equal(legacy.concurrencyMaxSamples, 20_000);
+  assert.equal(legacy.concurrencyDecimations, 0);
   assert.equal(legacy.residentMaxSeriesSamples, 20_000);
   assert.equal(legacy.residentSampling, 'time-weighted-full-window-buckets');
   assert.deepEqual(legacy.residentCoverage, [0, r.simEnd]);

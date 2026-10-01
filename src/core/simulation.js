@@ -6,7 +6,7 @@ import { autoNameStrategy } from "./strategy.js";
 import { createReplayRuntime, ReplayValidationError } from "./replay.js";
 import { createReplayCache } from "./replay-cache.js";
 import { createHash } from "node:crypto";
-import { createReplayMetrics } from "./replay-metrics.js";
+import { createReplayMetrics, createReplayConcurrencySeries } from "./replay-metrics.js";
 
 export function runSimulation(params, strategy, overrides, strategyMode = "dsl") {
   return simulate(params, strategy, overrides, strategyMode, null);
@@ -1914,15 +1914,16 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     });
   }
 
-  function sampleReplayConcurrency(time) {
+  const concurrencySeries = replay ? createReplayConcurrencySeries() : null;
+  if (concurrencySeries) stats.concSamples = concurrencySeries.samples;
+  function sampleReplayConcurrency(time, terminal = false) {
     const point = [time, 0, 0, 0];
     for (const xi of instances) {
       point[1] += xi.decoding.length;
       point[2] += xi.prefilling.length;
       point[3] += xi.waitQueue.length + xi.prefillQ.length;
     }
-    if (stats.concSamples.at(-1)?.[0] === time) stats.concSamples[stats.concSamples.length - 1] = point;
-    else stats.concSamples.push(point);
+    concurrencySeries.add(point, terminal);
   }
 
   function settlePrefillWave() {
@@ -2926,7 +2927,7 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     }
   }
   let simEnd = Math.max(now, 1e-6);
-  if (replay) sampleReplayConcurrency(simEnd);
+  if (replay) sampleReplayConcurrency(simEnd, true);
   let truncated = !drained; // 未排空即结束 ⇒ 窗口截断（实际排水超上限；调大「仿真窗口上限」可跑完）
 
   // ---------- 指标 ----------
@@ -3240,8 +3241,9 @@ function simulate(params, strategy, overrides, strategyMode, acceptance) {
     Object.assign(result.replay.cache, cacheSnapshot());
     result.replay.samples.legacy = {
       requestCoverage: 'all-arrived-requests',
-      concurrencySampling: 'periodic-with-idle-boundaries', concurrencySampleIntervalSeconds: DT * 5,
+      concurrencySampling: 'state-changes-with-bounded-decimation', concurrencySampleIntervalSeconds: DT * 5,
       concurrencyCoverage: [stats.concSamples[0][0], stats.concSamples.at(-1)[0]],
+      concurrencyMaxSamples: concurrencySeries.maxSamples, concurrencyDecimations: concurrencySeries.decimations,
       completedTimelineSamples: timeline.length, incompleteTimelineSamples: incomplete.length,
       residentMaxSeriesSamples: 20_000, residentSampling: 'time-weighted-full-window-buckets',
       residentCoverage: [0, now], residentBucketWidthSeconds: residentWidth,

@@ -371,8 +371,11 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
 function drawBatchOccupancy(r, input) {
   const occ = r.concTimeline || [];
   const interval = r.replay?.samples.legacy.concurrencySampleIntervalSeconds ?? 0.01;
+  const sampling = r.replay?.samples.legacy.concurrencySampling === 'state-changes-with-bounded-decimation'
+    ? 'ms 检查并发变化，仅记录变化边界与结束点；超过点数上限时会稀疏化。'
+    : 'ms 定时采样，空闲跳步由边界点表示；非完整事件流。';
   setFormula('formulaBatchOcc', resultCaption(r, input) + '<br>活跃期约 ' + numberText(interval * 1000, 0) +
-    'ms 定时采样，空闲跳步由边界点表示；非完整事件流。排队深度 = 等准入 + 等 Prefill，不含 Decode 等待。');
+    sampling + '排队深度 = 等准入 + 等 Prefill，不含 Decode 等待。');
   const ch = initChart('chartBatchOcc');
   ch.setOption({
     tooltip: { trigger: 'axis' },

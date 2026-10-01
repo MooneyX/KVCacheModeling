@@ -412,7 +412,7 @@ test('V2: worker returns complete drawing arrays and rejects over-budget results
       assert.equal(result.concTimeline.at(-1)[0], result.simEnd);
       if (name === 'manySuccessful') assert.equal(result.timeline.length, 400);
       if (name === 'manyUnfinished') assert.equal(result.incomplete.length, 400);
-      if (name === 'longActive') assert.ok(result.concTimeline.length > 20_000);
+      if (name === 'longActive') assert.ok(result.concTimeline.length < 100);
     }
     for (const name of ['manySuccessful', 'longActive']) {
       const job = structuredClone(visualizationCases[name]);

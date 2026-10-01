@@ -205,3 +205,27 @@ export function createReplayMetrics({ durationSeconds: T, warmupSeconds: warmup,
     },
   };
 }
+
+export function createReplayConcurrencySeries(maxSamples = 20_000) {
+  if (!Number.isSafeInteger(maxSamples) || maxSamples < 4) throw new RangeError('maxSamples must be an integer >= 4');
+  const samples = [];
+  let decimations = 0;
+  return {
+    samples, maxSamples,
+    get decimations() { return decimations; },
+    add(point, terminal = false) {
+      const previous = samples.at(-1);
+      if (previous?.[0] === point[0]) { samples[samples.length - 1] = point; return; }
+      if (!terminal && previous && previous[1] === point[1] && previous[2] === point[2] && previous[3] === point[3]) return;
+      if (samples.length >= maxSamples) {
+        const reduced = [samples[0]];
+        for (let i = 1; i < samples.length - 1; i += 2) reduced.push(samples[i]);
+        reduced.push(samples.at(-1));
+        samples.length = 0;
+        for (const item of reduced) samples.push(item);
+        decimations++;
+      }
+      samples.push(point);
+    },
+  };
+}

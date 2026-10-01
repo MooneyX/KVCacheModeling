@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createReplayMetrics } from '../../src/core/replay-metrics.js';
+import { createReplayMetrics, createReplayConcurrencySeries } from '../../src/core/replay-metrics.js';
 import { DEFAULT_REPLAY_RUN_LIMITS, validateReplayBundle } from '../../src/core/replay.js';
 import { runSimulation } from '../../src/core/simulation.js';
 
@@ -138,6 +138,23 @@ test('U5 metrics: duplicate observations at one time preserve transient peaks an
   assert.equal(actual.samples.peak.hbmBytes, 96);
   assert.ok(Math.abs(actual.samples.timeWeightedMean.hbmBytes - 24) < 1e-9);
   assert.ok(Math.abs(actual.samples.timeWeightedMean.activeRequests - 1) < 1e-9);
+});
+
+test('U5 metrics: concurrency series bounds changing states while preserving coverage', () => {
+  const series = createReplayConcurrencySeries(20);
+  series.add([0, 0, 0, 0]);
+  series.add([0, 1, 0, 0]);
+  series.add([1, 1, 0, 0]);
+  assert.equal(series.samples.length, 1);
+  for (let time = 2; time < 100; time++) {
+    series.add([time, time % 2, 0, 0]);
+    assert.ok(series.samples.length <= 20);
+  }
+  series.add([100, 1, 0, 0], true);
+  assert.ok(series.decimations > 0);
+  assert.deepEqual(series.samples[0], [0, 1, 0, 0]);
+  assert.deepEqual(series.samples.at(-1), [100, 1, 0, 0]);
+  for (let i = 1; i < series.samples.length; i++) assert.ok(series.samples[i][0] > series.samples[i - 1][0]);
 });
 
 test('U3 metrics: retries count events without repeating admission denominators or successful output', () => {
