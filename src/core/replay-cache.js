@@ -70,7 +70,14 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   const states = new WeakMap(), pageDescriptions = new WeakMap(), waitingPlans = new WeakMap();
   const incomingHandoffs = new WeakMap(), outgoingHandoffs = new WeakMap(), handoffs = new Set();
   const prefetches = new WeakMap(), pulls = new Map(), transfers = new Set();
-  const bindings = new Map(), fetchInitialized = new WeakSet();
+  const bindings = new Map(), requestBindings = new WeakMap(), fetchInitialized = new WeakSet();
+  function bindInput(req, state, entry, item) {
+    const binding = { req, state, entry, item };
+    if (!bindings.has(item)) bindings.set(item, new Set());
+    bindings.get(item).add(binding);
+    if (!requestBindings.has(req)) requestBindings.set(req, new Set());
+    requestBindings.get(req).add(binding);
+  }
   let sequence = 0, deduplicatedPages = 0, transferSequence = 0, clock = 0, readinessVersion = 0;
   const tiers = ['hbm', 'dram', 'ssd'];
   function markReady(item) {
@@ -325,7 +332,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     }
     if (target !== item) {
       if (!bindings.has(target)) bindings.set(target, new Set());
-      for (const binding of refs) bindings.get(target).add(binding);
+      for (const binding of refs) {
+        binding.item = target;
+        bindings.get(target).add(binding);
+      }
       bindings.delete(item);
     }
     for (const pull of pulls.values()) for (const task of pull.tasks) {
@@ -834,8 +844,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       const entry = { ...slot, id: item.id, completed: item.ready ? [{ position: slot.position, tokens: slot.tokens }] : [], claimed: [] };
       state.entries.push(entry);
       if (!entry.completed.length) state.pendingEntries.add(entry);
-      if (!bindings.has(item)) bindings.set(item, new Set());
-      bindings.get(item).add({ req, state, entry });
+      bindInput(req, state, entry, item);
     }
     for (let i = 0; i < Math.ceil(restored / blockSize); i++) {
       const tokens = Math.min(blockSize, restored - i * blockSize), position = req.inputLen + i * blockSize;
@@ -920,8 +929,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
           if (slot.output) { state.outputIds.push(item.id); req.ownBlkIds.push(item.id); }
           else {
             req.prefixBlkIds.push(item.id);
-            if (!bindings.has(item)) bindings.set(item, new Set());
-            bindings.get(item).add({ req, state, entry });
+            bindInput(req, state, entry, item);
           }
         }
         states.set(req, state);
@@ -1170,10 +1178,12 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       const state = states.get(req);
       if (!state || state.released) { if (finiteCapacity) prefetches.delete(req); return; }
       if (finiteCapacity) {
-        for (const [item, refs] of bindings) {
-          for (const binding of refs) if (binding.req === req) refs.delete(binding);
-          if (!refs.size) bindings.delete(item);
+        for (const binding of requestBindings.get(req) || []) {
+          const refs = bindings.get(binding.item);
+          refs?.delete(binding);
+          if (!refs?.size) bindings.delete(binding.item);
         }
+        requestBindings.delete(req);
         prefetches.delete(req);
       }
       if (reason === null) {
