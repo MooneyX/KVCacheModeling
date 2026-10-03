@@ -589,6 +589,15 @@ test('U3 cache: full referenced pool scans for eviction candidates only until el
   assert.equal(h.cache.place(waiting, 3).status, 'admitted');
 });
 
+test('U3 cache: eviction heap preserves last-touch and ID tie-breaking', () => {
+  const h = finiteHarness(256);
+  for (const name of ['z', 'A', 'a', 'x']) warmTier(h, contentRequest([[name, 64]]), 'hbm');
+  const expected = [...h.pool.blocks].sort((a, b) => (a.lastTouch || 0) - (b.lastTouch || 0)
+    || String(a.id).localeCompare(String(b.id)))[0];
+  assert.equal(h.cache.ensureSpace('hbm', 64, 0), 'wait');
+  assert.equal(h.cache.ledger[0].source, expected);
+});
+
 test('U3 cache: eviction reserves the destination but retains the locked source until completion', () => {
   const h = finiteHarness(64), req = contentRequest([['cached', 64]]);
   warmTier(h, req, 'hbm');

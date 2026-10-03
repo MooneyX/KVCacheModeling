@@ -485,8 +485,34 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       state.noCandidates = true;
       return 'wait';
     }
-    candidates.sort((a, b) => (a.lastTouch || 0) - (b.lastTouch || 0) || String(a.id).localeCompare(String(b.id)));
-    for (const item of candidates) {
+    // Build a min-heap in linear time; most calls need only the first few LRU victims.
+    const order = new Uint32Array(candidates.length);
+    const touch = new Float64Array(candidates.length);
+    for (let i = 0; i < candidates.length; i++) {
+      order[i] = i;
+      touch[i] = candidates[i].lastTouch || 0;
+    }
+    const compare = (a, b) => touch[a] - touch[b]
+      || String(candidates[a].id).localeCompare(String(candidates[b].id)) || a - b;
+    function siftDown(index, size) {
+      const value = order[index];
+      while (index * 2 + 1 < size) {
+        let child = index * 2 + 1;
+        if (child + 1 < size && compare(order[child + 1], order[child]) < 0) child++;
+        if (compare(value, order[child]) <= 0) break;
+        order[index] = order[child];
+        index = child;
+      }
+      order[index] = value;
+    }
+    for (let i = (order.length >>> 1) - 1; i >= 0; i--) siftDown(i, order.length);
+    for (let remaining = order.length; remaining > 0;) {
+      const item = candidates[order[0]];
+      remaining--;
+      if (remaining) {
+        order[0] = order[remaining];
+        siftDown(0, remaining);
+      }
       if (target.used + bytes <= target.cap) return 'admitted';
       if (target.used - promisedBytes + bytes <= target.cap) return 'wait';
       const next = tiers[tiers.indexOf(tier) + 1];
