@@ -33,13 +33,26 @@ function invalidatePlans(pool) {
 function evictionState(pool) {
   let state = poolEvictionStates.get(pool);
   if (!state) {
-    state = { epoch: pool.epoch, noCandidates: false };
+    state = { epoch: pool.epoch, noCandidates: false, eligible: null };
     poolEvictionStates.set(pool, state);
   } else if (state.epoch !== pool.epoch) {
     state.epoch = pool.epoch;
     state.noCandidates = false;
+    state.eligible = null;
   }
   return state;
+}
+
+function eligibleForEviction(item) {
+  return item.available && item.ready && !item.refcount && !item.pinned && !item.transferLocked;
+}
+
+function refreshEvictionCandidate(pool, item) {
+  if (!pool || !item) return;
+  const state = poolEvictionStates.get(pool);
+  if (!state?.eligible) return;
+  if (pool.blockIndex[item.id] === item && eligibleForEviction(item)) state.eligible.add(item);
+  else state.eligible.delete(item);
 }
 
 function invalidateEviction(pool) {
@@ -85,6 +98,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       item.ready = true;
       readinessVersion++;
       invalidateEviction(resources[item.tier]);
+      refreshEvictionCandidate(resources[item.tier], item);
       if (item._published) invalidatePlans(resources[item.tier]);
     }
   }
@@ -111,19 +125,25 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
   };
   const add = (tier, item) => {
     rawAdd(tier, item);
+    const target = resources[tier], eviction = poolEvictionStates.get(target);
+    if (eviction) eviction.epoch = target.epoch;
     if (item._contentResource === resourceId) item.output ? pageCounts.outputPages++ : pageCounts.inputPages++;
     syncPageEpochs();
-    invalidateEviction(resources[tier]);
-    if (item._published && item.ready) invalidatePlans(resources[tier]);
-    else syncPlanEpoch(resources[tier]);
+    invalidateEviction(target);
+    refreshEvictionCandidate(target, item);
+    if (item._published && item.ready) invalidatePlans(target);
+    else syncPlanEpoch(target);
   };
   const remove = (tier, id) => {
-    const item = resources[tier]?.blockIndex[id];
+    const target = resources[tier], item = target?.blockIndex[id];
+    poolEvictionStates.get(target)?.eligible?.delete(item);
     const removed = rawRemove(tier, id);
+    const eviction = poolEvictionStates.get(target);
+    if (eviction) eviction.epoch = target.epoch;
     if (item?._contentResource === resourceId) item.output ? pageCounts.outputPages-- : pageCounts.inputPages--;
     syncPageEpochs();
-    invalidateEviction(resources[tier]);
-    invalidatePlans(resources[tier]);
+    invalidateEviction(target);
+    invalidatePlans(target);
     return removed ?? item;
   };
   const sizeAt = (item, tier) => item.size * (tierRatio[tier] ?? 1);
@@ -135,7 +155,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (!item._cacheLocks) item._cacheWasLocked = wasLocked;
     item._cacheLocks = (item._cacheLocks || 0) + 1;
     item.transferLocked = true;
-    if (!wasLocked) activeCacheLocks++;
+    if (!wasLocked) {
+      activeCacheLocks++;
+      refreshEvictionCandidate(resources[item.tier], item);
+    }
   };
   const unlock = item => {
     const wasLocked = !!item.transferLocked;
@@ -144,6 +167,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (wasLocked && !item.transferLocked) {
       activeCacheLocks--;
       invalidateEviction(resources[item.tier]);
+      refreshEvictionCandidate(resources[item.tier], item);
     }
   };
   const residentCount = () => resourceCount ? resourceCount()
@@ -286,6 +310,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     if (ready(existing, now)) {
       existing.refcount += item.refcount;
       existing.lastTouch = now;
+      refreshEvictionCandidate(pool, existing);
       remove('hbm', id);
       deduplicatedPages++;
       return key;
@@ -412,6 +437,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       record.target.arriveAt = record.end;
       record.target.lastTouch = record.end;
       record.target._published = record.source._published;
+      refreshEvictionCandidate(record.toPool, record.target);
       if (record.prefetch && record.to === 'hbm' && record.target.canonicalKey)
         record.target = publishInput(record.target.id, record.end);
       if (record.move && record.fromPool.blockIndex[record.source.id] === record.source) remove(record.from, record.source.id);
@@ -474,10 +500,16 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       if (record.move && record.fromPool === target) promisedBytes += sizeAt(record.source, tier);
     }
     if (target.used - promisedBytes + bytes <= target.cap) return 'wait';
+    // Only simulator-owned indexed pools can maintain eligibility incrementally.
+    // External pools keep the original scan so direct page mutations remain observable.
+    if (target.blockPositions && !state.eligible) {
+      state.eligible = new Set(target.blocks.filter(eligibleForEviction));
+    }
     const candidates = [];
+    const source = state.eligible || target.blocks;
     let hasCandidate = false;
-    for (const item of target.blocks) {
-      if (!item.available || !item.ready || item.refcount || item.pinned || item.transferLocked) continue;
+    for (const item of source) {
+      if (!state.eligible && !eligibleForEviction(item)) continue;
       hasCandidate = true;
       if (!protectedPages.has(item)) candidates.push(item);
     }
@@ -860,6 +892,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
       let item = existing[i];
       if (item) {
         item.refcount++; item.lastTouch = now;
+        refreshEvictionCandidate(pool, item);
         if (item.canonicalKey) { req.ownBlkIds.push(item.id); state.privateIds.push(item.id); }
         else req.prefixBlkIds.push(item.id);
       } else {
@@ -921,8 +954,10 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
     const state = { id: sequence++, privateIds: [], outputIds: [], response, entries: [], pendingEntries: new Set(), readinessVersion, released: false };
     const reserved = slots.map((slot, i) => {
       let item = existing[i];
-      if (item) item.refcount++;
-      else {
+      if (item) {
+        item.refcount++;
+        refreshEvictionCandidate(pool, item);
+      } else {
         item = block(JSON.stringify(['handoff', resourceId, state.id, i]), slot.tokens, req, now, !!slot.output);
         if (slot.key) item.canonicalKey = slot.key;
         add('hbm', item);
@@ -936,6 +971,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
         for (const { item, created } of reserved) {
           unlock(item); item.refcount--; item.lastTouch = time;
           if (item.refcount === 0) invalidateEviction(resources[item.tier]);
+          refreshEvictionCandidate(resources[item.tier], item);
           if (created && item.refcount === 0) remove('hbm', item.id);
         }
         incomingHandoffs.delete(req);
@@ -1116,6 +1152,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
           const cached = pool.blockIndex[slot.key];
           cached.refcount++;
           cached.lastTouch = now;
+          refreshEvictionCandidate(pool, cached);
           req.prefixBlkIds.push(slot.key);
         } else {
           const id = JSON.stringify(['private', resourceId, state.id, i]);
@@ -1223,6 +1260,7 @@ export function createReplayCache({ pool, pools = { hbm: pool }, blockBytes, blo
         item.refcount--;
         item.lastTouch = now;
         if (item.refcount === 0) invalidateEviction(resources[item.tier]);
+        refreshEvictionCandidate(resources[item.tier], item);
         if (reason !== null && !item._published && item.refcount === 0) remove('hbm', id);
       }
       state.released = true;
