@@ -524,6 +524,16 @@
       <button id="ganttPrev" class="btn btn-sm" type="button">上一页</button>
       <span id="ganttPageStatus" role="status" aria-live="polite"></span>
       <button id="ganttNext" class="btn btn-sm" type="button">下一页</button>
+      <form id="ganttPageJump" hidden>
+        <label for="ganttPageNumber">跳转到第</label>
+        <input id="ganttPageNumber" type="number" min="1" step="1" required aria-label="甘特图页码">
+        <span>页</span>
+        <button class="btn btn-sm" type="submit">跳转</button>
+      </form>
+    </div>
+    <div class="gantt-zoom-help">
+      <span>缩放：拖动图下方滑块调整横轴时间范围，拖动右侧滑块调整纵轴请求行范围；拖动滑块中间可平移。</span>
+      <button id="ganttZoomReset" class="btn btn-sm" type="button" disabled>重置缩放</button>
     </div>
     <div id="chartGantt" class="chart-tall"></div>
     <h3 style="font-size:.85rem;color:var(--accent);margin:14px 0 4px">批次并发占用时间线</h3>

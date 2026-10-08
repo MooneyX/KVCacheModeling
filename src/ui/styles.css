@@ -100,4 +100,10 @@ input[type="checkbox"]{width:auto;padding:0;border:none;background:transparent;c
 #replaySummary dt,#replaySummary p,#replaySummary summary{color:var(--text-dim)}
 #replaySummary p{margin-bottom:14px}
 #replaySummary summary{cursor:pointer}
-#ganttPageStatus{font-size:.75rem;color:var(--text-dim);margin:0 8px}
+#ganttPagination:not([hidden]){display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+#ganttPageStatus{font-size:.75rem;color:var(--text-dim)}
+#ganttPageJump:not([hidden]){display:inline-flex;align-items:center;gap:6px}
+#ganttPageJump label{margin:0;white-space:nowrap}
+#ganttPageNumber{width:70px;min-width:0;padding:5px 6px}
+.gantt-zoom-help{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:.75rem;color:var(--text-dim)}
+.gantt-zoom-help .btn:disabled{cursor:default}

@@ -19,6 +19,7 @@ function resultInputs() {
 }
 
 const ganttPages = new WeakMap();
+const ganttZooms = new WeakMap();
 const GANTT_PAGE_SIZE = 100;
 const numberText = (value, digits = 3, unit = '') => Number.isFinite(value) ? value.toFixed(digits) + unit : '无样本';
 const chartNumber = (value, digits = 1) => Number.isFinite(value) ? +value.toFixed(digits) : null;
@@ -246,11 +247,17 @@ export function refreshScheduleTab(){
 
 export function drawGantt(r = state.simResults[0], input = state.simInput, pageIndex){
   const pager = $('ganttPagination');
+  const jump = $('ganttPageJump');
+  const resetZoom = $('ganttZoomReset');
   if (pager) {
     pager.hidden = true;
+    jump.hidden = true;
+    jump.onsubmit = null;
     $('ganttPrev').onclick = null;
     $('ganttNext').onclick = null;
   }
+  resetZoom.disabled = true;
+  resetZoom.onclick = null;
   if (!r || !input?.params || !input?.strategies?.length) {
     showRunPlaceholder(['chartGantt', 'chartBatchOcc'], ['formulaGantt', 'formulaBatchOcc']);
     return;
@@ -277,6 +284,14 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
       $('ganttNext').disabled = page === pages - 1;
       $('ganttPrev').onclick = () => drawGantt(r, input, page - 1);
       $('ganttNext').onclick = () => drawGantt(r, input, page + 1);
+      jump.hidden = pages <= 1;
+      const pageNumber = $('ganttPageNumber');
+      pageNumber.max = String(pages);
+      pageNumber.value = String(page + 1);
+      jump.onsubmit = event => {
+        event.preventDefault();
+        if (pageNumber.checkValidity()) drawGantt(r, input, Number(pageNumber.value) - 1);
+      };
     }
   }
   const ganttEl = $('chartGantt');
@@ -305,12 +320,17 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
     if (t.state === 'failed') failedData.push([row, end, end]);
   });
   const maxT = replay ? simEnd : Math.max(simEnd, ...timeline.map(t => t.completeTime || 0), 0.01);
+  const zoom = ganttZooms.get(r);
 
   function makeGanttSeries(name, color, data) {
     return { name: name, type: 'custom', renderItem: function(params, api) {
       let cat = api.value(0), start = api.coord([api.value(1), cat]), end = api.coord([api.value(2), cat]);
       let h = api.size([0, 1])[1] * 0.6;
-      return { type: 'rect', shape: { x: start[0], y: start[1] - h / 2, width: Math.max(end[0] - start[0], 2), height: h }, style: api.style() };
+      const shape = echarts.graphic.clipRectByRect(
+        { x: start[0], y: start[1] - h / 2, width: Math.max(end[0] - start[0], 2), height: h },
+        { x: params.coordSys.x, y: params.coordSys.y, width: params.coordSys.width, height: params.coordSys.height }
+      );
+      return shape && { type: 'rect', shape, style: api.style() };
     }, itemStyle: { color: color, borderRadius: 3 }, encode: { x: [1, 2], y: 0 }, data: data };
   }
 
@@ -324,11 +344,16 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
         '<br/>开始: ' + numberText(d[1], 3, 's') + '<br/>结束: ' + numberText(d[2], 3, 's') + '<br/>持续: ' + numberText(d[2] - d[1], 3, 's');
     }},
     legend: { data: ['Queue(等槽位/显存)', 'Wait(等算力)', 'Prefill', ...(waitDecodeData.length ? ['KV传输/等Decode'] : []), 'Decode', ...(failedData.length ? ['失败'] : [])], top: 0, textStyle: { color: '#9ca0b0' } },
-    grid: { left: replay ? 220 : 80, right: 46, top: 40, bottom: 20 },
-    // 只用 slider 缩放：移除 inside dataZoom——它即使 zoomOnMouseWheel:'shift' 仍会拦截滚轮事件，导致页面无法滚动
+    grid: { left: replay ? 220 : 80, right: 46, top: 40, bottom: 68 },
+    // 独立的轴滑块不拦截页面滚轮；翻页和切换标签时恢复各轴缩放范围
     dataZoom: [
-      { type: 'slider', yAxisIndex: 0, right: 4, width: 14,
-        start: 0, end: 100,
+      { id: 'gantt-x-zoom', type: 'slider', xAxisIndex: 0, left: replay ? 220 : 80, right: 46, bottom: 8, height: 18,
+        start: zoom?.x.start ?? 0, end: zoom?.x.end ?? 100,
+        borderColor: 'transparent', backgroundColor: 'rgba(46,51,71,.4)',
+        fillerColor: 'rgba(108,99,255,.25)', handleStyle: { color: '#6c63ff' },
+        textStyle: { color: '#9ca0b0' } },
+      { id: 'gantt-y-zoom', type: 'slider', yAxisIndex: 0, right: 4, width: 14,
+        start: zoom?.y.start ?? 0, end: zoom?.y.end ?? 100,
         borderColor: 'transparent', backgroundColor: 'rgba(46,51,71,.4)',
         fillerColor: 'rgba(108,99,255,.25)', handleStyle: { color: '#6c63ff' },
         textStyle: { color: '#9ca0b0' } }
@@ -344,6 +369,16 @@ export function drawGantt(r = state.simResults[0], input = state.simInput, pageI
       ...(failedData.length ? [{ name: '失败', type: 'scatter', symbol: 'diamond', symbolSize: 10, encode: { x: 1, y: 0 }, data: failedData, itemStyle: { color: '#f87171' } }] : []),
     ]
   });
+  ch.on('datazoom', () => {
+    const [x, y] = ch.getOption().dataZoom;
+    ganttZooms.set(r, { x: { start: x.start, end: x.end }, y: { start: y.start, end: y.end } });
+  });
+  resetZoom.disabled = false;
+  resetZoom.onclick = () => {
+    for (const dataZoomId of ['gantt-x-zoom', 'gantt-y-zoom']) {
+      ch.dispatchAction({ type: 'dataZoom', dataZoomId, start: 0, end: 100 });
+    }
+  };
 
   if (replay) {
     const n = r.replay.counts;

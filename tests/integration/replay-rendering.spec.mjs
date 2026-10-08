@@ -172,6 +172,53 @@ for (const name of ['manySuccessful', 'manyUnfinished']) {
   });
 }
 
+test('Gantt: independent axis zoom persists across page jumps and redraws, with valid page input', async ({ page }) => {
+  const observed = await start(page), r = result('manySuccessful');
+  await inject(page, r, visualizationCases.manySuccessful);
+  const zooms = () => page.evaluate(() => window.echarts.getInstanceByDom(document.getElementById('chartGantt'))
+    .getOption().dataZoom.map(({ id, start, end }) => ({ id, start, end })));
+  expect(await zooms()).toEqual([
+    { id: 'gantt-x-zoom', start: 0, end: 100 },
+    { id: 'gantt-y-zoom', start: 0, end: 100 },
+  ]);
+  await page.evaluate(() => window.echarts.getInstanceByDom(document.getElementById('chartGantt'))
+    .dispatchAction({ type: 'dataZoom', dataZoomId: 'gantt-x-zoom', start: 15, end: 65 }));
+  expect(await zooms()).toEqual([
+    { id: 'gantt-x-zoom', start: 15, end: 65 },
+    { id: 'gantt-y-zoom', start: 0, end: 100 },
+  ]);
+  await page.evaluate(() => window.echarts.getInstanceByDom(document.getElementById('chartGantt'))
+    .dispatchAction({ type: 'dataZoom', dataZoomId: 'gantt-y-zoom', start: 20, end: 80 }));
+  const zoomed = await zooms();
+  expect(zoomed).toEqual([
+    { id: 'gantt-x-zoom', start: 15, end: 65 },
+    { id: 'gantt-y-zoom', start: 20, end: 80 },
+  ]);
+  const pageNumber = page.locator('#ganttPageNumber');
+  await pageNumber.fill('4');
+  await pageNumber.press('Enter');
+  await expect(page.locator('#ganttPageStatus')).toContainText('301–400 / 400');
+  expect((await capture(page)).charts.chartGantt.yAxis[0].data[0]).toContain('Req #300');
+  expect(await zooms()).toEqual(zoomed);
+  await pageNumber.fill('5');
+  await page.locator('#ganttPageJump button').click();
+  expect(await pageNumber.evaluate(el => el.validity.rangeOverflow)).toBe(true);
+  await expect(page.locator('#ganttPageStatus')).toContainText('301–400 / 400');
+  await pageNumber.fill('2');
+  await page.locator('#ganttPageJump button').click();
+  await expect(page.locator('#ganttPageStatus')).toContainText('101–200 / 400');
+  expect(await zooms()).toEqual(zoomed);
+  await page.locator('.nav-item[data-tab="tab-params"]').click();
+  await page.locator('.nav-item[data-tab="tab-schedule"]').click();
+  expect(await zooms()).toEqual(zoomed);
+  await page.locator('#ganttZoomReset').click();
+  expect(await zooms()).toEqual([
+    { id: 'gantt-x-zoom', start: 0, end: 100 },
+    { id: 'gantt-y-zoom', start: 0, end: 100 },
+  ]);
+  expect(observed).toEqual({ errors: [], posts: [] });
+});
+
 test('V3: failed and cutoff records retain sparse IDs and never invent cancelled or future rows', async ({ page }) => {
   const observed = await start(page), mixed = result('mixed');
   await inject(page, mixed, visualizationCases.mixed);
